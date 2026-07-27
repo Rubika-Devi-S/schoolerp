@@ -1,0 +1,1119 @@
+:root {
+  --sidebar-width: 238px;
+  --sidebar-bg: #fff;
+  --sidebar-text: #1e293b;
+  --sidebar-active-bg-1: #6547e8;
+  --sidebar-active-bg-2: #315ed8;
+  --sidebar-active-text: #fff;
+  --sidebar-hover-bg: #f1f5f9;
+  --topbar-bg-1: #6740d9;
+  --topbar-bg-2: #1656c9;
+  --topbar-text: #fff;
+  --body-bg: #f6f8fc;
+  --card-bg: #fff;
+  --text-main: #101a3b;
+  --text-muted: #64748b;
+  --border-soft: #e7ebf3;
+  --brand-1: #6547e8;
+  --brand-2: #315ed8;
+}
+:root {
+  --app-font:
+    "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+html,
+body {
+  font-family: var(--app-font);
+}
+
+button,
+input,
+select,
+textarea,
+table,
+.dropdown-menu,
+.form-control,
+.form-select,
+.btn {
+  font-family: var(--app-font);
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  min-height: 100%;
+}
+body {
+  margin: 0;
+  background: var(--body-bg);
+  color: var(--text-main);
+  font-family: var(--app-font);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+#sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: var(--sidebar-width);
+  background: var(--sidebar-bg);
+  color: var(--sidebar-text);
+  z-index: 1045;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-soft);
+  transition: transform 0.25s ease;
+}
+.sidebar-brand {
+  height: 76px;
+  padding: 12px 15px;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--border-soft);
+}
+.brand-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+.brand-logo {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  flex: none;
+  background: linear-gradient(135deg, #f6c548, #1e4dbf);
+  color: #fff;
+  font-weight: 900;
+}
+.brand-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.brand-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.brand-copy strong {
+  font-size: 15px;
+  font-weight: 800;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.brand-copy small {
+  font-size: 11px;
+  color: #748099;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sidebar-close {
+  border: 0;
+  background: none;
+  color: inherit;
+  margin-left: auto;
+}
+
+.sidebar-nav {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 10px 18px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.sidebar-nav::-webkit-scrollbar {
+  display: none;
+}
+.sidebar-link {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  margin: 2px 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+}
+.sidebar-link svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.sidebar-link:hover {
+  background: var(--sidebar-hover-bg);
+}
+.sidebar-link.active {
+  color: var(--sidebar-active-text);
+  background: linear-gradient(
+    135deg,
+    var(--sidebar-active-bg-1),
+    var(--sidebar-active-bg-2)
+  );
+  box-shadow: 0 8px 20px rgba(79, 70, 229, 0.23);
+}
+.sidebar-parent .submenu-chevron {
+  margin-left: auto;
+  transition: 0.2s;
+}
+.sidebar-parent[aria-expanded="true"] .submenu-chevron {
+  transform: rotate(180deg);
+}
+.sidebar-child {
+  padding-left: 34px;
+  font-size: 13px;
+}
+.sidebar-promo {
+  margin: 10px 14px 16px;
+  padding: 14px;
+  border-radius: 13px;
+  color: #fff;
+  background: linear-gradient(140deg, #7354e8, #354ed4);
+  display: grid;
+  gap: 5px;
+}
+.sidebar-promo svg {
+  width: 28px;
+}
+.sidebar-promo strong {
+  font-size: 14px;
+}
+.sidebar-promo small {
+  font-size: 11px;
+  opacity: 0.84;
+  line-height: 1.45;
+}
+
+#topbar {
+  position: fixed;
+  top: 0;
+  left: var(--sidebar-width);
+  right: 0;
+  height: 76px;
+  z-index: 1035;
+  padding: 0 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--topbar-text);
+  background: linear-gradient(110deg, var(--topbar-bg-1), var(--topbar-bg-2));
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+.topbar-left,
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.icon-button {
+  width: 42px;
+  height: 42px;
+  border: 0;
+  border-radius: 10px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.14);
+  display: grid;
+  place-items: center;
+  text-decoration: none;
+}
+.icon-button:hover {
+  background: rgba(255, 255, 255, 0.23);
+}
+.global-search {
+  height: 42px;
+  width: min(430px, 38vw);
+  display: flex;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.1);
+}
+.global-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  padding: 0 14px;
+  background: transparent;
+  color: #fff;
+}
+.global-search input::placeholder {
+  color: rgba(255, 255, 255, 0.78);
+}
+.global-search button {
+  border: 0;
+  background: transparent;
+  color: #fff;
+  padding-right: 12px;
+}
+.academic-year {
+  min-width: 160px;
+  border: 0;
+  border-radius: 10px;
+  padding: 7px 11px;
+  background: #fff;
+  color: #172554;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.academic-year span {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.academic-year small {
+  font-size: 9px;
+}
+.academic-year strong {
+  font-size: 13px;
+}
+.notification {
+  position: relative;
+}
+.notification b {
+  position: absolute;
+  top: -4px;
+  right: -3px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 20px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  display: grid;
+  place-items: center;
+}
+.user-chip {
+  border: 0;
+  background: transparent;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 2px;
+}
+.avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: #fff;
+  color: #1d3c95;
+  font-weight: 800;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.user-chip-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.1;
+}
+.user-chip-copy strong {
+  font-size: 14px;
+}
+.user-chip-copy small {
+  font-size: 11px;
+  opacity: 0.83;
+}
+.topbar-panel {
+  width: 300px;
+  padding: 15px;
+}
+
+.app-content {
+  margin-left: var(--sidebar-width);
+  padding: 100px 22px 28px;
+  min-height: 100vh;
+}
+.page-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.page-title {
+  font-size: 26px;
+  font-weight: 800;
+  margin: 0;
+}
+.page-subtitle {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.page-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.btn-ui {
+  height: 40px;
+  border-radius: 9px;
+  padding: 0 15px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border-soft);
+  background: #fff;
+  color: #172554;
+  font-weight: 700;
+  font-size: 13px;
+}
+.btn-ui.btn-primary-ui {
+  border-color: transparent;
+  color: #fff;
+  background: linear-gradient(135deg, var(--brand-1), var(--brand-2));
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.metric-card {
+  min-height: 112px;
+  padding: 18px;
+  border-radius: 13px;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.07);
+}
+.metric-purple {
+  background: linear-gradient(135deg, #7050df, #4d37c8);
+}
+.metric-blue {
+  background: linear-gradient(135deg, #4b96f3, #2168db);
+}
+.metric-green {
+  background: linear-gradient(135deg, #45c687, #20a263);
+}
+.metric-orange {
+  background: linear-gradient(135deg, #ffb42e, #ff8a13);
+}
+.metric-pink {
+  background: linear-gradient(135deg, #ff5b83, #eb315f);
+}
+.metric-cyan {
+  background: linear-gradient(135deg, #43c9cf, #1babb4);
+}
+.metric-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.19);
+}
+.metric-icon svg {
+  width: 28px;
+  height: 28px;
+}
+.metric-card small {
+  font-size: 11px;
+  opacity: 0.9;
+}
+.metric-value {
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+.metric-trend {
+  font-size: 10px;
+  margin-top: 7px;
+  color: #d8ffe4;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1.1fr 0.95fr 0.85fr;
+  gap: 16px;
+}
+.ui-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 13px;
+  box-shadow: 0 5px 18px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+}
+.ui-card-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.ui-card-title {
+  font-size: 14px;
+  font-weight: 800;
+  margin: 0;
+}
+.ui-card-body {
+  padding: 16px;
+}
+.placeholder-chart {
+  height: 210px;
+  display: flex;
+  align-items: flex-end;
+  gap: 11px;
+  padding: 18px 8px 5px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.placeholder-chart span {
+  flex: 1;
+  min-width: 10px;
+  border-radius: 5px 5px 0 0;
+  background: linear-gradient(180deg, #6d5ae7, #4169df);
+}
+.list-clean {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.list-clean li {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.list-clean li:last-child {
+  border-bottom: 0;
+}
+.status {
+  padding: 4px 8px;
+  border-radius: 30px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.status.green {
+  background: #e8f8ef;
+  color: #16904e;
+}
+.status.blue {
+  background: #e8f1ff;
+  color: #3065d4;
+}
+.status.orange {
+  background: #fff3df;
+  color: #e18113;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.data-table th,
+.data-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+  text-align: left;
+}
+.data-table th {
+  background: #f8fafc;
+  color: #475569;
+  font-weight: 800;
+}
+.sidebar-backdrop {
+  display: none;
+}
+
+@media (max-width: 1199.98px) {
+  #sidebar {
+    transform: translateX(-100%);
+  }
+  body.sidebar-open #sidebar {
+    transform: translateX(0);
+  }
+  #topbar {
+    left: 0;
+  }
+  .app-content {
+    margin-left: 0;
+  }
+  .sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.5);
+    z-index: 1040;
+  }
+  body.sidebar-open .sidebar-backdrop {
+    display: block;
+  }
+  .dashboard-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 991.98px) {
+  .metric-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+  .global-search {
+    width: 300px;
+  }
+}
+@media (max-width: 767.98px) {
+  #topbar {
+    height: 64px;
+    padding: 0 10px;
+  }
+  .app-content {
+    padding: 82px 12px 20px;
+  }
+  .global-search {
+    display: none;
+  }
+  .academic-year {
+    min-width: 122px;
+    padding: 6px 8px;
+  }
+  .academic-year small {
+    display: none;
+  }
+  .user-chip-copy,
+  .user-chip > svg {
+    display: none;
+  }
+  .topbar-actions {
+    gap: 5px;
+  }
+  .icon-button {
+    width: 38px;
+    height: 38px;
+  }
+  .page-heading {
+    flex-direction: column;
+  }
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 480px) {
+  .topbar-calendar {
+    display: none;
+  }
+  .academic-year {
+    min-width: 106px;
+  }
+  .metric-card {
+    min-height: 100px;
+  }
+}
+/* =========================================================
+   Sidebar desktop collapsed mode
+   ========================================================= */
+
+@media (min-width: 1200px) {
+  body.sidebar-collapsed {
+    --sidebar-width: 82px;
+  }
+
+  body.sidebar-collapsed #sidebar {
+    width: var(--sidebar-width);
+  }
+
+  body.sidebar-collapsed #topbar {
+    left: var(--sidebar-width);
+  }
+
+  body.sidebar-collapsed .app-content {
+    margin-left: var(--sidebar-width);
+  }
+
+  body.sidebar-collapsed .sidebar-brand {
+    padding-right: 10px;
+    padding-left: 10px;
+    justify-content: center;
+  }
+
+  body.sidebar-collapsed .brand-link {
+    width: 100%;
+    justify-content: center;
+  }
+
+  body.sidebar-collapsed .brand-copy {
+    display: none;
+  }
+
+  body.sidebar-collapsed .brand-logo {
+    width: 45px;
+    height: 45px;
+  }
+
+  body.sidebar-collapsed .sidebar-link {
+    min-height: 44px;
+    padding-right: 10px;
+    padding-left: 10px;
+    justify-content: center;
+    gap: 0;
+  }
+
+  body.sidebar-collapsed .sidebar-link > span {
+    display: none;
+  }
+
+  body.sidebar-collapsed .sidebar-link > svg {
+    width: 20px;
+    height: 20px;
+    margin: 0;
+  }
+
+  body.sidebar-collapsed .submenu-chevron {
+    display: none;
+  }
+
+  body.sidebar-collapsed .sidebar-submenu {
+    display: none !important;
+  }
+
+  body.sidebar-collapsed .sidebar-child {
+    display: none;
+  }
+
+  body.sidebar-collapsed .sidebar-promo {
+    min-height: 56px;
+    margin-right: 10px;
+    margin-left: 10px;
+    padding: 12px;
+    place-items: center;
+  }
+
+  body.sidebar-collapsed .sidebar-promo strong,
+  body.sidebar-collapsed .sidebar-promo small {
+    display: none;
+  }
+
+  body.sidebar-collapsed .sidebar-promo svg {
+    width: 25px;
+    height: 25px;
+  }
+}
+
+/* =========================================================
+   Sidebar school name
+   ========================================================= */
+
+.brand-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.brand-school-name {
+  display: block;
+  max-width: 150px;
+  color: var(--sidebar-text, #1e293b);
+  font-size: 12px !important;
+  font-weight: 850 !important;
+  line-height: 1.25;
+  white-space: normal !important;
+  overflow: visible !important;
+  text-overflow: initial !important;
+}
+
+/* =========================================================
+   Smooth sidebar transition
+   ========================================================= */
+
+#sidebar,
+#topbar,
+.app-content,
+.sidebar-brand,
+.sidebar-link,
+.brand-copy {
+  transition:
+    width 0.25s ease,
+    left 0.25s ease,
+    margin-left 0.25s ease,
+    padding 0.25s ease,
+    transform 0.25s ease,
+    opacity 0.2s ease;
+}
+
+/* Mobile should always use the full sidebar width */
+@media (max-width: 1199.98px) {
+  body.sidebar-collapsed {
+    --sidebar-width: 238px;
+  }
+
+  .brand-school-name {
+    max-width: 155px;
+  }
+}
+
+/* =========================================================
+   Unified sidebar brand and topbar
+   ========================================================= */
+
+:root {
+  --header-height: 76px;
+  --header-gradient-start: #5632ca;
+  --header-gradient-end: #8253bf;
+  --header-text: #ffffff;
+}
+
+/* Sidebar top brand */
+.sidebar-brand {
+  height: var(--header-height);
+  min-height: var(--header-height);
+  padding: 10px 16px;
+  border-bottom: 0;
+  background: linear-gradient(
+    110deg,
+    var(--header-gradient-start),
+    var(--header-gradient-end)
+  );
+}
+
+/* Main topbar */
+#topbar {
+  height: var(--header-height);
+  color: var(--header-text);
+  border-left: 0;
+  background: linear-gradient(
+    110deg,
+    var(--header-gradient-start),
+    var(--header-gradient-end)
+  );
+}
+
+/* Remove any visible gap between both sections */
+#sidebar {
+  border-right: 0;
+}
+
+.sidebar-brand .brand-link {
+  color: var(--header-text);
+}
+
+/* School name */
+.sidebar-brand .school-name-primary,
+.sidebar-brand .school-name-secondary,
+.sidebar-brand .school-location,
+.sidebar-brand .brand-copy strong,
+.sidebar-brand .brand-copy span,
+.sidebar-brand .brand-copy small {
+  color: #ffffff !important;
+}
+
+/* Compact school title */
+.sidebar-brand .school-name-primary {
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1.15;
+  letter-spacing: 0.1px;
+}
+
+.sidebar-brand .school-name-secondary {
+  margin-top: 2px;
+  font-size: 10px;
+  font-weight: 750;
+  opacity: 0.92;
+}
+
+.sidebar-brand .school-location {
+  margin-top: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  opacity: 0.8;
+}
+
+/* Logo appearance on gradient background */
+.sidebar-brand .brand-logo {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow: none;
+}
+
+.sidebar-brand .brand-monogram {
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+/* Uploaded school logo */
+.sidebar-brand .brand-logo img {
+  width: 100%;
+  height: 100%;
+  padding: 2px;
+  object-fit: contain;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.95);
+}
+
+/* Mobile close button */
+.sidebar-brand .sidebar-close {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.sidebar-brand .sidebar-close:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* Content starts under unified header */
+.app-content {
+  padding-top: calc(var(--header-height) + 24px);
+}
+
+/* Desktop collapsed state */
+@media (min-width: 1200px) {
+  body.sidebar-collapsed .sidebar-brand {
+    height: var(--header-height);
+    min-height: var(--header-height);
+    padding: 10px;
+  }
+
+  body.sidebar-collapsed .brand-logo {
+    width: 46px;
+    height: 46px;
+    flex-basis: 46px;
+  }
+}
+
+/* =========================================================
+   Global typography refinement — Plus Jakarta Sans
+   ========================================================= */
+html,
+body,
+button,
+input,
+select,
+textarea,
+table,
+.dropdown-menu,
+.form-control,
+.form-select,
+.btn {
+  font-family: var(--app-font) !important;
+}
+body {
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+.page-title,
+.page-heading h1 {
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: -0.8px;
+}
+.page-subtitle,
+.page-heading p {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+.sidebar-link {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+}
+.sidebar-link.active {
+  font-weight: 700;
+}
+.global-search input {
+  font-size: 13px;
+  font-weight: 500;
+}
+.academic-year small {
+  font-size: 9px;
+  font-weight: 500;
+}
+.academic-year strong {
+  font-size: 12px;
+  font-weight: 700;
+}
+.user-chip-copy strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+.user-chip-copy small {
+  font-size: 10px;
+  font-weight: 500;
+}
+.btn-ui {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: -0.1px;
+}
+.metric-card small {
+  font-size: 11px;
+  font-weight: 600;
+}
+.metric-value {
+  font-size: 25px;
+  font-weight: 800;
+  letter-spacing: -0.6px;
+}
+.metric-trend {
+  font-size: 10px;
+  font-weight: 600;
+}
+.ui-card-title,
+.ui-card-header h2,
+.card-header-ui h2,
+.students-card-header h2,
+.admission-card-header h2,
+.fee-card-header h2,
+.attendance-card-header h2,
+.report-card-header h2 {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: -0.15px;
+}
+table th {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+table td {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+.student-cell,
+.admission-student,
+.fee-student,
+.attendance-student,
+.report-name-copy strong {
+  font-weight: 700;
+}
+.sidebar-brand .school-name-primary {
+  font-weight: 800;
+}
+.sidebar-brand .school-name-secondary,
+.sidebar-brand .school-location {
+  font-weight: 600;
+}
+
+/* =========================================================
+   FINAL HEADER FIX — continuous sidebar/topbar gradient
+   Keep this block at the very end of the file.
+   ========================================================= */
+
+:root {
+  --header-height: 76px;
+  --header-gradient-start: #6845df;
+  --header-gradient-end: #1656c9;
+}
+
+/*
+ * Use the same viewport-sized gradient for both elements.
+ * The topbar is offset by the sidebar width so the gradient
+ * continues instead of restarting.
+ */
+.sidebar-brand,
+#topbar {
+  background-image: linear-gradient(
+    110deg,
+    var(--header-gradient-start) 0%,
+    var(--header-gradient-end) 100%
+  ) !important;
+  background-size: 100vw var(--header-height) !important;
+  background-repeat: no-repeat !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
+.sidebar-brand {
+  height: var(--header-height) !important;
+  min-height: var(--header-height) !important;
+  background-position: 0 0 !important;
+}
+
+#topbar {
+  height: var(--header-height) !important;
+  background-position: calc(-1 * var(--sidebar-width)) 0 !important;
+}
+
+/* Remove the visible seam between sidebar and topbar. */
+#sidebar {
+  border-right: 0 !important;
+}
+
+.sidebar-brand::before,
+.sidebar-brand::after,
+#topbar::before,
+#topbar::after {
+  display: none !important;
+}
+
+/* Keep all branding readable on the shared gradient. */
+.sidebar-brand .brand-link,
+.sidebar-brand .brand-copy,
+.sidebar-brand .brand-copy strong,
+.sidebar-brand .brand-copy span,
+.sidebar-brand .brand-copy small,
+.sidebar-brand .school-name-primary,
+.sidebar-brand .school-name-secondary,
+.sidebar-brand .school-location {
+  color: #ffffff !important;
+}
+
+.sidebar-brand .brand-logo {
+  color: #ffffff !important;
+  border: 2px solid rgba(255,255,255,.45) !important;
+  background: rgba(255,255,255,.14) !important;
+  box-shadow: none !important;
+}
+
+#sidebarToggle {
+  color: #ffffff !important;
+  background: rgba(255,255,255,.15) !important;
+}
+
+#sidebarToggle:hover {
+  background: rgba(255,255,255,.24) !important;
+}
+
+/* Correct gradient continuation when desktop sidebar is collapsed. */
+@media (min-width: 1200px) {
+  body.sidebar-collapsed #topbar {
+    background-position: calc(-1 * var(--sidebar-width)) 0 !important;
+  }
+}
+
+/* On mobile the topbar spans the full viewport. */
+@media (max-width: 1199.98px) {
+  #topbar {
+    background-position: 0 0 !important;
+  }
+}

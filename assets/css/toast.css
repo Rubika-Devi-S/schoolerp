@@ -1,0 +1,579 @@
+/*
+ * School ERP - Premium Common Toast V5 - Medium
+ * Visual direction: vibrant colored icon panel + clean message body,
+ * animated countdown, glowing status edge and premium dashboard motion.
+ */
+
+:root {
+    --st-surface: rgba(255, 255, 255, .985);
+    --st-surface-2: #f8fafc;
+    --st-text: #0f172a;
+    --st-muted: #475569;
+    --st-border: rgba(15, 23, 42, .09);
+    --st-progress-track: #e7ebf1;
+    --st-close: #64748b;
+    --st-shadow: 0 22px 60px rgba(15, 23, 42, .18), 0 4px 14px rgba(15, 23, 42, .10);
+}
+
+[data-bs-theme="dark"],
+[data-theme="dark"],
+html.dark,
+body.dark,
+body.dark-mode,
+body.theme-dark {
+    --st-surface: rgba(20, 28, 43, .985);
+    --st-surface-2: #121a29;
+    --st-text: #f8fafc;
+    --st-muted: #cbd5e1;
+    --st-border: rgba(255, 255, 255, .10);
+    --st-progress-track: rgba(255, 255, 255, .12);
+    --st-close: #a8b2c3;
+    --st-shadow: 0 26px 72px rgba(0, 0, 0, .48), 0 5px 18px rgba(0, 0, 0, .30);
+}
+
+.school-toast-container {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    z-index: 2147483000;
+    width: min(420px, calc(100vw - 32px));
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    pointer-events: none;
+    perspective: 1200px;
+}
+
+.school-toast {
+    --st-accent: #2563eb;
+    --st-accent-2: #0ea5e9;
+    --st-accent-rgb: 37, 99, 235;
+
+    position: relative;
+    min-height: 90px;
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr);
+    overflow: visible;
+    border: 1px solid var(--st-border);
+    border-radius: 16px;
+    background: var(--st-surface);
+    color: var(--st-text);
+    box-shadow:
+        var(--st-shadow),
+        12px 0 34px rgba(var(--st-accent-rgb), .16);
+    pointer-events: auto;
+    opacity: 0;
+    transform-origin: 100% 50%;
+    transform: translate3d(68px, -12px, 0) rotateY(-7deg) scale(.94);
+    filter: blur(5px);
+    transition:
+        opacity .30s ease,
+        transform .52s cubic-bezier(.16, 1.15, .32, 1),
+        filter .28s ease,
+        box-shadow .22s ease;
+    isolation: isolate;
+}
+
+.school-toast::after {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    z-index: -2;
+    border-radius: inherit;
+    opacity: .48;
+    pointer-events: none;
+    background: linear-gradient(
+        110deg,
+        rgba(var(--st-accent-rgb), .52),
+        transparent 26%,
+        transparent 82%,
+        rgba(var(--st-accent-rgb), .36)
+    );
+    filter: blur(12px);
+}
+
+.school-toast--success {
+    --st-accent: #16a34a;
+    --st-accent-2: #22c55e;
+    --st-accent-rgb: 34, 197, 94;
+}
+
+.school-toast--error {
+    --st-accent: #dc2626;
+    --st-accent-2: #fb3e57;
+    --st-accent-rgb: 239, 68, 68;
+}
+
+.school-toast--warning {
+    --st-accent: #f97316;
+    --st-accent-2: #f59e0b;
+    --st-accent-rgb: 249, 115, 22;
+}
+
+.school-toast--info {
+    --st-accent: #2563eb;
+    --st-accent-2: #0ea5e9;
+    --st-accent-rgb: 37, 99, 235;
+}
+
+.school-toast--visible {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) rotateY(0) scale(1);
+    filter: blur(0);
+}
+
+.school-toast--visible:hover,
+.school-toast--paused {
+    transform: translate3d(-7px, 0, 0) scale(1.012);
+    box-shadow:
+        0 28px 76px rgba(15, 23, 42, .23),
+        0 7px 20px rgba(15, 23, 42, .12),
+        14px 0 46px rgba(var(--st-accent-rgb), .25);
+}
+
+.school-toast--leaving {
+    opacity: 0;
+    transform: translate3d(80px, 3px, 0) rotateY(-10deg) scale(.92);
+    filter: blur(7px);
+    pointer-events: none;
+}
+
+.school-toast__visual {
+    position: relative;
+    min-height: 90px;
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    border-radius: 15px 0 0 15px;
+    background:
+        radial-gradient(circle at 24% 22%, rgba(255,255,255,.38), transparent 25%),
+        linear-gradient(145deg, var(--st-accent-2), var(--st-accent));
+    box-shadow:
+        inset 0 0 0 1px rgba(255,255,255,.16),
+        inset -12px 0 26px rgba(0,0,0,.09);
+}
+
+/* White / dark body notch, visually matching the selected sample. */
+.school-toast__visual::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: -1px;
+    width: 18px;
+    height: 100%;
+    background: var(--st-surface);
+    clip-path: polygon(100% 0, 100% 100%, 0 100%, 54% 76%, 0 50%, 54% 24%, 0 0);
+    filter: drop-shadow(-4px 0 6px rgba(0, 0, 0, .06));
+}
+
+.school-toast__icon-ring {
+    position: relative;
+    z-index: 3;
+    width: 60px;
+    height: 60px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, .22);
+    box-shadow:
+        0 12px 28px rgba(0,0,0,.18),
+        inset 0 0 0 1px rgba(255,255,255,.32);
+    animation: school-toast-ring-pop .62s cubic-bezier(.15, 1.35, .3, 1) both;
+}
+
+.school-toast__icon-ring::before,
+.school-toast__icon-ring::after {
+    content: "";
+    position: absolute;
+    inset: -8px;
+    border-radius: inherit;
+    border: 1px solid rgba(255,255,255,.32);
+    opacity: 0;
+    animation: school-toast-pulse 2.25s ease-out .7s infinite;
+}
+
+.school-toast__icon-ring::after {
+    animation-delay: 1.35s;
+}
+
+.school-toast__icon {
+    width: 46px;
+    height: 46px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: #fff;
+    color: var(--st-accent);
+    box-shadow:
+        0 9px 22px rgba(0,0,0,.16),
+        inset 0 0 0 1px rgba(15,23,42,.04);
+}
+
+.school-toast__icon svg {
+    width: 27px;
+    height: 27px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.4;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    animation: school-toast-icon-draw .65s ease .15s both;
+}
+
+.school-toast__spark {
+    position: absolute;
+    z-index: 1;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: rgba(255,255,255,.34);
+    transform: rotate(45deg);
+    animation: school-toast-spark 3.2s ease-in-out infinite;
+}
+
+.school-toast__spark--1 { left: 13px; top: 18px; animation-delay: -.6s; }
+.school-toast__spark--2 { left: 26px; bottom: 16px; width: 6px; height: 6px; animation-delay: -1.4s; }
+.school-toast__spark--3 { right: 24px; top: 15px; width: 6px; height: 6px; animation-delay: -2.1s; }
+.school-toast__spark--4 { right: 20px; bottom: 20px; width: 9px; height: 9px; animation-delay: -.2s; }
+.school-toast__spark--5 { left: 16px; top: 54px; width: 5px; height: 4px; animation-delay: -1.8s; }
+
+.school-toast__body {
+    position: relative;
+    min-width: 0;
+    min-height: 90px;
+    padding: 15px 16px 14px 14px;
+    border-radius: 0 15px 15px 0;
+    background:
+        linear-gradient(135deg, rgba(var(--st-accent-rgb), .035), transparent 45%),
+        var(--st-surface);
+}
+
+.school-toast__header {
+    min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 9px;
+}
+
+.school-toast__title {
+    min-width: 0;
+    margin: 0;
+    color: var(--st-accent);
+    font-size: 17px;
+    font-weight: 850;
+    line-height: 1.15;
+    letter-spacing: -.025em;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.school-toast__tools {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.school-toast__time {
+    min-width: 38px;
+    height: 25px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 8px;
+    border-radius: 999px;
+    background: rgba(var(--st-accent-rgb), .11);
+    color: var(--st-accent);
+    font-size: 11px;
+    font-weight: 850;
+    line-height: 1;
+    transition: transform .18s ease, background .18s ease;
+}
+
+.school-toast--paused .school-toast__time {
+    background: rgba(var(--st-accent-rgb), .18);
+    transform: scale(1.06);
+}
+
+.school-toast__close {
+    width: 27px;
+    height: 27px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--st-close);
+    cursor: pointer;
+    transition:
+        color .18s ease,
+        background .18s ease,
+        transform .18s cubic-bezier(.2, 1.5, .4, 1);
+}
+
+.school-toast__close:hover {
+    color: var(--st-accent);
+    background: rgba(var(--st-accent-rgb), .10);
+    transform: rotate(90deg) scale(1.07);
+}
+
+.school-toast__close:active {
+    transform: rotate(90deg) scale(.92);
+}
+
+.school-toast__close:focus-visible {
+    outline: 2px solid var(--st-accent);
+    outline-offset: 2px;
+}
+
+.school-toast__close svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+}
+
+.school-toast__message {
+    margin-top: 5px;
+    padding-right: 4px;
+    color: var(--st-text);
+    font-size: 12.5px;
+    font-weight: 560;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+.school-toast__progress-track {
+    position: absolute;
+    right: 16px;
+    bottom: 10px;
+    left: 14px;
+    height: 4px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--st-progress-track);
+}
+
+.school-toast__progress {
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--st-accent), var(--st-accent-2));
+    box-shadow: 0 0 12px rgba(var(--st-accent-rgb), .28);
+    transform: scaleX(1);
+    transform-origin: left center;
+    will-change: transform;
+}
+
+.school-toast--paused .school-toast__progress {
+    box-shadow: 0 0 16px rgba(var(--st-accent-rgb), .42);
+}
+
+@keyframes school-toast-ring-pop {
+    0% {
+        opacity: 0;
+        transform: scale(.35) rotate(-18deg);
+    }
+    62% {
+        opacity: 1;
+        transform: scale(1.10) rotate(4deg);
+    }
+    100% {
+        opacity: 1;
+        transform: scale(1) rotate(0);
+    }
+}
+
+@keyframes school-toast-pulse {
+    0% {
+        opacity: .42;
+        transform: scale(.84);
+    }
+    70%, 100% {
+        opacity: 0;
+        transform: scale(1.38);
+    }
+}
+
+@keyframes school-toast-icon-draw {
+    from {
+        opacity: 0;
+        transform: scale(.55) rotate(-12deg);
+    }
+    to {
+        opacity: 1;
+        transform: scale(1) rotate(0);
+    }
+}
+
+@keyframes school-toast-spark {
+    0%, 100% {
+        opacity: .24;
+        transform: translateY(0) rotate(45deg) scale(.8);
+    }
+    50% {
+        opacity: .72;
+        transform: translateY(-7px) rotate(135deg) scale(1.1);
+    }
+}
+
+@media (max-width: 767.98px) {
+    .school-toast-container {
+        top: 12px;
+        right: 12px;
+        width: min(390px, calc(100vw - 24px));
+        gap: 11px;
+    }
+
+    .school-toast {
+        min-height: 84px;
+        grid-template-columns: 82px minmax(0, 1fr);
+        border-radius: 17px;
+    }
+
+    .school-toast__visual {
+        min-height: 84px;
+        border-radius: 14px 0 0 14px;
+    }
+
+    .school-toast__icon-ring {
+        width: 48px;
+        height: 48px;
+    }
+
+    .school-toast__icon {
+        width: 42px;
+        height: 42px;
+    }
+
+    .school-toast__icon svg {
+        width: 24px;
+        height: 24px;
+    }
+
+    .school-toast__body {
+        min-height: 84px;
+        padding: 13px 13px 12px 11px;
+        border-radius: 0 16px 16px 0;
+    }
+
+    .school-toast__title {
+        font-size: 14px;
+    }
+
+    .school-toast__message {
+        margin-top: 5px;
+        font-size: 11px;
+        line-height: 1.4;
+    }
+
+    .school-toast__time {
+        min-width: 34px;
+        height: 23px;
+        padding: 0 8px;
+        font-size: 11px;
+    }
+
+    .school-toast__close {
+        width: 18px;
+        height: 28px;
+    }
+
+    .school-toast__close svg {
+        width: 17px;
+        height: 17px;
+    }
+
+    .school-toast__progress-track {
+        right: 13px;
+        bottom: 9px;
+        left: 11px;
+        height: 4px;
+    }
+}
+
+@media (max-width: 420px) {
+    .school-toast-container {
+        top: 8px;
+        right: 8px;
+        width: calc(100vw - 16px);
+    }
+
+    .school-toast {
+        grid-template-columns: 70px minmax(0, 1fr);
+        min-height: 78px;
+    }
+
+    .school-toast__visual,
+    .school-toast__body {
+        min-height: 78px;
+    }
+
+    .school-toast__icon-ring {
+        width: 54px;
+        height: 54px;
+    }
+
+    .school-toast__icon {
+        width: 38px;
+        height: 38px;
+    }
+
+    .school-toast__icon svg {
+        width: 22px;
+        height: 22px;
+    }
+
+    .school-toast__visual::after {
+        width: 21px;
+    }
+
+    .school-toast__body {
+        padding-left: 10px;
+        padding-right: 10px;
+    }
+
+    .school-toast__header {
+        gap: 7px;
+    }
+
+    .school-toast__title {
+        font-size: 15.5px;
+    }
+
+    .school-toast__message {
+        font-size: 11.5px;
+    }
+
+    .school-toast__time {
+        display: none;
+    }
+
+    .school-toast__progress-track {
+        right: 10px;
+        left: 10px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .school-toast,
+    .school-toast__icon-ring,
+    .school-toast__icon svg,
+    .school-toast__spark,
+    .school-toast__icon-ring::before,
+    .school-toast__icon-ring::after {
+        animation: none !important;
+        transition-duration: .01ms !important;
+    }
+}
+
+@media print {
+    .school-toast-container {
+        display: none !important;
+    }
+}

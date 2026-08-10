@@ -1,0 +1,687 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * School Admin sidebar master definitions.
+ *
+ * The database remains the primary source. This registry is used for:
+ * - installation and database seeding
+ * - safe fallback when sidebar tables are not installed
+ * - keeping menu keys, routes and Lucide icons consistent
+ * - maintaining the complete menu structure in one file
+ */
+
+if (!function_exists('school_sidebar_master_options')) {
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    function school_sidebar_master_options(): array
+    {
+        return [
+            [
+                'id' => 1,
+                'parent_id' => null,
+                'module_key' => 'dashboard',
+                'menu_key' => 'dashboard',
+                'menu_title' => 'Dashboard',
+                'route' => 'dashboard.php',
+                'icon' => 'house',
+                'display_order' => 1,
+            ],
+
+            [
+                'id' => 10,
+                'parent_id' => null,
+                'module_key' => 'academics',
+                'menu_key' => 'academic_management',
+                'menu_title' => 'Academic Management',
+                'route' => '#',
+                'icon' => 'graduation-cap',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 11,
+                'parent_id' => 10,
+                'module_key' => 'academics',
+                'menu_key' => 'academic_year',
+                'menu_title' => 'Academic Year',
+                'route' => 'academic-years.php',
+                'icon' => 'calendar-range',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 12,
+                'parent_id' => 10,
+                'module_key' => 'academics',
+                'menu_key' => 'classes',
+                'menu_title' => 'Classes',
+                'route' => 'classes.php',
+                'icon' => 'layout-grid',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 13,
+                'parent_id' => 10,
+                'module_key' => 'academics',
+                'menu_key' => 'sections',
+                'menu_title' => 'Sections',
+                'route' => 'sections.php',
+                'icon' => 'panels-top-left',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 14,
+                'parent_id' => 10,
+                'module_key' => 'academics',
+                'menu_key' => 'subjects',
+                'menu_title' => 'Subjects',
+                'route' => 'subjects.php',
+                'icon' => 'book-open-text',
+                'display_order' => 4,
+            ],
+            [
+                'id' => 15,
+                'parent_id' => 10,
+                'module_key' => 'academics',
+                'menu_key' => 'timetable',
+                'menu_title' => 'Timetable',
+                'route' => 'timetable.php',
+                'icon' => 'calendar-days',
+                'display_order' => 5,
+            ],
+
+            [
+                'id' => 20,
+                'parent_id' => null,
+                'module_key' => 'students',
+                'menu_key' => 'student_management',
+                'menu_title' => 'Student Management',
+                'route' => '#',
+                'icon' => 'users',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 21,
+                'parent_id' => 20,
+                'module_key' => 'students',
+                'menu_key' => 'admissions',
+                'menu_title' => 'Student Admission',
+                'route' => 'admissions.php',
+                'icon' => 'user-plus',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 22,
+                'parent_id' => 20,
+                'module_key' => 'students',
+                'menu_key' => 'students',
+                'menu_title' => 'Student List',
+                'route' => 'students.php',
+                'icon' => 'list',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 23,
+                'parent_id' => 20,
+                'module_key' => 'students',
+                'menu_key' => 'attendance',
+                'menu_title' => 'Student Attendance',
+                'route' => 'attendance.php',
+                'icon' => 'calendar-check',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 24,
+                'parent_id' => 20,
+                'module_key' => 'students',
+                'menu_key' => 'student_promotion',
+                'menu_title' => 'Student Promotion',
+                'route' => 'student-promotion.php',
+                'icon' => 'move-up-right',
+                'display_order' => 4,
+            ],
+            [
+                'id' => 25,
+                'parent_id' => 20,
+                'module_key' => 'students',
+                'menu_key' => 'transfer_certificate',
+                'menu_title' => 'Transfer Certificate (TC)',
+                'route' => 'transfer-certificate.php',
+                'icon' => 'file-output',
+                'display_order' => 5,
+            ],
+
+            [
+                'id' => 30,
+                'parent_id' => null,
+                'module_key' => 'staff',
+                'menu_key' => 'teacher_management',
+                'menu_title' => 'Teacher Management',
+                'route' => '#',
+                'icon' => 'presentation',
+                'display_order' => 4,
+            ],
+            [
+                'id' => 31,
+                'parent_id' => 30,
+                'module_key' => 'staff',
+                'menu_key' => 'teachers',
+                'menu_title' => 'Teachers',
+                'route' => 'teachers.php',
+                'icon' => 'user-round',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 32,
+                'parent_id' => 30,
+                'module_key' => 'staff',
+                'menu_key' => 'staff',
+                'menu_title' => 'Staff',
+                'route' => 'staff.php',
+                'icon' => 'users-round',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 33,
+                'parent_id' => 30,
+                'module_key' => 'staff',
+                'menu_key' => 'staff_attendance',
+                'menu_title' => 'Staff Attendance',
+                'route' => 'staff-attendance.php',
+                'icon' => 'clipboard-check',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 34,
+                'parent_id' => 30,
+                'module_key' => 'staff',
+                'menu_key' => 'leave_management',
+                'menu_title' => 'Leave Management',
+                'route' => 'leave-management.php',
+                'icon' => 'calendar-off',
+                'display_order' => 4,
+            ],
+
+            [
+                'id' => 40,
+                'parent_id' => null,
+                'module_key' => 'examinations',
+                'menu_key' => 'examinations',
+                'menu_title' => 'Examination',
+                'route' => '#',
+                'icon' => 'file-check-2',
+                'display_order' => 5,
+            ],
+            [
+                'id' => 41,
+                'parent_id' => 40,
+                'module_key' => 'examinations',
+                'menu_key' => 'exam_setup',
+                'menu_title' => 'Exam Setup',
+                'route' => 'exam-setup.php',
+                'icon' => 'settings-2',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 42,
+                'parent_id' => 40,
+                'module_key' => 'examinations',
+                'menu_key' => 'exam_schedule',
+                'menu_title' => 'Exam Schedule',
+                'route' => 'exam-schedule.php',
+                'icon' => 'calendar-clock',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 43,
+                'parent_id' => 40,
+                'module_key' => 'examinations',
+                'menu_key' => 'marks_entry',
+                'menu_title' => 'Marks Entry',
+                'route' => 'marks-entry.php',
+                'icon' => 'square-pen',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 44,
+                'parent_id' => 40,
+                'module_key' => 'examinations',
+                'menu_key' => 'grade_management',
+                'menu_title' => 'Grade Management',
+                'route' => 'grade-management.php',
+                'icon' => 'badge-check',
+                'display_order' => 4,
+            ],
+            [
+                'id' => 45,
+                'parent_id' => 40,
+                'module_key' => 'examinations',
+                'menu_key' => 'report_cards',
+                'menu_title' => 'Report Cards',
+                'route' => 'report-cards.php',
+                'icon' => 'notebook-tabs',
+                'display_order' => 5,
+            ],
+
+            [
+                'id' => 50,
+                'parent_id' => null,
+                'module_key' => 'fees',
+                'menu_key' => 'fees',
+                'menu_title' => 'Fee Management',
+                'route' => '#',
+                'icon' => 'wallet-cards',
+                'display_order' => 6,
+            ],
+            [
+                'id' => 51,
+                'parent_id' => 50,
+                'module_key' => 'fees',
+                'menu_key' => 'fee_structure',
+                'menu_title' => 'Fee Structure',
+                'route' => 'fee-structure.php',
+                'icon' => 'list-tree',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 52,
+                'parent_id' => 50,
+                'module_key' => 'fees',
+                'menu_key' => 'fee_collection',
+                'menu_title' => 'Fee Collection',
+                'route' => 'fees-payments.php',
+                'icon' => 'indian-rupee',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 53,
+                'parent_id' => 50,
+                'module_key' => 'fees',
+                'menu_key' => 'fee_reports',
+                'menu_title' => 'Fee Reports',
+                'route' => 'fee-reports.php',
+                'icon' => 'chart-column',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 54,
+                'parent_id' => 50,
+                'module_key' => 'fees',
+                'menu_key' => 'due_fees',
+                'menu_title' => 'Due Fees',
+                'route' => 'due-fees.php',
+                'icon' => 'circle-alert',
+                'display_order' => 4,
+            ],
+
+            [
+                'id' => 60,
+                'parent_id' => null,
+                'module_key' => 'library',
+                'menu_key' => 'library',
+                'menu_title' => 'Library',
+                'route' => '#',
+                'icon' => 'book-open',
+                'display_order' => 7,
+            ],
+            [
+                'id' => 61,
+                'parent_id' => 60,
+                'module_key' => 'library',
+                'menu_key' => 'library_books',
+                'menu_title' => 'Books',
+                'route' => 'library-books.php',
+                'icon' => 'book-copy',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 62,
+                'parent_id' => 60,
+                'module_key' => 'library',
+                'menu_key' => 'library_issue_return',
+                'menu_title' => 'Issue/Return Books',
+                'route' => 'library-issue-return.php',
+                'icon' => 'repeat-2',
+                'display_order' => 2,
+            ],
+
+            [
+                'id' => 70,
+                'parent_id' => null,
+                'module_key' => 'transport',
+                'menu_key' => 'transport',
+                'menu_title' => 'Transport',
+                'route' => '#',
+                'icon' => 'bus-front',
+                'display_order' => 8,
+            ],
+            [
+                'id' => 71,
+                'parent_id' => 70,
+                'module_key' => 'transport',
+                'menu_key' => 'transport_vehicles',
+                'menu_title' => 'Vehicles',
+                'route' => 'transport-vehicles.php',
+                'icon' => 'bus',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 72,
+                'parent_id' => 70,
+                'module_key' => 'transport',
+                'menu_key' => 'transport_routes',
+                'menu_title' => 'Routes',
+                'route' => 'transport-routes.php',
+                'icon' => 'route',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 73,
+                'parent_id' => 70,
+                'module_key' => 'transport',
+                'menu_key' => 'student_transport',
+                'menu_title' => 'Student Transport',
+                'route' => 'student-transport.php',
+                'icon' => 'users-round',
+                'display_order' => 3,
+            ],
+
+            [
+                'id' => 80,
+                'parent_id' => null,
+                'module_key' => 'communication',
+                'menu_key' => 'communication',
+                'menu_title' => 'Communication',
+                'route' => '#',
+                'icon' => 'messages-square',
+                'display_order' => 9,
+            ],
+            [
+                'id' => 81,
+                'parent_id' => 80,
+                'module_key' => 'communication',
+                'menu_key' => 'notice_board',
+                'menu_title' => 'Notice Board',
+                'route' => 'notice-board.php',
+                'icon' => 'clipboard-list',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 82,
+                'parent_id' => 80,
+                'module_key' => 'communication',
+                'menu_key' => 'sms',
+                'menu_title' => 'SMS',
+                'route' => 'sms.php',
+                'icon' => 'message-square-text',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 83,
+                'parent_id' => 80,
+                'module_key' => 'communication',
+                'menu_key' => 'email',
+                'menu_title' => 'Email',
+                'route' => 'email.php',
+                'icon' => 'mail',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 84,
+                'parent_id' => 80,
+                'module_key' => 'communication',
+                'menu_key' => 'announcements',
+                'menu_title' => 'Announcements',
+                'route' => 'announcements.php',
+                'icon' => 'megaphone',
+                'display_order' => 4,
+            ],
+
+            [
+                'id' => 90,
+                'parent_id' => null,
+                'module_key' => 'reports',
+                'menu_key' => 'reports',
+                'menu_title' => 'Reports',
+                'route' => '#',
+                'icon' => 'chart-no-axes-combined',
+                'display_order' => 10,
+            ],
+            [
+                'id' => 91,
+                'parent_id' => 90,
+                'module_key' => 'reports',
+                'menu_key' => 'student_reports',
+                'menu_title' => 'Student Reports',
+                'route' => 'student-reports.php',
+                'icon' => 'file-user',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 92,
+                'parent_id' => 90,
+                'module_key' => 'reports',
+                'menu_key' => 'attendance_reports',
+                'menu_title' => 'Attendance Reports',
+                'route' => 'attendance-reports.php',
+                'icon' => 'calendar-search',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 93,
+                'parent_id' => 90,
+                'module_key' => 'reports',
+                'menu_key' => 'examination_reports',
+                'menu_title' => 'Examination Reports',
+                'route' => 'examination-reports.php',
+                'icon' => 'file-chart-column',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 94,
+                'parent_id' => 90,
+                'module_key' => 'reports',
+                'menu_key' => 'fee_reports',
+                'menu_title' => 'Fee Reports',
+                'route' => 'fee-reports.php',
+                'icon' => 'chart-column',
+                'display_order' => 4,
+            ],
+
+            [
+                'id' => 100,
+                'parent_id' => null,
+                'module_key' => 'users',
+                'menu_key' => 'users',
+                'menu_title' => 'User Management',
+                'route' => '#',
+                'icon' => 'user-cog',
+                'display_order' => 11,
+            ],
+            [
+                'id' => 101,
+                'parent_id' => 100,
+                'module_key' => 'users',
+                'menu_key' => 'user_list',
+                'menu_title' => 'Users',
+                'route' => 'users.php',
+                'icon' => 'users',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 102,
+                'parent_id' => 100,
+                'module_key' => 'users',
+                'menu_key' => 'roles_permissions',
+                'menu_title' => 'Roles & Permissions',
+                'route' => 'roles-permissions.php',
+                'icon' => 'shield-check',
+                'display_order' => 2,
+            ],
+
+            [
+                'id' => 110,
+                'parent_id' => null,
+                'module_key' => 'settings',
+                'menu_key' => 'settings',
+                'menu_title' => 'Settings',
+                'route' => '#',
+                'icon' => 'settings',
+                'display_order' => 12,
+            ],
+            [
+                'id' => 111,
+                'parent_id' => 110,
+                'module_key' => 'settings',
+                'menu_key' => 'school_profile',
+                'menu_title' => 'School Profile',
+                'route' => 'school-profile.php',
+                'icon' => 'school',
+                'display_order' => 1,
+            ],
+            [
+                'id' => 112,
+                'parent_id' => 110,
+                'module_key' => 'settings',
+                'menu_key' => 'general_settings',
+                'menu_title' => 'General Settings',
+                'route' => 'general-settings.php',
+                'icon' => 'sliders-horizontal',
+                'display_order' => 2,
+            ],
+            [
+                'id' => 113,
+                'parent_id' => 110,
+                'module_key' => 'settings',
+                'menu_key' => 'theme_settings',
+                'menu_title' => 'Theme Settings',
+                'route' => 'theme-settings.php',
+                'icon' => 'palette',
+                'display_order' => 3,
+            ],
+            [
+                'id' => 114,
+                'parent_id' => 110,
+                'module_key' => 'settings',
+                'menu_key' => 'backup_restore',
+                'menu_title' => 'Backup & Restore',
+                'route' => 'backup-restore.php',
+                'icon' => 'database-backup',
+                'display_order' => 4,
+            ],
+            [
+                'id' => 115,
+                'parent_id' => 110,
+                'module_key' => 'settings',
+                'menu_key' => 'profile',
+                'menu_title' => 'Profile',
+                'route' => 'profile.php',
+                'icon' => 'circle-user-round',
+                'display_order' => 5,
+            ],
+            [
+                'id' => 116,
+                'parent_id' => 110,
+                'module_key' => 'settings',
+                'menu_key' => 'change_password',
+                'menu_title' => 'Change Password',
+                'route' => 'change-password.php',
+                'icon' => 'key-round',
+                'display_order' => 6,
+            ],
+            [
+                'id' => 117,
+                'parent_id' => 110,
+                'module_key' => 'settings',
+                'menu_key' => 'sidebar_options',
+                'menu_title' => 'Sidebar Options',
+                'route' => 'sidebar-options.php',
+                'icon' => 'panel-left',
+                'display_order' => 7,
+            ],
+
+            [
+                'id' => 120,
+                'parent_id' => null,
+                'module_key' => 'support',
+                'menu_key' => 'help_support',
+                'menu_title' => 'Help & Support',
+                'route' => 'help-support.php',
+                'icon' => 'circle-help',
+                'display_order' => 13,
+            ],
+            [
+                'id' => 130,
+                'parent_id' => null,
+                'module_key' => 'authentication',
+                'menu_key' => 'logout',
+                'menu_title' => 'Logout',
+                'route' => 'logout.php',
+                'icon' => 'log-out',
+                'display_order' => 14,
+            ],
+        ];
+    }
+}
+
+if (!function_exists('school_sidebar_fallback_menus')) {
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    function school_sidebar_fallback_menus(): array
+    {
+        return array_map(
+            static function (array $option): array {
+                return [
+                    'id' => (int)($option['id'] ?? 0),
+                    'parent_id' => $option['parent_id'] ?? null,
+                    'module_key' => (string)($option['module_key'] ?? ''),
+                    'menu_key' => (string)($option['menu_key'] ?? ''),
+                    'display_title' => (string)(
+                        $option['menu_title'] ?? 'Menu'
+                    ),
+                    'route' => (string)($option['route'] ?? '#'),
+                    'display_icon' => (string)(
+                        $option['icon'] ?? 'circle'
+                    ),
+                    'badge_text' => $option['badge_text'] ?? null,
+                    'badge_variant' => $option['badge_variant'] ?? null,
+                    'display_order' => (int)(
+                        $option['display_order'] ?? 0
+                    ),
+                    'can_show' => 1,
+                    'is_visible' => 1,
+                ];
+            },
+            school_sidebar_master_options()
+        );
+    }
+}
+
+if (!function_exists('school_sidebar_allowed_icons')) {
+    /**
+     * @return array<int,string>
+     */
+    function school_sidebar_allowed_icons(): array
+    {
+        $icons = [];
+
+        foreach (school_sidebar_master_options() as $option) {
+            $icon = trim((string)($option['icon'] ?? ''));
+
+            if ($icon !== '') {
+                $icons[] = $icon;
+            }
+        }
+
+        return array_values(array_unique(array_merge($icons, [
+            'circle',
+            'database',
+            'panel-left',
+            'layers',
+            'clipboard-list',
+            'graduation-cap',
+            'school',
+        ])));
+    }
+}

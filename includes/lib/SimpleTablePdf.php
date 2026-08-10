@@ -1,0 +1,8 @@
+<?php
+declare(strict_types=1);
+final class SimpleTablePdf
+{
+ public function download(string$file,string$title,array$headers,array$rows):never{
+  $lines=[$title,str_repeat('=',min(90,strlen($title))),implode(' | ',$headers),str_repeat('-',110)];foreach($rows as$r)$lines[]=implode(' | ',array_map(static fn($v)=>mb_substr(preg_replace('/\s+/',' ',(string)$v)?:'',0,34),$r));$pages=array_chunk($lines,45);$obj=[];$ids=[];$next=4;foreach($pages as$ls){$pid=$next++;$cid=$next++;$ids[]=$pid;$stream="BT\n/F1 9 Tf\n35 800 Td\n";foreach($ls as$i=>$line){if($i)$stream.="0 -16 Td\n";$x=iconv('UTF-8','Windows-1252//TRANSLIT',$line);if($x===false)$x=$line;$x=str_replace(['\\','(',')'],['\\\\','\\(','\\)'],$x);$stream.="($x) Tj\n";}$stream.='ET';$obj[$cid]="<< /Length ".strlen($stream)." >>\nstream\n$stream\nendstream";$obj[$pid]="<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents $cid 0 R >>";}$kids=implode(' ',array_map(fn($id)=>"$id 0 R",$ids));$obj[1]='<< /Type /Catalog /Pages 2 0 R >>';$obj[2]="<< /Type /Pages /Kids [$kids] /Count ".count($ids).' >>';$obj[3]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';ksort($obj);$pdf="%PDF-1.4\n";$off=[0];foreach($obj as$id=>$o){$off[$id]=strlen($pdf);$pdf.="$id 0 obj\n$o\nendobj\n";}$xref=strlen($pdf);$max=max(array_keys($obj));$pdf.="xref\n0 ".($max+1)."\n0000000000 65535 f \n";for($i=1;$i<=$max;$i++)$pdf.=sprintf("%010d 00000 n \n",$off[$i]??0);$pdf.="trailer\n<< /Size ".($max+1)." /Root 1 0 R >>\nstartxref\n$xref\n%%EOF";header('Content-Type: application/pdf');header('Content-Disposition: attachment; filename="'.preg_replace('/[^A-Za-z0-9._-]/','_',$file).'"');header('Content-Length: '.strlen($pdf));echo$pdf;exit;
+ }
+}

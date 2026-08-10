@@ -1,0 +1,14 @@
+Add this ONE line in includes/layout-start.php after bootstrap/database is loaded and before the page body is rendered:
+
+require_once __DIR__ . '/general-settings-client.php';
+
+This exposes globally:
+- window.SCHOOL_GENERAL_SETTINGS
+- window.SchoolSettings.formatDate(value)
+- window.SchoolSettings.formatTime(value)
+- data-school-default-time="start"
+- data-school-default-time="end"
+- data-school-time-value="HH:MM:SS"
+- data-school-date-value="YYYY-MM-DD"
+
+Time inputs filled by data-school-default-time remain editable by the user.

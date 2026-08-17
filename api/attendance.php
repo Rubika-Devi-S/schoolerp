@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
 
+/* Build: 2026-08-17-attendance-strict-branch-v3 */
+
 function attendanceJson(bool $success,string $message='',array $data=[],int $status=200): never
 {
     while(ob_get_level()>0)ob_end_clean();
@@ -28,29 +30,166 @@ function attendanceUser(): array
     return is_array($user)?$user:[];
 }
 
-function attendanceScope(): array
+function attendanceScope(PDO $pdo): array
 {
+    if(session_status()!==PHP_SESSION_ACTIVE){
+        session_start();
+    }
+
     $user=attendanceUser();
 
+    $tenantId=(int)(
+        $user['tenant_id']
+        ??$user['school_id']
+        ??$_SESSION['tenant_id']
+        ??$_SESSION['school_id']
+        ??0
+    );
+
+    $userId=(int)(
+        $user['id']
+        ??$user['user_id']
+        ??$_SESSION['user_id']
+        ??0
+    );
+
+    /*
+     * IMPORTANT:
+     * Branch Settings stores the selected/current Branch in the session.
+     * Use that branch before any older value cached in current_user().
+     */
+    $branchId=0;
+
+    if(function_exists('current_branch_id')){
+        try{
+            $branchId=(int)current_branch_id();
+        }catch(Throwable){
+            $branchId=0;
+        }
+    }
+
+    if($branchId<=0&&function_exists('branch_current_id')){
+        try{
+            $branchId=(int)branch_current_id();
+        }catch(Throwable){
+            $branchId=0;
+        }
+    }
+
+    if($branchId<=0){
+        $branchId=(int)(
+            $_SESSION['branch_id']
+            ??$_SESSION['default_branch_id']
+            ??$user['branch_id']
+            ??$user['default_branch_id']
+            ??0
+        );
+    }
+
+    if(
+        $branchId<=0
+        &&$userId>0
+        &&tableExists($pdo,'users')
+    ){
+        try{
+            $query=$pdo->prepare(
+                "SELECT default_branch_id
+                 FROM users
+                 WHERE id=:user_id
+                   AND tenant_id=:tenant_id
+                 LIMIT 1"
+            );
+            $query->execute([
+                'user_id'=>$userId,
+                'tenant_id'=>$tenantId,
+            ]);
+            $branchId=(int)$query->fetchColumn();
+        }catch(Throwable){
+            $branchId=0;
+        }
+    }
+
+    if(
+        $branchId<=0
+        &&$tenantId>0
+        &&tableExists($pdo,'branches')
+    ){
+        $query=$pdo->prepare(
+            "SELECT id
+             FROM branches
+             WHERE tenant_id=:tenant_id
+               AND status='active'
+             ORDER BY is_main DESC,id ASC
+             LIMIT 1"
+        );
+        $query->execute([
+            'tenant_id'=>$tenantId,
+        ]);
+        $branchId=(int)$query->fetchColumn();
+    }
+
+    if($tenantId<=0){
+        throw new RuntimeException(
+            'School tenant session was not found.',
+            401
+        );
+    }
+
+    if($branchId<=0){
+        throw new RuntimeException(
+            'Active Branch is required for Attendance.',
+            422
+        );
+    }
+
+    if(tableExists($pdo,'branches')){
+        $query=$pdo->prepare(
+            "SELECT branch_name
+             FROM branches
+             WHERE id=:branch_id
+               AND tenant_id=:tenant_id
+               AND status='active'
+             LIMIT 1"
+        );
+        $query->execute([
+            'branch_id'=>$branchId,
+            'tenant_id'=>$tenantId,
+        ]);
+
+        $branchName=(string)($query->fetchColumn()?:'');
+
+        if($branchName===''){
+            throw new RuntimeException(
+                'The selected Branch does not belong to this School.',
+                403
+            );
+        }
+
+        $_SESSION['branch_id']=$branchId;
+        $_SESSION['default_branch_id']=$branchId;
+        $_SESSION['branch_name']=$branchName;
+    }
+
+    /*
+     * Database branch-isolation triggers use these connection variables.
+     */
+    try{
+        $query=$pdo->prepare(
+            "SET @schoolerp_tenant_id=:tenant_id,
+                 @schoolerp_branch_id=:branch_id"
+        );
+        $query->execute([
+            'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
+        ]);
+    }catch(Throwable){
+        /* Keep compatibility with databases without those triggers. */
+    }
+
     return [
-        'tenant_id'=>(int)(
-            $user['tenant_id']
-            ??$user['school_id']
-            ??$_SESSION['tenant_id']
-            ??$_SESSION['school_id']
-            ??0
-        ),
-        'branch_id'=>(int)(
-            $user['branch_id']
-            ??$_SESSION['branch_id']
-            ??0
-        ),
-        'user_id'=>(int)(
-            $user['id']
-            ??$user['user_id']
-            ??$_SESSION['user_id']
-            ??0
-        ),
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+        'user_id'=>$userId,
     ];
 }
 
@@ -224,40 +363,129 @@ function attendanceMeta(PDO $pdo,array $scope): array
             "SELECT id,year_name
              FROM academic_years
              WHERE tenant_id=:tenant_id
+               AND branch_id=:branch_id
              ORDER BY is_current DESC,start_date DESC,id DESC"
         );
-        $query->execute(['tenant_id'=>$scope['tenant_id']]);
+        $query->execute([
+            'tenant_id'=>$scope['tenant_id'],
+            'branch_id'=>$scope['branch_id'],
+        ]);
         $years=$query->fetchAll(PDO::FETCH_ASSOC);
     }
 
-    if(tableExists($pdo,'classes')){
+    /*
+     * Attendance must use only the classes that were explicitly configured
+     * in Class Management for an academic year.
+     *
+     * Important:
+     *   class_management_classes = configured Class Management rows
+     *   classes.id                = canonical ID stored in student_enrollments
+     *
+     * Therefore we use class_management_classes only to decide WHICH classes
+     * are visible, but return the matching canonical classes.id to the UI.
+     * This prevents old/orphan rows in classes from appearing in Attendance.
+     */
+    if(
+        tableExists($pdo,'classes')
+        &&tableExists($pdo,'class_management_classes')
+    ){
         $query=$pdo->prepare(
-            "SELECT id,class_name,academic_year_id
-             FROM classes
-             WHERE tenant_id=:tenant_id
-               AND status='active'
-             ORDER BY academic_year_id DESC,display_order,class_name"
+            "SELECT
+                c.id,
+                c.class_name,
+                c.academic_year_id
+             FROM classes c
+             INNER JOIN (
+                SELECT
+                    tenant_id,
+                    branch_id,
+                    academic_year_id,
+                    LOWER(TRIM(class_name)) AS class_key,
+                    MIN(display_order) AS management_order
+                FROM class_management_classes
+                WHERE tenant_id=:management_tenant_id
+                  AND branch_id=:management_branch_id
+                  AND status='active'
+                GROUP BY
+                    tenant_id,
+                    branch_id,
+                    academic_year_id,
+                    LOWER(TRIM(class_name))
+             ) cmc
+                ON cmc.tenant_id=c.tenant_id
+               AND cmc.branch_id=c.branch_id
+               AND cmc.academic_year_id=c.academic_year_id
+               AND cmc.class_key=LOWER(TRIM(c.class_name))
+             INNER JOIN academic_years ay
+                ON ay.id=c.academic_year_id
+               AND ay.tenant_id=c.tenant_id
+               AND ay.branch_id=c.branch_id
+             WHERE c.tenant_id=:class_tenant_id
+               AND c.branch_id=:class_branch_id
+               AND c.status='active'
+             ORDER BY
+                c.academic_year_id DESC,
+                c.display_order,
+                cmc.management_order,
+                c.class_name"
         );
-        $query->execute(['tenant_id'=>$scope['tenant_id']]);
+        $query->execute([
+            'management_tenant_id'=>$scope['tenant_id'],
+            'management_branch_id'=>$scope['branch_id'],
+            'class_tenant_id'=>$scope['tenant_id'],
+            'class_branch_id'=>$scope['branch_id'],
+        ]);
         $classes=$query->fetchAll(PDO::FETCH_ASSOC);
     }
 
-    if(tableExists($pdo,'sections')){
+    /*
+     * Sections are also limited to exact Class Management class/section rows.
+     * The IDs returned are canonical sections.id values because attendance and
+     * student_enrollments reference the canonical sections table.
+     */
+    if(
+        tableExists($pdo,'sections')
+        &&tableExists($pdo,'classes')
+        &&tableExists($pdo,'class_management_classes')
+    ){
         $query=$pdo->prepare(
             "SELECT
                 sec.id,
                 sec.class_id,
                 sec.section_name,
                 c.academic_year_id
-             FROM sections sec
+             FROM class_management_classes cmc
              INNER JOIN classes c
-                ON c.id=sec.class_id
-               AND c.tenant_id=sec.tenant_id
-             WHERE sec.tenant_id=:tenant_id
+                ON c.tenant_id=cmc.tenant_id
+               AND c.branch_id=cmc.branch_id
+               AND c.academic_year_id=cmc.academic_year_id
+               AND LOWER(TRIM(c.class_name))
+                   =LOWER(TRIM(cmc.class_name))
+               AND c.status='active'
+             INNER JOIN academic_years ay
+                ON ay.id=c.academic_year_id
+               AND ay.tenant_id=c.tenant_id
+               AND ay.branch_id=c.branch_id
+             INNER JOIN sections sec
+                ON sec.tenant_id=c.tenant_id
+               AND sec.branch_id=c.branch_id
+               AND sec.class_id=c.id
+               AND LOWER(TRIM(sec.section_name))
+                   =LOWER(TRIM(cmc.section_name))
                AND sec.status='active'
-             ORDER BY c.display_order,c.class_name,sec.section_name"
+             WHERE cmc.tenant_id=:tenant_id
+               AND cmc.branch_id=:branch_id
+               AND cmc.status='active'
+             ORDER BY
+                c.academic_year_id DESC,
+                c.display_order,
+                c.class_name,
+                sec.section_name"
         );
-        $query->execute(['tenant_id'=>$scope['tenant_id']]);
+        $query->execute([
+            'tenant_id'=>$scope['tenant_id'],
+            'branch_id'=>$scope['branch_id'],
+        ]);
         $sections=$query->fetchAll(PDO::FETCH_ASSOC);
     }
 
@@ -281,15 +509,22 @@ function attendanceMeta(PDO $pdo,array $scope): array
              INNER JOIN student_enrollments e
                 ON e.student_id=s.id
                AND e.tenant_id=s.tenant_id
+               AND e.branch_id=s.branch_id
                AND e.enrollment_status='active'
              INNER JOIN classes c
                 ON c.id=e.class_id
                AND c.tenant_id=e.tenant_id
+               AND c.branch_id=e.branch_id
              INNER JOIN sections sec
                 ON sec.id=e.section_id
                AND sec.tenant_id=e.tenant_id
+               AND sec.branch_id=e.branch_id
+             INNER JOIN academic_years ay
+                ON ay.id=e.academic_year_id
+               AND ay.tenant_id=e.tenant_id
+               AND ay.branch_id=e.branch_id
              WHERE s.tenant_id=:tenant_id
-               AND (:branch_scope=0 OR s.branch_id=:branch_value)
+               AND s.branch_id=:branch_id
                AND s.status='active'
                AND s.deleted_at IS NULL
              ORDER BY c.display_order,c.class_name,
@@ -298,8 +533,7 @@ function attendanceMeta(PDO $pdo,array $scope): array
 
         $query->execute([
             'tenant_id'=>$scope['tenant_id'],
-            'branch_scope'=>$scope['branch_id'],
-            'branch_value'=>$scope['branch_id'],
+            'branch_id'=>$scope['branch_id'],
         ]);
 
         $students=$query->fetchAll(PDO::FETCH_ASSOC);
@@ -365,12 +599,18 @@ function attendanceLoadStudents(
     $selectionCheck=$pdo->prepare(
         "SELECT COUNT(*)
          FROM classes c
+         INNER JOIN academic_years ay
+            ON ay.id=c.academic_year_id
+           AND ay.tenant_id=c.tenant_id
+           AND ay.branch_id=c.branch_id
          INNER JOIN sections sec
             ON sec.class_id=c.id
            AND sec.tenant_id=c.tenant_id
+           AND sec.branch_id=c.branch_id
          WHERE c.id=:class_id
            AND sec.id=:section_id
            AND c.tenant_id=:tenant_id
+           AND c.branch_id=:branch_id
            AND c.academic_year_id=:academic_year_id
            AND c.status='active'
            AND sec.status='active'"
@@ -380,6 +620,7 @@ function attendanceLoadStudents(
         'class_id'=>$classId,
         'section_id'=>$sectionId,
         'tenant_id'=>$scope['tenant_id'],
+        'branch_id'=>$scope['branch_id'],
         'academic_year_id'=>$academicYearId,
     ]);
 
@@ -409,23 +650,31 @@ function attendanceLoadStudents(
          INNER JOIN students s
             ON s.id=e.student_id
            AND s.tenant_id=e.tenant_id
+           AND s.branch_id=e.branch_id
          INNER JOIN classes c
             ON c.id=e.class_id
            AND c.tenant_id=e.tenant_id
+           AND c.branch_id=e.branch_id
          INNER JOIN sections sec
             ON sec.id=e.section_id
            AND sec.tenant_id=e.tenant_id
+           AND sec.branch_id=e.branch_id
+         INNER JOIN academic_years ay
+            ON ay.id=e.academic_year_id
+           AND ay.tenant_id=e.tenant_id
+           AND ay.branch_id=e.branch_id
          LEFT JOIN student_attendance a
             ON a.student_id=e.student_id
            AND a.tenant_id=e.tenant_id
+           AND a.branch_id=e.branch_id
            AND a.academic_year_id=e.academic_year_id
            AND a.attendance_date=:attendance_date
          WHERE e.tenant_id=:tenant_id
+           AND e.branch_id=:branch_id
            AND e.academic_year_id=:academic_year_id
            AND e.class_id=:class_id
            AND e.section_id=:section_id
            AND e.enrollment_status='active'
-           AND (:branch_scope=0 OR s.branch_id=:branch_value)
            AND s.status='active'
            AND s.deleted_at IS NULL
          ORDER BY
@@ -446,8 +695,7 @@ function attendanceLoadStudents(
         'academic_year_id'=>$academicYearId,
         'class_id'=>$classId,
         'section_id'=>$sectionId,
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
+        'branch_id'=>$scope['branch_id'],
     ]);
 
     $students=$query->fetchAll(PDO::FETCH_ASSOC);
@@ -499,14 +747,13 @@ function attendanceRows(
 ): array {
     $where=[
         'a.tenant_id=:tenant_id',
-        '(:branch_scope=0 OR a.branch_id=:branch_value)',
+        'a.branch_id=:branch_id',
         'a.attendance_date=:attendance_date',
     ];
 
     $params=[
         'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
+        'branch_id'=>$scope['branch_id'],
         'attendance_date'=>trim(
             (string)($filters['date']??date('Y-m-d'))
         ),
@@ -570,19 +817,24 @@ function attendanceRows(
          INNER JOIN students s
             ON s.id=a.student_id
            AND s.tenant_id=a.tenant_id
+           AND s.branch_id=a.branch_id
          LEFT JOIN student_enrollments e
             ON e.student_id=a.student_id
            AND e.academic_year_id=a.academic_year_id
            AND e.tenant_id=a.tenant_id
+           AND e.branch_id=a.branch_id
          LEFT JOIN classes c
             ON c.id=e.class_id
            AND c.tenant_id=e.tenant_id
+           AND c.branch_id=e.branch_id
          LEFT JOIN sections sec
             ON sec.id=e.section_id
            AND sec.tenant_id=e.tenant_id
+           AND sec.branch_id=e.branch_id
          LEFT JOIN academic_years ay
             ON ay.id=a.academic_year_id
            AND ay.tenant_id=a.tenant_id
+           AND ay.branch_id=a.branch_id
          WHERE ".implode(' AND ',$where)."
          ORDER BY
             COALESCE(c.display_order,9999),
@@ -607,17 +859,17 @@ function attendanceStats(
          INNER JOIN student_enrollments e
             ON e.student_id=s.id
            AND e.tenant_id=s.tenant_id
+           AND e.branch_id=s.branch_id
            AND e.enrollment_status='active'
          WHERE s.tenant_id=:tenant_id
-           AND (:branch_scope=0 OR s.branch_id=:branch_value)
+           AND s.branch_id=:branch_id
            AND s.status='active'
            AND s.deleted_at IS NULL"
     );
 
     $totalQuery->execute([
         'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
+        'branch_id'=>$scope['branch_id'],
     ]);
 
     $total=(int)$totalQuery->fetchColumn();
@@ -633,14 +885,13 @@ function attendanceStats(
             COUNT(*) AS marked
          FROM student_attendance
          WHERE tenant_id=:tenant_id
-           AND (:branch_scope=0 OR branch_id=:branch_value)
+           AND branch_id=:branch_id
            AND attendance_date=:attendance_date"
     );
 
     $query->execute([
         'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
+        'branch_id'=>$scope['branch_id'],
         'attendance_date'=>$date,
     ]);
 
@@ -687,14 +938,17 @@ function weeklyData(PDO $pdo,array $scope): array
             ON e.student_id=a.student_id
            AND e.academic_year_id=a.academic_year_id
            AND e.tenant_id=a.tenant_id
+           AND e.branch_id=a.branch_id
          INNER JOIN classes c
             ON c.id=e.class_id
            AND c.tenant_id=e.tenant_id
+           AND c.branch_id=e.branch_id
          INNER JOIN sections sec
             ON sec.id=e.section_id
            AND sec.tenant_id=e.tenant_id
+           AND sec.branch_id=e.branch_id
          WHERE a.tenant_id=:tenant_id
-           AND (:branch_scope=0 OR a.branch_id=:branch_value)
+           AND a.branch_id=:branch_id
            AND a.attendance_date BETWEEN :start_date AND :end_date
          GROUP BY
             e.class_id,c.class_name,
@@ -707,8 +961,7 @@ function weeklyData(PDO $pdo,array $scope): array
 
     $query->execute([
         'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
+        'branch_id'=>$scope['branch_id'],
         'start_date'=>$start,
         'end_date'=>$end,
     ]);
@@ -778,14 +1031,14 @@ if(
     $_SESSION['attendance_csrf_token']=bin2hex(random_bytes(32));
 }
 
-$scope=attendanceScope();
+$scope=attendanceScope($pdo);
 
-if($scope['tenant_id']<=0){
+if($scope['tenant_id']<=0||$scope['branch_id']<=0){
     attendanceJson(
         false,
-        'School tenant session was not found.',
+        'Active School and Branch context is required.',
         [],
-        401
+        422
     );
 }
 
@@ -982,14 +1235,21 @@ try{
              INNER JOIN student_enrollments e
                 ON e.student_id=s.id
                AND e.tenant_id=s.tenant_id
+               AND e.branch_id=s.branch_id
+             INNER JOIN academic_years ay
+                ON ay.id=e.academic_year_id
+               AND ay.tenant_id=e.tenant_id
+               AND ay.branch_id=e.branch_id
              WHERE s.id=:student_id
                AND s.tenant_id=:tenant_id
+               AND s.branch_id=:branch_id
                AND e.academic_year_id=:academic_year_id"
         );
 
         $studentCheck->execute([
             'student_id'=>$studentId,
             'tenant_id'=>$scope['tenant_id'],
+            'branch_id'=>$scope['branch_id'],
             'academic_year_id'=>$yearId,
         ]);
 
@@ -1052,11 +1312,13 @@ try{
                 "SELECT *
                  FROM student_attendance
                  WHERE id=:id
-                   AND tenant_id=:tenant_id"
+                   AND tenant_id=:tenant_id
+                   AND branch_id=:branch_id"
             );
             $find->execute([
                 'id'=>$id,
                 'tenant_id'=>$scope['tenant_id'],
+                'branch_id'=>$scope['branch_id'],
             ]);
 
             $old=$find->fetch(PDO::FETCH_ASSOC);
@@ -1082,7 +1344,8 @@ try{
                     source=:source,
                     marked_by=:marked_by
                  WHERE id=:id
-                   AND tenant_id=:tenant_id"
+                   AND tenant_id=:tenant_id
+                   AND branch_id=:branch_id"
             );
 
             $query->execute(
@@ -1121,11 +1384,15 @@ try{
                     "SELECT id
                      FROM student_attendance
                      WHERE student_id=:student_id
+                       AND tenant_id=:tenant_id
+                       AND branch_id=:branch_id
                        AND attendance_date=:attendance_date
                      LIMIT 1"
                 );
                 $find->execute([
                     'student_id'=>$studentId,
+                    'tenant_id'=>$scope['tenant_id'],
+                    'branch_id'=>$scope['branch_id'],
                     'attendance_date'=>$data[
                         'attendance_date'
                     ],
@@ -1222,12 +1489,18 @@ try{
         $selectionCheck=$pdo->prepare(
             "SELECT COUNT(*)
              FROM classes c
+             INNER JOIN academic_years ay
+                ON ay.id=c.academic_year_id
+               AND ay.tenant_id=c.tenant_id
+               AND ay.branch_id=c.branch_id
              INNER JOIN sections sec
                 ON sec.class_id=c.id
                AND sec.tenant_id=c.tenant_id
+               AND sec.branch_id=c.branch_id
              WHERE c.id=:class_id
                AND sec.id=:section_id
                AND c.tenant_id=:tenant_id
+               AND c.branch_id=:branch_id
                AND c.academic_year_id=:academic_year_id
                AND c.status='active'
                AND sec.status='active'"
@@ -1237,6 +1510,7 @@ try{
             'class_id'=>$classId,
             'section_id'=>$sectionId,
             'tenant_id'=>$scope['tenant_id'],
+            'branch_id'=>$scope['branch_id'],
             'academic_year_id'=>$yearId,
         ]);
 
@@ -1257,7 +1531,9 @@ try{
                 ON e.student_id=a.student_id
                AND e.academic_year_id=a.academic_year_id
                AND e.tenant_id=a.tenant_id
+               AND e.branch_id=a.branch_id
              WHERE a.tenant_id=:tenant_id
+               AND a.branch_id=:branch_id
                AND a.academic_year_id=:academic_year_id
                AND a.attendance_date=:attendance_date
                AND e.class_id=:class_id
@@ -1266,6 +1542,7 @@ try{
 
         $existingQuery->execute([
             'tenant_id'=>$scope['tenant_id'],
+            'branch_id'=>$scope['branch_id'],
             'academic_year_id'=>$yearId,
             'attendance_date'=>$attendanceDate,
             'class_id'=>$classId,
@@ -1287,9 +1564,11 @@ try{
              INNER JOIN student_enrollments e
                 ON e.student_id=s.id
                AND e.tenant_id=s.tenant_id
+               AND e.branch_id=s.branch_id
              WHERE s.id=:student_id
                AND s.tenant_id=:tenant_id
-               AND (:branch_scope=0 OR s.branch_id=:branch_value)
+               AND s.branch_id=:branch_id
+               AND e.branch_id=:branch_id
                AND s.status='active'
                AND s.deleted_at IS NULL
                AND e.academic_year_id=:academic_year_id
@@ -1322,7 +1601,19 @@ try{
                 marked_by=VALUES(marked_by)"
         );
 
-        $allowedStatuses=['present','absent','leave'];
+        /*
+         * Take Student Attendance supports every status displayed by the UI.
+         * Students not changed by the user are submitted as Present.
+         */
+        $allowedStatuses=[
+            'present',
+            'absent',
+            'half_day',
+            'late',
+            'leave',
+            'on_duty',
+            'holiday',
+        ];
         $savedCount=0;
         $insertedCount=0;
         $updatedCount=0;
@@ -1339,8 +1630,7 @@ try{
             $studentCheck->execute([
                 'student_id'=>$studentId,
                 'tenant_id'=>$scope['tenant_id'],
-                'branch_scope'=>$scope['branch_id'],
-                'branch_value'=>$scope['branch_id'],
+                'branch_id'=>$scope['branch_id'],
                 'academic_year_id'=>$yearId,
                 'class_id'=>$classId,
                 'section_id'=>$sectionId,

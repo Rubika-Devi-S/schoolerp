@@ -15,6 +15,235 @@ $baseUrl = defined('BASE_URL')
 $csrfToken = function_exists('csrfToken')
     ? csrfToken()
     : '';
+
+/*
+ * Section action permissions.
+ *
+ * Platform Owner / Super Admin:
+ *   Full access to all Section actions.
+ *
+ * Other School users:
+ *   Controlled by School Sidebar Permissions.
+ *
+ * Unknown / missing permissions fail closed, so buttons are hidden.
+ */
+$sectionsPermissionUser = function_exists('current_user')
+    ? current_user()
+    : [];
+
+$sectionsPermissionUser = is_array($sectionsPermissionUser)
+    ? $sectionsPermissionUser
+    : [];
+
+$sectionsRoleText = strtolower(
+    trim(
+        (string)(
+            $sectionsPermissionUser['role_key']
+            ?? $sectionsPermissionUser['role_name']
+            ?? $sectionsPermissionUser['role']
+            ?? $sectionsPermissionUser['user_type']
+            ?? $_SESSION['role_key']
+            ?? $_SESSION['role_name']
+            ?? $_SESSION['role']
+            ?? ''
+        )
+    )
+);
+
+$sectionsRoleKey = preg_replace(
+    '/[^a-z0-9]+/',
+    '_',
+    $sectionsRoleText
+) ?? '';
+
+$sectionsPlatformFullAccess = in_array(
+    trim($sectionsRoleKey, '_'),
+    [
+        'platform_owner',
+        'platformowner',
+        'platform_admin',
+        'platformadministrator',
+        'super_admin',
+        'superadministrator',
+    ],
+    true
+);
+
+if (function_exists('is_super_admin')) {
+    try {
+        $sectionsPlatformFullAccess =
+            $sectionsPlatformFullAccess
+            || (bool)is_super_admin();
+    } catch (Throwable) {
+        // Continue with role-key matching.
+    }
+}
+
+$sectionsCapabilities = $sectionsPlatformFullAccess
+    ? [
+        'view' => true,
+        'add' => true,
+        'create' => true,
+        'edit' => true,
+        'delete' => true,
+        'print' => true,
+        'pdf' => true,
+        'export' => true,
+    ]
+    : (
+        function_exists('school_current_page_capabilities')
+            ? school_current_page_capabilities($pageKey)
+            : []
+    );
+
+$canSectionView = !empty($sectionsCapabilities['view']);
+
+$canSectionAdd = !empty(
+    $sectionsCapabilities['add']
+    ?? $sectionsCapabilities['create']
+    ?? false
+);
+
+$canSectionEdit = !empty(
+    $sectionsCapabilities['edit']
+);
+
+$canSectionDelete = !empty(
+    $sectionsCapabilities['delete']
+);
+
+$canSectionPrint = !empty(
+    $sectionsCapabilities['print']
+);
+
+$canSectionPdf = !empty(
+    $sectionsCapabilities['pdf']
+);
+
+$canSectionExport = !empty(
+    $sectionsCapabilities['export']
+);
+
+/*
+ * General Settings runtime:
+ * - School Start / End Time
+ * - 12 / 24 hour format
+ * - Enabled Morning / General / Evening Shift Time records
+ */
+$generalSettingsRuntime =
+    dirname(__DIR__)
+    . '/includes/general-settings-runtime.php';
+
+if (is_file($generalSettingsRuntime)) {
+    require_once $generalSettingsRuntime;
+}
+
+$resolvedCurrentUser = function_exists('current_user')
+    ? current_user()
+    : [];
+
+$resolvedCurrentUser = is_array($resolvedCurrentUser)
+    ? $resolvedCurrentUser
+    : [];
+
+$sectionsTenantId = (int)(
+    $resolvedCurrentUser['tenant_id']
+    ?? $resolvedCurrentUser['school_id']
+    ?? $_SESSION['tenant_id']
+    ?? $_SESSION['school_id']
+    ?? $_SESSION['tenant']['id']
+    ?? 0
+);
+
+$sectionsGeneralSettings = (
+    isset($pdo)
+    && $pdo instanceof PDO
+    && $sectionsTenantId > 0
+    && function_exists('school_settings_get')
+)
+    ? school_settings_get(
+        $pdo,
+        $sectionsTenantId
+    )
+    : [
+        'school_start_time' => '08:30:00',
+        'school_end_time' => '16:00:00',
+        'time_format' => '12',
+    ];
+
+$sectionsConfiguredShifts = (
+    isset($pdo)
+    && $pdo instanceof PDO
+    && $sectionsTenantId > 0
+    && function_exists('school_settings_enabled_shifts')
+)
+    ? school_settings_enabled_shifts(
+        $pdo,
+        $sectionsTenantId
+    )
+    : [];
+
+/*
+ * Backward-compatible fallback:
+ * When Shift Time Configuration has not been saved yet,
+ * General uses School Start Time / End Time.
+ */
+if (
+    empty($sectionsConfiguredShifts)
+    && $sectionsTenantId > 0
+) {
+    $generalStart = trim(
+        (string)(
+            $sectionsGeneralSettings['school_start_time']
+            ?? '08:30:00'
+        )
+    );
+
+    $generalEnd = trim(
+        (string)(
+            $sectionsGeneralSettings['school_end_time']
+            ?? '16:00:00'
+        )
+    );
+
+    if (
+        $generalStart !== ''
+        && $generalEnd !== ''
+        && $generalStart < $generalEnd
+    ) {
+        $formattedStart = function_exists(
+            'school_settings_format_time'
+        )
+            ? school_settings_format_time(
+                $generalStart,
+                $sectionsGeneralSettings
+            )
+            : $generalStart;
+
+        $formattedEnd = function_exists(
+            'school_settings_format_time'
+        )
+            ? school_settings_format_time(
+                $generalEnd,
+                $sectionsGeneralSettings
+            )
+            : $generalEnd;
+
+        $sectionsConfiguredShifts = [[
+            'shift_key' => 'general',
+            'shift_name' => 'General',
+            'start_time' => $generalStart,
+            'end_time' => $generalEnd,
+            'display_order' => 20,
+            'display_label' =>
+                'General ('
+                . $formattedStart
+                . ' - '
+                . $formattedEnd
+                . ')',
+        ]];
+    }
+}
 ?>
 <style>
 .sections-page{display:grid;gap:16px}
@@ -71,30 +300,6 @@ $csrfToken = function_exists('csrfToken')
 .sections-stat small{display:block;font-size:11px;font-weight:700;opacity:.94;margin-bottom:6px}
 .sections-stat .trend{font-size:9px;font-weight:700;opacity:.94;margin-top:8px}
 
-.sections-tabs{
-    display:flex;
-    gap:8px;
-    overflow:auto;
-    padding:10px;
-}
-.sections-tab{
-    border:1px solid var(--border-soft,#e7ebf3);
-    background:var(--card-bg,#fff);
-    color:var(--text-main,#101b46);
-    border-radius:9px;
-    padding:9px 12px;
-    font-size:11px;
-    font-weight:700;
-    white-space:nowrap;
-}
-.sections-tab.active{
-    color:#fff;
-    border-color:transparent;
-    background:linear-gradient(135deg,#6747e8,#2f62d7);
-}
-.sections-panel{display:none}
-.sections-panel.active{display:block}
-
 .sections-layout{
     display:grid;
     grid-template-columns:minmax(0,1fr);
@@ -128,6 +333,11 @@ $csrfToken = function_exists('csrfToken')
 .sections-table{min-width:1050px}
 .sections-table th{font-size:10px}
 .sections-table td{font-size:11px;vertical-align:middle}
+.sections-table td strong{
+    font-size:10px;
+    font-weight:800;
+    color:var(--text-main,#101b46);
+}
 .sections-name-cell{display:flex;align-items:center;gap:9px}
 .sections-avatar{
     width:30px;
@@ -226,6 +436,7 @@ $csrfToken = function_exists('csrfToken')
 }
 </style>
 
+<!-- Build: 2026-08-10-sections-role-permissions-superadmin-platform-v3 -->
 <div class="sections-page">
     <div class="page-heading">
         <div>
@@ -234,21 +445,48 @@ $csrfToken = function_exists('csrfToken')
         </div>
 
         <div class="page-actions">
-            <a id="printSections" class="btn-ui" target="_blank">
-                <i data-lucide="printer"></i> Print
-            </a>
+            <?php if ($canSectionPrint): ?>
+                <a
+                    id="printSections"
+                    class="btn-ui"
+                    target="_blank"
+                    data-permission-action="print"
+                >
+                    <i data-lucide="printer"></i> Print
+                </a>
+            <?php endif; ?>
 
-            <a id="exportSectionsPdf" class="btn-ui">
-                <i data-lucide="file-text"></i> PDF
-            </a>
+            <?php if ($canSectionPdf): ?>
+                <a
+                    id="exportSectionsPdf"
+                    class="btn-ui"
+                    target="_blank"
+                    data-permission-action="pdf"
+                >
+                    <i data-lucide="file-text"></i> PDF
+                </a>
+            <?php endif; ?>
 
-            <a id="exportSectionsExcel" class="btn-ui">
-                <i data-lucide="download"></i> Export
-            </a>
+            <?php if ($canSectionExport): ?>
+                <a
+                    id="exportSectionsExcel"
+                    class="btn-ui"
+                    data-permission-action="export"
+                >
+                    <i data-lucide="download"></i> Export
+                </a>
+            <?php endif; ?>
 
-            <button id="addSection" class="btn-ui btn-primary-ui" type="button">
-                <i data-lucide="plus"></i> Add Section
-            </button>
+            <?php if ($canSectionAdd): ?>
+                <button
+                    id="addSection"
+                    class="btn-ui btn-primary-ui"
+                    type="button"
+                    data-permission-action="create"
+                >
+                    <i data-lucide="plus"></i> Add Section
+                </button>
+            <?php endif; ?>
         </div>
     </div>
 
@@ -300,17 +538,7 @@ $csrfToken = function_exists('csrfToken')
         </article>
     </section>
 
-    <section class="ui-card sections-tabs">
-        <button class="sections-tab active" data-tab="sections" type="button">
-            Sections
-        </button>
-        <button class="sections-tab" data-tab="subjects" type="button">
-            Subject Assignment
-        </button>
-        <button class="sections-tab" data-tab="timetables" type="button">
-            Timetable Assignment
-        </button>
-    </section>
+
 
     <section class="sections-panel active" data-panel="sections">
         <section class="sections-layout">
@@ -365,7 +593,7 @@ $csrfToken = function_exists('csrfToken')
                                 <th>Class</th>
                                 <th>Academic Year</th>
                                 <th>Medium</th>
-                                <th>Shift</th>
+                                <th>Shift Time</th>
                                 <th>Room</th>
                                 <th>Capacity</th>
                                 <th>Class Teacher</th>
@@ -399,62 +627,7 @@ $csrfToken = function_exists('csrfToken')
 </section>
     </section>
 
-    <?php foreach (
-        [
-            'subjects' => 'Subject Assignment',
-            'timetables' => 'Timetable Assignment',
-        ] as $key => $title
-    ): ?>
-        <section class="sections-panel" data-panel="<?= e($key) ?>">
-            <div class="page-heading">
-                <div>
-                    <h2 class="page-title"><?= e($title) ?></h2>
-                    <p class="page-subtitle">
-                        Select a section and assign an existing record.
-                    </p>
-                </div>
 
-                <button
-                    class="btn-ui btn-primary-ui js-add-assignment"
-                    data-type="<?= e($key) ?>"
-                    type="button"
-                >
-                    <i data-lucide="plus"></i> Add Assignment
-                </button>
-            </div>
-
-            <section class="ui-card sections-card">
-                <div class="p-3">
-                    <select
-                        class="form-select js-assignment-section"
-                        data-type="<?= e($key) ?>"
-                    >
-                        <option value="">Select section</option>
-                    </select>
-                </div>
-
-                <div class="table-responsive">
-                    <table class="data-table">
-                        <thead
-                            class="js-assignment-head"
-                            data-type="<?= e($key) ?>"
-                        ></thead>
-
-                        <tbody
-                            class="js-assignment-body"
-                            data-type="<?= e($key) ?>"
-                        >
-                            <tr>
-                                <td class="text-center py-5">
-                                    Select a section.
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </section>
-        </section>
-    <?php endforeach; ?>
 </div>
 
 <div class="modal fade"
@@ -538,7 +711,7 @@ $csrfToken = function_exists('csrfToken')
 
                         <div class="col-md-4">
                             <label class="form-label">
-                                Shift
+                                Shift <span class="text-muted">(Optional)</span>
                             </label>
 
                             <select id="sectionShift"
@@ -646,55 +819,6 @@ $csrfToken = function_exists('csrfToken')
     </div>
 </div>
 
-<div class="modal fade"
-     id="assignmentModal"
-     tabindex="-1">
-    <div class="modal-dialog modal-lg
-                modal-dialog-centered">
-        <div class="modal-content">
-            <form id="assignmentForm">
-                <div class="modal-header">
-                    <h5 id="assignmentTitle"
-                        class="modal-title">
-                        Add Assignment
-                    </h5>
-
-                    <button class="btn-close"
-                            type="button"
-                            data-bs-dismiss="modal">
-                    </button>
-                </div>
-
-                <div class="modal-body">
-                    <input id="assignmentType"
-                           type="hidden">
-
-                    <input id="assignmentSectionId"
-                           type="hidden">
-
-                    <div id="assignmentFields"
-                         class="row g-3">
-                    </div>
-                </div>
-
-                <div class="modal-footer">
-                    <button class="btn-ui"
-                            type="button"
-                            data-bs-dismiss="modal">
-                        Cancel
-                    </button>
-
-                    <button class="btn-ui
-                                   btn-primary-ui"
-                            type="submit">
-                        <i data-lucide="save"></i>
-                        Save Assignment
-                    </button>
-                </div>
-            </form>
-        </div>
-    </div>
-</div>
 
 <script>
 (function () {
@@ -719,7 +843,44 @@ $csrfToken = function_exists('csrfToken')
     let csrfToken = <?= json_encode($csrfToken) ?>;
     let sections = [];
     let meta = {};
-    let permissions = {};
+
+    let permissions = <?= json_encode([
+        'view' => $canSectionView,
+        'add' => $canSectionAdd,
+        'create' => $canSectionAdd,
+        'edit' => $canSectionEdit,
+        'delete' => $canSectionDelete,
+        'print' => $canSectionPrint,
+        'pdf' => $canSectionPdf,
+        'export' => $canSectionExport,
+        'platform_full_access' => $sectionsPlatformFullAccess,
+    ], JSON_UNESCAPED_SLASHES) ?>;
+
+    /*
+     * Existing General Settings data.
+     * No new settings or toast system is created here.
+     */
+    const generalSettings = <?= json_encode(
+        $sectionsGeneralSettings,
+        JSON_UNESCAPED_UNICODE
+        | JSON_UNESCAPED_SLASHES
+    ) ?>;
+
+    const configuredShifts = <?= json_encode(
+        $sectionsConfiguredShifts,
+        JSON_UNESCAPED_UNICODE
+        | JSON_UNESCAPED_SLASHES
+    ) ?>;
+
+    const configuredShiftMap = new Map(
+        configuredShifts.map(shift => [
+            String(
+                shift.shift_name
+                || ''
+            ).trim().toLowerCase(),
+            shift
+        ])
+    );
 
     const escapeHtml = value => String(value ?? '')
         .replace(/&/g, '&amp;')
@@ -815,7 +976,57 @@ $csrfToken = function_exists('csrfToken')
         return result;
     }
 
-    function showMessage(text, success) {
+    function showMessage(
+        text,
+        success = false,
+        title = ''
+    ) {
+        const type = success
+            ? 'success'
+            : 'error';
+
+        /*
+         * Use the ERP's existing global common toast only.
+         * bootstrap/layout-start loads includes/common-toast.php.
+         */
+        if (
+            typeof window.schoolToast
+            === 'function'
+        ) {
+            window.schoolToast(
+                type,
+                text,
+                title || (
+                    success
+                        ? 'Success'
+                        : 'Action failed'
+                )
+            );
+
+            return;
+        }
+
+        if (
+            typeof window.showToast
+            === 'function'
+        ) {
+            window.showToast(
+                type,
+                text,
+                title || (
+                    success
+                        ? 'Success'
+                        : 'Action failed'
+                )
+            );
+
+            return;
+        }
+
+        /*
+         * Plain alert fallback only if the global common toast
+         * was not loaded for any reason.
+         */
         const box = document.getElementById(
             'sectionsMessage'
         );
@@ -829,6 +1040,153 @@ $csrfToken = function_exists('csrfToken')
             );
 
         box.textContent = text;
+    }
+
+    function normalizeShiftName(value) {
+        return String(
+            value || ''
+        )
+            .trim()
+            .toLowerCase();
+    }
+
+    function formatTimeFromGeneralSettings(value) {
+        const text = String(
+            value || ''
+        ).trim();
+
+        if (!text) {
+            return '';
+        }
+
+        const match = text.match(
+            /^(\d{1,2}):(\d{2})/
+        );
+
+        if (!match) {
+            return text;
+        }
+
+        let hour = Number(
+            match[1]
+        );
+
+        const minute =
+            match[2];
+
+        if (
+            String(
+                generalSettings.time_format
+                || '12'
+            ) === '24'
+        ) {
+            return String(hour)
+                .padStart(2, '0')
+                + ':'
+                + minute;
+        }
+
+        const period =
+            hour >= 12
+                ? 'PM'
+                : 'AM';
+
+        hour = hour % 12 || 12;
+
+        return hour
+            + ':'
+            + minute
+            + ' '
+            + period;
+    }
+
+    function configuredShiftByName(
+        shiftName
+    ) {
+        return configuredShiftMap.get(
+            normalizeShiftName(
+                shiftName
+            )
+        ) || null;
+    }
+
+    function sectionShiftDisplay(
+        shiftName
+    ) {
+        const name = String(
+            shiftName || ''
+        ).trim();
+
+        if (!name) {
+            return '-';
+        }
+
+        const shift =
+            configuredShiftByName(
+                name
+            );
+
+        if (!shift) {
+            return name;
+        }
+
+        if (
+            String(
+                shift.display_label
+                || ''
+            ).trim()
+        ) {
+            return String(
+                shift.display_label
+            );
+        }
+
+        const start =
+            formatTimeFromGeneralSettings(
+                shift.start_time
+            );
+
+        const end =
+            formatTimeFromGeneralSettings(
+                shift.end_time
+            );
+
+        return (
+            start
+            && end
+        )
+            ? `${name} (${start} - ${end})`
+            : name;
+    }
+
+    function sectionShiftTimeOnly(
+        shiftName
+    ) {
+        const shift =
+            configuredShiftByName(
+                shiftName
+            );
+
+        if (!shift) {
+            return '';
+        }
+
+        const start =
+            formatTimeFromGeneralSettings(
+                shift.start_time
+            );
+
+        const end =
+            formatTimeFromGeneralSettings(
+                shift.end_time
+            );
+
+        return (
+            start
+            && end
+        )
+            ? `${start} - ${end}`
+            : '';
     }
 
     function currentFilters() {
@@ -865,20 +1223,124 @@ $csrfToken = function_exists('csrfToken')
             currentFilters()
         );
 
-        document.getElementById(
-            'printSections'
-        ).href =
-            exportUrl + '?format=print&' + query;
+        query.set(
+            'page_key',
+            'sections'
+        );
 
-        document.getElementById(
-            'exportSectionsPdf'
-        ).href =
-            exportUrl + '?format=pdf&' + query;
+        const printButton =
+            document.getElementById(
+                'printSections'
+            );
 
-        document.getElementById(
-            'exportSectionsExcel'
-        ).href =
-            exportUrl + '?format=excel&' + query;
+        const pdfButton =
+            document.getElementById(
+                'exportSectionsPdf'
+            );
+
+        const exportButton =
+            document.getElementById(
+                'exportSectionsExcel'
+            );
+
+        if (
+            printButton
+            && permissions.print
+        ) {
+            const printQuery =
+                new URLSearchParams(
+                    query
+                );
+
+            printQuery.set(
+                'permission_action',
+                'print'
+            );
+
+            printButton.href =
+                exportUrl
+                + '?format=print&'
+                + printQuery;
+        }
+
+        if (
+            pdfButton
+            && permissions.pdf
+        ) {
+            const pdfQuery =
+                new URLSearchParams(
+                    query
+                );
+
+            pdfQuery.set(
+                'permission_action',
+                'pdf'
+            );
+
+            pdfButton.href =
+                exportUrl
+                + '?format=pdf&'
+                + pdfQuery;
+        }
+
+        if (
+            exportButton
+            && permissions.export
+        ) {
+            const exportQuery =
+                new URLSearchParams(
+                    query
+                );
+
+            exportQuery.set(
+                'permission_action',
+                'export'
+            );
+
+            exportButton.href =
+                exportUrl
+                + '?format=excel&'
+                + exportQuery;
+        }
+    }
+
+    function applySectionActionPermissions() {
+        const buttonMap = {
+            print: 'printSections',
+            pdf: 'exportSectionsPdf',
+            export: 'exportSectionsExcel',
+            create: 'addSection'
+        };
+
+        Object.entries(
+            buttonMap
+        ).forEach(
+            ([action, elementId]) => {
+                const element =
+                    document.getElementById(
+                        elementId
+                    );
+
+                if (!element) {
+                    return;
+                }
+
+                const allowed =
+                    action === 'create'
+                        ? Boolean(
+                            permissions.create
+                            || permissions.add
+                        )
+                        : Boolean(
+                            permissions[action]
+                        );
+
+                element.style.display =
+                    allowed
+                        ? ''
+                        : 'none';
+            }
+        );
     }
 
     function renderSections() {
@@ -898,7 +1360,32 @@ $csrfToken = function_exists('csrfToken')
                 <td>${escapeHtml(section.class_name_snapshot || '-')}</td>
                 <td>${escapeHtml(section.academic_year_name || '-')}</td>
                 <td>${escapeHtml(section.medium)}</td>
-                <td>${escapeHtml(section.shift_name)}</td>
+                <td>
+                    <strong>
+                        ${escapeHtml(
+                            section.shift_name
+                            || '-'
+                        )}
+                    </strong>
+                    ${
+                        sectionShiftTimeOnly(
+                            section.shift_name
+                        )
+                            ? `
+                                <small
+                                    class="d-block text-muted"
+                                    style="font-size:8px;margin-top:2px"
+                                >
+                                    ${escapeHtml(
+                                        sectionShiftTimeOnly(
+                                            section.shift_name
+                                        )
+                                    )}
+                                </small>
+                            `
+                            : ''
+                    }
+                </td>
                 <td>${escapeHtml(section.room_number || '-')}</td>
                 <td>${Number(section.maximum_student_capacity)}</td>
                 <td>${escapeHtml(section.class_teacher_name || '-')}</td>
@@ -909,13 +1396,15 @@ $csrfToken = function_exists('csrfToken')
                 </td>
                 <td>
                     <div class="sections-actions">
-                        <button
-                            class="sections-action js-section-view"
-                            type="button"
-                            title="View"
-                        >
-                            <i data-lucide="eye"></i>
-                        </button>
+                        ${permissions.view ? `
+                            <button
+                                class="sections-action js-section-view"
+                                type="button"
+                                title="View"
+                            >
+                                <i data-lucide="eye"></i>
+                            </button>
+                        ` : ''}
 
                         ${permissions.edit ? `
                             <button
@@ -984,6 +1473,15 @@ $csrfToken = function_exists('csrfToken')
 
         body.querySelectorAll('.js-section-delete').forEach(button => {
             button.addEventListener('click', async () => {
+                if (!permissions.delete) {
+                    showMessage(
+                        'You do not have permission to delete sections.',
+                        false
+                    );
+
+                    return;
+                }
+
                 const row = button.closest('tr[data-id]');
 
                 if (!window.confirm(
@@ -1007,7 +1505,6 @@ $csrfToken = function_exists('csrfToken')
             });
         });
 
-        updateAssignmentSectionOptions();
         updateExportLinks();
         window.lucide?.createIcons();
     }
@@ -1016,6 +1513,47 @@ $csrfToken = function_exists('csrfToken')
         section = null,
         viewOnly = false
     ) {
+        if (
+            viewOnly
+            && !permissions.view
+        ) {
+            showMessage(
+                'You do not have permission to view sections.',
+                false
+            );
+
+            return;
+        }
+
+        if (
+            section
+            && !viewOnly
+            && !permissions.edit
+        ) {
+            showMessage(
+                'You do not have permission to edit sections.',
+                false
+            );
+
+            return;
+        }
+
+        if (
+            !section
+            && !viewOnly
+            && !(
+                permissions.add
+                || permissions.create
+            )
+        ) {
+            showMessage(
+                'You do not have permission to add sections.',
+                false
+            );
+
+            return;
+        }
+
         const form = document.getElementById(
             'sectionForm'
         );
@@ -1077,6 +1615,43 @@ $csrfToken = function_exists('csrfToken')
                     ?? defaultValue;
             }
         );
+
+        /*
+         * Existing rows may contain a Shift that is now disabled.
+         * Keep it visible while viewing/editing that old record,
+         * but new records can choose only enabled General Settings shifts.
+         */
+        if (
+            section
+            && section.shift_name
+            && !configuredShiftByName(
+                section.shift_name
+            )
+        ) {
+            const shiftSelect =
+                document.getElementById(
+                    'sectionShift'
+                );
+
+            const option =
+                document.createElement(
+                    'option'
+                );
+
+            option.value =
+                section.shift_name;
+
+            option.textContent =
+                section.shift_name
+                + ' (Disabled in General Settings)';
+
+            shiftSelect.appendChild(
+                option
+            );
+
+            shiftSelect.value =
+                section.shift_name;
+        }
 
         document.querySelectorAll(
             '#sectionForm input, '
@@ -1181,15 +1756,16 @@ $csrfToken = function_exists('csrfToken')
                 || csrfToken;
 
             meta = result.data.meta || {};
-            permissions =
-                result.data.permissions || {};
 
-            document.getElementById(
-                'addSection'
-            ).style.display =
-                permissions.add
-                    ? ''
-                    : 'none';
+            permissions = {
+                ...permissions,
+                ...(
+                    result.data.permissions
+                    || {}
+                )
+            };
+
+            applySectionActionPermissions();
 
             fillSelect(
                 'sectionAcademicYear',
@@ -1240,16 +1816,74 @@ $csrfToken = function_exists('csrfToken')
                 true
             );
 
-            fillSimple(
-                'sectionShift',
-                meta.shifts || []
-            );
+            /*
+             * Shift Time comes only from General Settings.
+             * Disabled shifts are not shown.
+             */
+            const enabledShiftNames =
+                configuredShifts.map(
+                    shift =>
+                        String(
+                            shift.shift_name
+                            || ''
+                        ).trim()
+                ).filter(Boolean);
 
-            fillSimple(
-                'sectionsShift',
-                meta.shifts || [],
-                true
-            );
+            const sectionShiftSelect =
+                document.getElementById(
+                    'sectionShift'
+                );
+
+            sectionShiftSelect.innerHTML =
+                `
+                    <option value="">
+                        No Shift / Optional
+                    </option>
+                `
+                + enabledShiftNames.map(
+                    shiftName => `
+                        <option
+                            value="${escapeHtml(shiftName)}"
+                        >
+                            ${escapeHtml(
+                                sectionShiftDisplay(
+                                    shiftName
+                                )
+                            )}
+                        </option>
+                    `
+                ).join('');
+
+            const sectionShiftFilter =
+                document.getElementById(
+                    'sectionsShift'
+                );
+
+            sectionShiftFilter.innerHTML =
+                `
+                    <option value="all">
+                        All Shifts
+                    </option>
+                `
+                + enabledShiftNames.map(
+                    shiftName => `
+                        <option
+                            value="${escapeHtml(shiftName)}"
+                        >
+                            ${escapeHtml(
+                                sectionShiftDisplay(
+                                    shiftName
+                                )
+                            )}
+                        </option>
+                    `
+                ).join('');
+
+            /*
+             * Keep metadata in sync for code that already reads meta.shifts.
+             */
+            meta.shifts =
+                configuredShifts;
 
             await loadSections();
         } catch (error) {
@@ -1260,335 +1894,45 @@ $csrfToken = function_exists('csrfToken')
         }
     }
 
-    function updateAssignmentSectionOptions() {
-        document.querySelectorAll(
-            '.js-assignment-section'
-        ).forEach(select => {
-            const selected = select.value;
-
-            select.innerHTML = `
-                <option value="">
-                    Select section
-                </option>
-            ` + sections.map(
-                section => `
-                    <option value="${Number(section.id)}">
-                        ${escapeHtml(
-                            section.class_name_snapshot
-                            + ' - '
-                            + section.section_name
-                        )}
-                    </option>
-                `
-            ).join('');
-
-            select.value = selected;
-        });
-    }
-
-    async function loadAssignments(
-        type,
-        sectionId
-    ) {
-        const body = document.querySelector(
-            `.js-assignment-body[data-type="${type}"]`
-        );
-
-        const head = document.querySelector(
-            `.js-assignment-head[data-type="${type}"]`
-        );
-
-        if (type === 'subjects') {
-            head.innerHTML = `
-                <tr>
-                    <th>Subject</th>
-                    <th>Code</th>
-                    <th>Status</th>
-                    <th>Action</th>
-                </tr>
-            `;
-        } else {
-            head.innerHTML = `
-                <tr>
-                    <th>Timetable</th>
-                    <th>Status</th>
-                    <th>Action</th>
-                </tr>
-            `;
-        }
-
-        if (!sectionId) {
-            body.innerHTML = `
-                <tr>
-                    <td class="text-center py-5">
-                        Select a section.
-                    </td>
-                </tr>
-            `;
-
-            return;
-        }
-
-        try {
-            const result = await request(
-                'related',
-                {
-                    type,
-                    section_id: sectionId
-                }
-            );
-
-            const records =
-                result.data.records || [];
-
-            body.innerHTML = records.map(
-                record => type === 'subjects'
-                    ? `
-                        <tr>
-                            <td>
-                                ${escapeHtml(
-                                    record.subject_name
-                                )}
-                            </td>
-                            <td>
-                                ${escapeHtml(
-                                    record.subject_code
-                                    || '-'
-                                )}
-                            </td>
-                            <td>
-                                ${escapeHtml(
-                                    record.status
-                                )}
-                            </td>
-                            <td>
-                                ${
-                                    permissions.edit
-                                        ? `
-                                            <button
-                                                class="sections-action
-                                                       js-remove-assignment"
-                                                data-id="${Number(record.id)}"
-                                                type="button">
-                                                <i data-lucide="trash-2"></i>
-                                            </button>
-                                        `
-                                        : ''
-                                }
-                            </td>
-                        </tr>
-                    `
-                    : `
-                        <tr>
-                            <td>
-                                ${escapeHtml(
-                                    record.timetable_name
-                                )}
-                            </td>
-                            <td>
-                                ${escapeHtml(
-                                    record.status
-                                )}
-                            </td>
-                            <td>
-                                ${
-                                    permissions.edit
-                                        ? `
-                                            <button
-                                                class="sections-action
-                                                       js-remove-assignment"
-                                                data-id="${Number(record.id)}"
-                                                type="button">
-                                                <i data-lucide="trash-2"></i>
-                                            </button>
-                                        `
-                                        : ''
-                                }
-                            </td>
-                        </tr>
-                    `
-            ).join('') || `
-                <tr>
-                    <td colspan="${
-                        type === 'subjects'
-                            ? 4
-                            : 3
-                    }"
-                        class="text-center py-5">
-                        No assignments.
-                    </td>
-                </tr>
-            `;
-
-            body.querySelectorAll(
-                '.js-remove-assignment'
-            ).forEach(button => {
-                button.addEventListener(
-                    'click',
-                    async () => {
-                        if (
-                            !window.confirm(
-                                'Remove this assignment?'
-                            )
-                        ) {
-                            return;
-                        }
-
-                        await request(
-                            'delete_related',
-                            {
-                                type,
-                                id: Number(
-                                    button.dataset.id
-                                )
-                            },
-                            'POST'
-                        );
-
-                        await loadAssignments(
-                            type,
-                            sectionId
-                        );
-                    }
-                );
-            });
-
-            window.lucide?.createIcons();
-        } catch (error) {
-            showMessage(
-                error.message,
-                false
-            );
-        }
-    }
-
-    function openAssignment(type) {
-        const sectionSelect =
-            document.querySelector(
-                `.js-assignment-section[data-type="${type}"]`
-            );
-
-        if (!sectionSelect.value) {
-            showMessage(
-                'Select a section first.',
-                false
-            );
-
-            return;
-        }
-
-        document.getElementById(
-            'assignmentType'
-        ).value = type;
-
-        document.getElementById(
-            'assignmentSectionId'
-        ).value = sectionSelect.value;
-
-        const fields =
-            document.getElementById(
-                'assignmentFields'
-            );
-
-        if (type === 'subjects') {
-            document.getElementById(
-                'assignmentTitle'
-            ).textContent =
-                'Assign Existing Subject';
-
-            fields.innerHTML = `
-                <div class="col-12">
-                    <label class="form-label">
-                        Subject
-                    </label>
-
-                    <select id="assignmentSubject"
-                            class="form-select"
-                            required>
-                        <option value="">
-                            Select subject
-                        </option>
-
-                        ${(meta.subjects || []).map(
-                            subject => `
-                                <option
-                                    value="${Number(subject.id)}"
-                                    data-name="${escapeHtml(
-                                        subject.subject_name
-                                    )}"
-                                    data-code="${escapeHtml(
-                                        subject.subject_code
-                                        || ''
-                                    )}">
-                                    ${escapeHtml(
-                                        subject.subject_name
-                                    )}
-                                    ${
-                                        subject.subject_code
-                                            ? ' - '
-                                                + escapeHtml(
-                                                    subject.subject_code
-                                                )
-                                            : ''
-                                    }
-                                </option>
-                            `
-                        ).join('')}
-                    </select>
-                </div>
-            `;
-        } else {
-            document.getElementById(
-                'assignmentTitle'
-            ).textContent =
-                'Assign Existing Timetable';
-
-            fields.innerHTML = `
-                <div class="col-12">
-                    <label class="form-label">
-                        Timetable
-                    </label>
-
-                    <select id="assignmentTimetable"
-                            class="form-select"
-                            required>
-                        <option value="">
-                            Select timetable
-                        </option>
-
-                        ${(meta.timetables || []).map(
-                            timetable => `
-                                <option
-                                    value="${Number(timetable.id)}"
-                                    data-name="${escapeHtml(
-                                        timetable.timetable_name
-                                    )}">
-                                    ${escapeHtml(
-                                        timetable.timetable_name
-                                    )}
-                                </option>
-                            `
-                        ).join('')}
-                    </select>
-                </div>
-            `;
-        }
-
-        window.bootstrap.Modal
-            .getOrCreateInstance(
-                document.getElementById(
-                    'assignmentModal'
-                )
-            )
-            .show();
-    }
-
     document.getElementById(
         'sectionForm'
     ).addEventListener(
         'submit',
         async event => {
             event.preventDefault();
+
+            const sectionId = Number(
+                document.getElementById(
+                    'sectionId'
+                ).value || 0
+            );
+
+            if (
+                sectionId > 0
+                && !permissions.edit
+            ) {
+                showMessage(
+                    'You do not have permission to edit sections.',
+                    false
+                );
+
+                return;
+            }
+
+            if (
+                sectionId <= 0
+                && !(
+                    permissions.add
+                    || permissions.create
+                )
+            ) {
+                showMessage(
+                    'You do not have permission to add sections.',
+                    false
+                );
+
+                return;
+            }
 
             const classSelect =
                 document.getElementById(
@@ -1600,12 +1944,32 @@ $csrfToken = function_exists('csrfToken')
                     'sectionTeacher'
                 );
 
+            const selectedShiftName =
+                document.getElementById(
+                    'sectionShift'
+                ).value;
+
+            /*
+             * Shift is optional.
+             * Validate only when a Shift is selected.
+             */
+            if (
+                selectedShiftName
+                && !configuredShiftByName(
+                    selectedShiftName
+                )
+            ) {
+                showMessage(
+                    'Selected Shift Time is disabled in General Settings. Enable it first or choose No Shift.',
+                    false,
+                    'Shift Not Available'
+                );
+                return;
+            }
+
             const data = {
-                id: Number(
-                    document.getElementById(
-                        'sectionId'
-                    ).value || 0
-                ),
+                id:
+                    sectionId,
                 section_name:
                     document.getElementById(
                         'sectionName'
@@ -1631,9 +1995,7 @@ $csrfToken = function_exists('csrfToken')
                         'sectionMedium'
                     ).value,
                 shift_name:
-                    document.getElementById(
-                        'sectionShift'
-                    ).value,
+                    selectedShiftName,
                 room_number:
                     document.getElementById(
                         'sectionRoom'
@@ -1699,99 +2061,6 @@ $csrfToken = function_exists('csrfToken')
     );
 
     document.getElementById(
-        'assignmentForm'
-    ).addEventListener(
-        'submit',
-        async event => {
-            event.preventDefault();
-
-            const type =
-                document.getElementById(
-                    'assignmentType'
-                ).value;
-
-            const sectionId = Number(
-                document.getElementById(
-                    'assignmentSectionId'
-                ).value
-            );
-
-            const data = {
-                type,
-                section_id: sectionId
-            };
-
-            if (type === 'subjects') {
-                const select =
-                    document.getElementById(
-                        'assignmentSubject'
-                    );
-
-                const option =
-                    select.options[
-                        select.selectedIndex
-                    ];
-
-                data.subject_id =
-                    Number(select.value);
-
-                data.subject_name =
-                    option?.dataset.name || '';
-
-                data.subject_code =
-                    option?.dataset.code || '';
-            } else {
-                const select =
-                    document.getElementById(
-                        'assignmentTimetable'
-                    );
-
-                const option =
-                    select.options[
-                        select.selectedIndex
-                    ];
-
-                data.timetable_id =
-                    Number(select.value);
-
-                data.timetable_name =
-                    option?.dataset.name || '';
-            }
-
-            try {
-                const result = await request(
-                    'save_related',
-                    data,
-                    'POST'
-                );
-
-                window.bootstrap.Modal
-                    .getInstance(
-                        document.getElementById(
-                            'assignmentModal'
-                        )
-                    )
-                    ?.hide();
-
-                showMessage(
-                    result.message,
-                    true
-                );
-
-                await loadAssignments(
-                    type,
-                    sectionId
-                );
-            } catch (error) {
-                showMessage(
-                    error.message,
-                    false
-                );
-            }
-        }
-    );
-
-    document.getElementById(
         'sectionsFilterToggle'
     ).addEventListener('click', () => {
         const box = document.getElementById(
@@ -1805,58 +2074,17 @@ $csrfToken = function_exists('csrfToken')
     });
 
 
-    document.getElementById(
-        'addSection'
-    ).addEventListener(
-        'click',
-        () => openSection()
-    );
+    const addSectionButton =
+        document.getElementById(
+            'addSection'
+        );
 
-    document.querySelectorAll(
-        '.sections-tab'
-    ).forEach(tab => {
-        tab.addEventListener(
+    if (addSectionButton) {
+        addSectionButton.addEventListener(
             'click',
-            () => {
-                document.querySelectorAll(
-                    '.sections-tab, .sections-panel'
-                ).forEach(element => {
-                    element.classList.remove(
-                        'active'
-                    );
-                });
-
-                tab.classList.add('active');
-
-                document.querySelector(
-                    `[data-panel="${tab.dataset.tab}"]`
-                )?.classList.add('active');
-            }
+            () => openSection()
         );
-    });
-
-    document.querySelectorAll(
-        '.js-assignment-section'
-    ).forEach(select => {
-        select.addEventListener(
-            'change',
-            () => loadAssignments(
-                select.dataset.type,
-                select.value
-            )
-        );
-    });
-
-    document.querySelectorAll(
-        '.js-add-assignment'
-    ).forEach(button => {
-        button.addEventListener(
-            'click',
-            () => openAssignment(
-                button.dataset.type
-            )
-        );
-    });
+    }
 
     [
         'sectionsSearch',

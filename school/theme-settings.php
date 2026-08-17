@@ -14,6 +14,8 @@ require_login();
 $pageTitle = 'Theme Settings';
 $pageKey = 'settings';
 
+/* Build: 2026-08-14-school-id-theme-isolation-v7 */
+
 $currentUser = function_exists('current_user')
     ? current_user()
     : [];
@@ -22,14 +24,16 @@ $baseUrl = defined('BASE_URL')
     ? rtrim((string)BASE_URL, '/') . '/'
     : '../';
 
-$tenantId = max(
-    1,
-    (int)(
-        $currentUser['tenant_id']
-        ?? $_SESSION['tenant_id']
-        ?? 1
+$tenantId = function_exists('school_theme_context_tenant_id')
+    ? school_theme_context_tenant_id(
+        is_array($currentUser) ? $currentUser : []
     )
-);
+    : (int)($_SESSION['school_id'] ?? $_SESSION['tenant_id'] ?? 0);
+
+if ($tenantId <= 0) {
+    http_response_code(403);
+    exit('A valid School ID is required to manage Theme Settings.');
+}
 
 if (function_exists('csrfToken')) {
     $csrfToken = (string)csrfToken();

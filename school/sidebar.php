@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-12-role-master-sidebar-runtime-v21 */
+
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
 require_once dirname(__DIR__) . '/includes/layout_helpers.php';
 require_once dirname(__DIR__) . '/includes/sidebar-manager.php';
@@ -24,6 +26,27 @@ $roleId = (int)(
     ?? $_SESSION['role_id']
     ?? 0
 );
+
+$roleKey = function_exists('school_normalize_role_key')
+    ? school_normalize_role_key(
+        (string)(
+            $currentUser['role_key']
+            ?? $_SESSION['role_key']
+            ?? ''
+        ),
+        (string)(
+            $currentUser['role_name']
+            ?? $_SESSION['role_name']
+            ?? ''
+        )
+    )
+    : strtolower(trim((string)(
+        $currentUser['role_key']
+        ?? $_SESSION['role_key']
+        ?? ''
+    )));
+
+$isParentSidebar = $roleKey === 'parent';
 
 $tenantId = max(
     1,
@@ -133,10 +156,14 @@ $monogram = $monogram !== '' ? $monogram : 'SE';
 <aside id="sidebar">
     <div class="sidebar-brand">
         <a
-            href="<?= e(school_sidebar_href(
-                'dashboard.php',
-                $baseUrl
-            )) ?>"
+            href="<?= e(
+                $isParentSidebar
+                    ? $baseUrl . 'parent/s_dashboard.php'
+                    : school_sidebar_href(
+                        'dashboard.php',
+                        $baseUrl
+                    )
+            ) ?>"
             class="brand-link"
         >
             <span class="brand-logo">
@@ -174,7 +201,7 @@ $monogram = $monogram !== '' ? $monogram : 'SE';
         </button>
     </div>
 
-    <nav class="sidebar-nav" aria-label="School Admin navigation">
+    <nav class="sidebar-nav" aria-label="<?= e($isParentSidebar ? 'Parent navigation' : 'School Admin navigation') ?>">
         <?php if ($sidebarTree): ?>
             <?php school_sidebar_render_items(
                 $sidebarTree,
@@ -193,14 +220,22 @@ $monogram = $monogram !== '' ? $monogram : 'SE';
         <i data-lucide="graduation-cap"></i>
         <strong>
             <?= e(
-                $branding['sidebar_footer_title']
-                ?? 'School Administration'
+                $isParentSidebar
+                    ? 'Parent Portal'
+                    : (
+                        $branding['sidebar_footer_title']
+                        ?? 'School Administration'
+                    )
             ) ?>
         </strong>
         <small>
             <?= e(
-                $branding['sidebar_footer_text']
-                ?? 'Manage academics, students, staff and school operations.'
+                $isParentSidebar
+                    ? 'View your children\'s school information and updates.'
+                    : (
+                        $branding['sidebar_footer_text']
+                        ?? 'Manage academics, students, staff and school operations.'
+                    )
             ) ?>
         </small>
     </div>

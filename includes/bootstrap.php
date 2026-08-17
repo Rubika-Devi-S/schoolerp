@@ -11,7 +11,7 @@ const APP_NAME = 'Brighton Public School ERP';
 const APP_TIMEZONE = 'Asia/Kolkata';
 const APP_DEMO_MODE = false; // Set true only when you need database-free preview mode.
 
-const SCHOOL_PERMISSION_BOOTSTRAP_BUILD = '2026-08-07-strict-school-sidebar-v17';
+const SCHOOL_PERMISSION_BOOTSTRAP_BUILD = '2026-08-17-branch-module-permissions-v57';
 
 if (!defined('PROJECT_ROOT')) {
     define('PROJECT_ROOT', dirname(__DIR__));
@@ -85,6 +85,18 @@ if (!APP_DEMO_MODE) {
         http_response_code(500);
         exit('Database connection failed.');
     }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Branch module permission layer
+|--------------------------------------------------------------------------
+*/
+
+$branchModuleAccessFile = PROJECT_ROOT . '/includes/branch-module-access.php';
+
+if (is_file($branchModuleAccessFile)) {
+    require_once $branchModuleAccessFile;
 }
 
 /*
@@ -275,6 +287,47 @@ if (!function_exists('school_column_exists')) {
             error_log('school_column_exists: ' . $e->getMessage());
             return $cache[$key] = false;
         }
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Permission-chain initialization
+|--------------------------------------------------------------------------
+*/
+require_once __DIR__ . '/permission-chain.php';
+
+if ($pdo instanceof PDO) {
+    try {
+        $needsPermissionChainSetup =
+            !school_table_exists($pdo, 'sidebar_role_master_items');
+
+        if (!$needsPermissionChainSetup
+            && school_table_exists($pdo, 'sidebar_items')) {
+            $stmt = $pdo->query(
+                "SELECT COUNT(*) FROM sidebar_items
+                 WHERE menu_key='parent_sidebar_permissions'"
+            );
+            $needsPermissionChainSetup =
+                (int)$stmt->fetchColumn() === 0;
+        }
+
+        if (!$needsPermissionChainSetup
+            && school_table_exists($pdo, 'app_pages')) {
+            $stmt = $pdo->query(
+                "SELECT COUNT(*) FROM app_pages
+                 WHERE page_key='parent_sidebar_permissions'
+                   AND is_active=1"
+            );
+            $needsPermissionChainSetup =
+                (int)$stmt->fetchColumn() === 0;
+        }
+
+        if ($needsPermissionChainSetup) {
+            pc_ensure_parent_permission_page($pdo);
+        }
+    } catch (Throwable $exception) {
+        error_log('Permission-chain initialization: ' . $exception->getMessage());
     }
 }
 
@@ -1803,47 +1856,133 @@ if (!function_exists('school_role_ids_include_school_admin')) {
 }
 
 if (!function_exists('school_sidebar_assigned_items')) {
-    /** @return array<int,array<string,mixed>> */
+    /**
+     * Return the EFFECTIVE sidebar for one school.
+     *
+     * Default inheritance:
+     * - shared Default item + no tenant override => use default is_enabled
+     * - explicit tenant row                      => use tenant is_visible
+     * - school-owned custom item                 => requires its tenant row
+     *
+     * This means a newly enabled Default Sidebar item is automatically visible
+     * to every school without copying rows into tenant_sidebar_items.
+     *
+     * @return array<int,array<string,mixed>>
+     */
     function school_sidebar_assigned_items(int $tenantId): array
     {
         global $pdo;
         static $cache=[];
-        if (isset($cache[$tenantId])) return $cache[$tenantId];
+
+        if (isset($cache[$tenantId])) {
+            return $cache[$tenantId];
+        }
+
         if (!($pdo instanceof PDO) || $tenantId<=0
-            || !school_table_exists($pdo,'sidebar_items')
-            || !school_table_exists($pdo,'tenant_sidebar_items')) {
+            || !school_table_exists($pdo,'sidebar_items')) {
             return $cache[$tenantId]=[];
         }
 
         try {
-            $hasCustomRoute=school_column_exists($pdo,'tenant_sidebar_items','custom_route');
-            $hasCustomParent=school_column_exists($pdo,'tenant_sidebar_items','custom_parent_id');
-            $hasInherit=school_column_exists($pdo,'tenant_sidebar_items','inherit_default');
+            $hasTenantTable=school_table_exists($pdo,'tenant_sidebar_items');
+            $hasDefaults=school_table_exists($pdo,'sidebar_default_settings');
+            $hasCustomRoute=$hasTenantTable
+                && school_column_exists($pdo,'tenant_sidebar_items','custom_route');
+            $hasCustomParent=$hasTenantTable
+                && school_column_exists($pdo,'tenant_sidebar_items','custom_parent_id');
+            $hasInherit=$hasTenantTable
+                && school_column_exists($pdo,'tenant_sidebar_items','inherit_default');
             $hasPortal=school_column_exists($pdo,'sidebar_items','portal_scope');
             $hasOwner=school_column_exists($pdo,'sidebar_items','owner_tenant_id');
             $hasModuleId=school_column_exists($pdo,'sidebar_items','module_id');
-            $hasTenantModules=$hasModuleId
-                && school_table_exists($pdo,'tenant_modules')
-                && school_column_exists($pdo,'tenant_modules','tenant_id')
-                && school_column_exists($pdo,'tenant_modules','module_id')
-                && school_column_exists($pdo,'tenant_modules','is_enabled');
+            /*
+             * Sidebar visibility is controlled by Default Sidebar + the
+             * selected school's explicit override. Do not apply tenant_modules
+             * as a second hidden visibility gate here, otherwise Super Admin
+             * can show an item as Enabled while the School Admin sidebar still
+             * hides it.
+             */
+            $hasTenantModules=false;
 
-            $route=$hasCustomRoute
-                ? "COALESCE(NULLIF(TRIM(tsi.custom_route),''),si.route)"
+            $explicit = !$hasTenantTable
+                ? '0=1'
+                : ($hasInherit
+                    ? '(tsi.id IS NOT NULL AND COALESCE(tsi.inherit_default,0)=0)'
+                    : '(tsi.id IS NOT NULL)');
+
+            $defaultEnabled=$hasDefaults
+                ? 'COALESCE(sds.is_enabled,1)'
+                : '1';
+
+            $route = $hasCustomRoute
+                ? "CASE WHEN {$explicit}
+                         THEN COALESCE(NULLIF(TRIM(tsi.custom_route),''),si.route)
+                         ELSE si.route END"
                 : 'si.route';
-            $parent=$hasCustomParent
-                ? 'COALESCE(tsi.custom_parent_id,si.parent_id)'
+
+            $parent = $hasCustomParent
+                ? "CASE WHEN {$explicit}
+                         THEN COALESCE(tsi.custom_parent_id,si.parent_id)
+                         ELSE si.parent_id END"
                 : 'si.parent_id';
 
-            $where=['tsi.tenant_id=:sidebar_tenant_id','tsi.is_visible=1'];
-            $params=['sidebar_tenant_id'=>$tenantId];
-            if ($hasInherit) $where[]='COALESCE(tsi.inherit_default,0)=0';
-            if (school_column_exists($pdo,'sidebar_items','is_active')) $where[]='si.is_active=1';
-            if (school_column_exists($pdo,'sidebar_items','show_in_sidebar')) $where[]='si.show_in_sidebar=1';
-            if ($hasPortal) $where[]="si.portal_scope IN ('school','all')";
-            else $where[]="si.menu_key NOT LIKE 'sa\\_%'";
+            $tenantJoin=$hasTenantTable
+                ? 'LEFT JOIN tenant_sidebar_items tsi
+                     ON tsi.sidebar_item_id=si.id
+                    AND tsi.tenant_id=:sidebar_tenant_id'
+                : '';
+
+            $defaultJoin=$hasDefaults
+                ? 'LEFT JOIN sidebar_default_settings sds
+                     ON sds.sidebar_item_id=si.id'
+                : '';
+
+            $effectiveEnabled = $hasOwner
+                ? "CASE
+                     WHEN {$explicit} THEN COALESCE(tsi.is_visible,0)
+                     WHEN si.owner_tenant_id=:owner_visibility_id THEN 0
+                     ELSE {$defaultEnabled}
+                   END"
+                : "CASE
+                     WHEN {$explicit} THEN COALESCE(tsi.is_visible,0)
+                     ELSE {$defaultEnabled}
+                   END";
+
+            $where=["({$effectiveEnabled})=1"];
+            $params=[];
+
+            if ($hasTenantTable) {
+                $params['sidebar_tenant_id']=$tenantId;
+            }
             if ($hasOwner) {
-                $where[]='(si.owner_tenant_id IS NULL OR si.owner_tenant_id=:owner_tenant_id)';
+                $params['owner_visibility_id']=$tenantId;
+            }
+
+            if (school_column_exists($pdo,'sidebar_items','is_active')) {
+                $where[]='si.is_active=1';
+            }
+            if (school_column_exists($pdo,'sidebar_items','show_in_sidebar')) {
+                $where[]='si.show_in_sidebar=1';
+            }
+            if ($hasPortal) {
+                $where[]="si.portal_scope IN ('school','all')";
+            } else {
+                $where[]="si.menu_key NOT LIKE 'sa\\_%'";
+            }
+
+            if ($hasOwner) {
+                /*
+                 * Shared master rows are inherited. A school-owned custom menu
+                 * is visible only to its owner and only when an explicit tenant
+                 * row exists.
+                 */
+                $where[]='(
+                    si.owner_tenant_id IS NULL
+                    OR (
+                        si.owner_tenant_id=:owner_tenant_id
+                        AND ' . ($hasTenantTable ? 'tsi.id IS NOT NULL' : '0=1') . '
+                    )
+                )';
                 $params['owner_tenant_id']=$tenantId;
             }
 
@@ -1857,17 +1996,26 @@ if (!function_exists('school_sidebar_assigned_items')) {
             }
 
             $stmt=$pdo->prepare(
-                "SELECT si.id,{$parent} AS parent_id,si.menu_key,
-                        {$route} AS effective_route
-                 FROM tenant_sidebar_items tsi
-                 INNER JOIN sidebar_items si ON si.id=tsi.sidebar_item_id
+                "SELECT
+                    si.id,
+                    {$parent} AS parent_id,
+                    si.menu_key,
+                    {$route} AS effective_route
+                 FROM sidebar_items si
+                 {$defaultJoin}
+                 {$tenantJoin}
                  {$moduleJoin}
                  WHERE ".implode(' AND ',$where)
             );
             $stmt->execute($params);
+
             $items=[];
             foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                $id=(int)($row['id']??0); if ($id<=0) continue;
+                $id=(int)($row['id']??0);
+                if ($id<=0) {
+                    continue;
+                }
+
                 $row['id']=$id;
                 $row['parent_id']=(int)($row['parent_id']??0);
                 $row['menu_key']=school_permission_canonical_page_key(
@@ -1879,9 +2027,13 @@ if (!function_exists('school_sidebar_assigned_items')) {
                 );
                 $items[$id]=$row;
             }
+
             return $cache[$tenantId]=$items;
         } catch (Throwable $exception) {
-            error_log('school_sidebar_assigned_items: '.$exception->getMessage());
+            error_log(
+                'school_sidebar_assigned_items(default inheritance): '
+                . $exception->getMessage()
+            );
             return $cache[$tenantId]=[];
         }
     }
@@ -2155,6 +2307,105 @@ if (!function_exists('school_sidebar_find_assigned_item')) {
     }
 }
 
+
+if (!function_exists('school_sidebar_role_master_item_allowed')) {
+    function school_sidebar_role_master_item_allowed(
+        PDO $pdo,
+        array $roleIds,
+        int $sidebarItemId,
+        int $tenantId
+    ): bool {
+        if ($sidebarItemId <= 0 || $tenantId <= 0 || $roleIds === []) {
+            return false;
+        }
+
+        /*
+         * Backward compatibility before Super Admin opens the upgraded Sidebar
+         * Permission page and creates the role-master catalogue.
+         */
+        if (!school_table_exists($pdo, 'sidebar_role_master_items')
+            || !school_table_exists($pdo, 'roles')) {
+            return true;
+        }
+
+        $roleIds = array_values(array_unique(array_filter(
+            array_map('intval', $roleIds),
+            static fn(int $id): bool => $id > 0
+        )));
+        if ($roleIds === []) {
+            return false;
+        }
+
+        try {
+            $marks = implode(',', array_fill(0, count($roleIds), '?'));
+            $stmt = $pdo->prepare(
+                "SELECT role_key
+                 FROM roles
+                 WHERE id IN ({$marks})
+                   AND tenant_id=?
+                   AND status='active'
+                   AND deleted_at IS NULL"
+            );
+            $stmt->execute([...$roleIds, $tenantId]);
+
+            $keys = [];
+            $hasParent = false;
+            foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $rawKey) {
+                $key = school_normalize_role_key((string)$rawKey);
+                if ($key === 'super_admin') {
+                    return true;
+                }
+                if ($key === 'parent') {
+                    $hasParent = true;
+                }
+                if ($key !== '') {
+                    $keys[$key] = $key;
+                }
+            }
+
+            if ($keys === []) {
+                return false;
+            }
+
+            /*
+             * Preserve existing school-owned custom menus for non-Parent roles.
+             * Parent must always come exclusively from its global Parent master.
+             */
+            if (!$hasParent
+                && school_column_exists($pdo, 'sidebar_items', 'owner_tenant_id')) {
+                $owner = $pdo->prepare(
+                    "SELECT COALESCE(owner_tenant_id,0)
+                     FROM sidebar_items
+                     WHERE id=?
+                     LIMIT 1"
+                );
+                $owner->execute([$sidebarItemId]);
+                if ((int)$owner->fetchColumn() === $tenantId) {
+                    return true;
+                }
+            }
+
+            $keyMarks = implode(',', array_fill(0, count($keys), '?'));
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM sidebar_role_master_items
+                 WHERE role_key IN ({$keyMarks})
+                   AND sidebar_item_id=?
+                   AND is_enabled=1"
+            );
+            $stmt->execute([...array_values($keys), $sidebarItemId]);
+
+            return (int)$stmt->fetchColumn() > 0;
+        } catch (Throwable $exception) {
+            error_log(
+                'school_sidebar_role_master_item_allowed: '
+                . $exception->getMessage()
+            );
+            return false;
+        }
+    }
+}
+
 if (!function_exists('school_sidebar_action_allowed_for_item')) {
     function school_sidebar_action_allowed_for_item(
         int $sidebarItemId,
@@ -2164,7 +2415,9 @@ if (!function_exists('school_sidebar_action_allowed_for_item')) {
     ): bool {
         global $pdo;
 
-        if (!($pdo instanceof PDO) || $sidebarItemId <= 0 || $tenantId <= 0) {
+        if (!($pdo instanceof PDO)
+            || $sidebarItemId <= 0
+            || $tenantId <= 0) {
             return false;
         }
 
@@ -2179,12 +2432,12 @@ if (!function_exists('school_sidebar_action_allowed_for_item')) {
             return false;
         }
 
-        /* The complete assigned parent chain is always required. */
         $chain = [];
         $currentId = $sidebarItemId;
         $visited = [];
         while ($currentId > 0) {
-            if (isset($visited[$currentId]) || !isset($items[$currentId])) {
+            if (isset($visited[$currentId])
+                || !isset($items[$currentId])) {
                 return false;
             }
             $visited[$currentId] = true;
@@ -2192,252 +2445,38 @@ if (!function_exists('school_sidebar_action_allowed_for_item')) {
             $currentId = (int)($items[$currentId]['parent_id'] ?? 0);
         }
 
-        /*
-         * School Administrator is configurable by Super Admin. For backward
-         * compatibility, missing permission rows still mean full access for the
-         * School Administrator; explicit 0/1 rows are authoritative.
-         */
-        $schoolAdminDefaultFullAccess = school_role_ids_include_school_admin(
-            $pdo,
-            $tenantId,
-            $roleIds
-        );
+        $action = school_sidebar_normalize_action($action);
 
-        $normalizedAction = school_sidebar_normalize_action($action);
+        foreach ($roleIds as $roleId) {
+            $roleId = (int)$roleId;
+            if ($roleId <= 0) continue;
 
-        try {
-            /*
-             * Standard actions use the SAME row as View/Add/Edit/Delete.
-             * This is authoritative whenever the matching extended column
-             * exists. Full Access and future custom actions continue to use the
-             * normalized grant table below.
-             */
-            $standardColumns = [
-                'view' => 'can_view',
-                'create' => 'can_add',
-                'edit' => 'can_edit',
-                'delete' => 'can_delete',
-                'print' => 'can_print',
-                'pdf' => 'can_pdf',
-                'export' => 'can_export',
-                'import' => 'can_import',
-                'approve' => 'can_approve',
-                'reject' => 'can_reject',
-                'restore' => 'can_restore',
-                'manage_settings' => 'can_manage',
-                'manage_visibility' => 'can_manage_visibility',
-            ];
-
-            if (isset($standardColumns[$normalizedAction])
-                && school_table_exists($pdo, 'school_sidebar_action_permissions')
-                && school_column_exists(
+            $masterAllowed = true;
+            foreach ($chain as $chainItemId) {
+                if (!school_sidebar_role_master_item_allowed(
                     $pdo,
-                    'school_sidebar_action_permissions',
-                    $standardColumns[$normalizedAction]
+                    [$roleId],
+                    (int)$chainItemId,
+                    $tenantId
                 )) {
-                $actionColumn = $standardColumns[$normalizedAction];
-                $roleMarks = implode(',', array_fill(0, count($roleIds), '?'));
-                $itemMarks = implode(',', array_fill(0, count($chain), '?'));
-
-                $stmt = $pdo->prepare(
-                    "SELECT sidebar_item_id,
-                            MAX(can_view) AS can_view,
-                            MAX({$actionColumn}) AS action_allowed
-                     FROM school_sidebar_action_permissions
-                     WHERE tenant_id = ?
-                       AND role_id IN ({$roleMarks})
-                       AND sidebar_item_id IN ({$itemMarks})
-                     GROUP BY sidebar_item_id"
-                );
-                $stmt->execute([$tenantId, ...$roleIds, ...$chain]);
-
-                $permissions = [];
-                foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                    $permissions[(int)$row['sidebar_item_id']] = $row;
+                    $masterAllowed = false;
+                    break;
                 }
+            }
+            if (!$masterAllowed) continue;
 
-                foreach ($chain as $index => $id) {
-                    if (isset($permissions[$id])) {
-                        $allowed = $index === 0
-                            ? (int)($permissions[$id]['action_allowed'] ?? 0)
-                            : (int)($permissions[$id]['can_view'] ?? 0);
-                        if ($allowed !== 1) {
-                            return false;
-                        }
-                        continue;
-                    }
-
-                    if (!$schoolAdminDefaultFullAccess) {
-                        return false;
-                    }
-                }
-
+            if (pc_effective_role_chain_action(
+                $pdo,
+                $tenantId,
+                $roleId,
+                $chain,
+                $action
+            )) {
                 return true;
             }
-
-            /*
-             * Normalized, unlimited action matrix. This remains the fallback
-             * for Full Access and future custom permission sections.
-             */
-            if (school_table_exists($pdo, 'school_sidebar_permission_grants')) {
-                $roleMarks = implode(',', array_fill(0, count($roleIds), '?'));
-                $itemMarks = implode(',', array_fill(0, count($chain), '?'));
-                $stmt = $pdo->prepare(
-                    "SELECT sidebar_item_id, action_key, MAX(is_allowed) AS is_allowed
-                     FROM school_sidebar_permission_grants
-                     WHERE tenant_id = ?
-                       AND role_id IN ({$roleMarks})
-                       AND sidebar_item_id IN ({$itemMarks})
-                       AND action_key IN (?, 'view', 'full_access')
-                     GROUP BY sidebar_item_id, action_key"
-                );
-                $stmt->execute([
-                    $tenantId,
-                    ...$roleIds,
-                    ...$chain,
-                    $normalizedAction,
-                ]);
-
-                $permissions = [];
-                foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                    $permissions[(int)$row['sidebar_item_id']][(string)$row['action_key']]
-                        = (int)$row['is_allowed'];
-                }
-
-                foreach ($chain as $index => $id) {
-                    $row = $permissions[$id] ?? [];
-                    $hasFullRow = array_key_exists('full_access', $row);
-                    $full = (int)($row['full_access'] ?? 0) === 1;
-
-                    if ($index === 0) {
-                        $hasActionRow = array_key_exists($normalizedAction, $row);
-                        if ($full || (int)($row[$normalizedAction] ?? 0) === 1) {
-                            continue;
-                        }
-                        if ($schoolAdminDefaultFullAccess
-                            && !$hasActionRow
-                            && !$hasFullRow) {
-                            continue;
-                        }
-                        return false;
-                    }
-
-                    $hasViewRow = array_key_exists('view', $row);
-                    if ($full || (int)($row['view'] ?? 0) === 1) {
-                        continue;
-                    }
-                    if ($schoolAdminDefaultFullAccess
-                        && !$hasViewRow
-                        && !$hasFullRow) {
-                        continue;
-                    }
-                    return false;
-                }
-
-                return true;
-            }
-
-            /* Compatibility fallback before the normalized migration exists. */
-            if (school_table_exists($pdo, 'school_sidebar_action_permissions')) {
-                $legacyMap = [
-                    'view' => 'can_view',
-                    'create' => 'can_add',
-                    'edit' => 'can_edit',
-                    'delete' => 'can_delete',
-                    'print' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_print') ? 'can_print' : 'can_view',
-                    'pdf' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_pdf') ? 'can_pdf' : null,
-                    'export' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_export') ? 'can_export' : 'can_view',
-                    'import' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_import') ? 'can_import' : 'can_add',
-                    'approve' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_approve') ? 'can_approve' : 'can_edit',
-                    'reject' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_reject') ? 'can_reject' : 'can_edit',
-                    'restore' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_restore') ? 'can_restore' : 'can_edit',
-                    'manage_settings' => school_column_exists($pdo, 'school_sidebar_action_permissions', 'can_manage') ? 'can_manage' : 'can_edit',
-                    'manage_visibility' => 'can_manage_visibility',
-                    'full_access' => 'can_view',
-                ];
-                $actionColumn = $legacyMap[$normalizedAction] ?? 'can_view';
-                if (!school_column_exists($pdo, 'school_sidebar_action_permissions', $actionColumn)) {
-                    return false;
-                }
-
-                $selectColumns = ['can_view', $actionColumn];
-                $selectColumns = array_values(array_unique($selectColumns));
-                foreach ($selectColumns as $requiredColumn) {
-                    if (!school_column_exists($pdo, 'school_sidebar_action_permissions', $requiredColumn)) {
-                        return false;
-                    }
-                }
-
-                $roleMarks = implode(',', array_fill(0, count($roleIds), '?'));
-                $itemMarks = implode(',', array_fill(0, count($chain), '?'));
-                $aggregates = implode(', ', array_map(
-                    static fn(string $column): string => "MAX({$column}) AS {$column}",
-                    $selectColumns
-                ));
-                $stmt = $pdo->prepare(
-                    "SELECT sidebar_item_id, {$aggregates}
-                     FROM school_sidebar_action_permissions
-                     WHERE tenant_id = ?
-                       AND role_id IN ({$roleMarks})
-                       AND sidebar_item_id IN ({$itemMarks})
-                     GROUP BY sidebar_item_id"
-                );
-                $stmt->execute([$tenantId, ...$roleIds, ...$chain]);
-
-                $permissions = [];
-                foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                    $permissions[(int)$row['sidebar_item_id']] = $row;
-                }
-                foreach ($chain as $index => $id) {
-                    $required = $index === 0 ? $actionColumn : 'can_view';
-                    if (isset($permissions[$id])) {
-                        if ((int)($permissions[$id][$required] ?? 0) !== 1) {
-                            return false;
-                        }
-                        continue;
-                    }
-                    if (!$schoolAdminDefaultFullAccess) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-
-            if ($normalizedAction !== 'view'
-                || !school_table_exists($pdo, 'role_sidebar_permissions')) {
-                return false;
-            }
-
-            $roleMarks = implode(',', array_fill(0, count($roleIds), '?'));
-            $itemMarks = implode(',', array_fill(0, count($chain), '?'));
-            $stmt = $pdo->prepare(
-                "SELECT sidebar_item_id, MAX(can_show) AS can_show
-                 FROM role_sidebar_permissions
-                 WHERE role_id IN ({$roleMarks})
-                   AND sidebar_item_id IN ({$itemMarks})
-                 GROUP BY sidebar_item_id"
-            );
-            $stmt->execute([...$roleIds, ...$chain]);
-            $visible = [];
-            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                $visible[(int)$row['sidebar_item_id']] = (int)$row['can_show'];
-            }
-            foreach ($chain as $id) {
-                if (array_key_exists($id, $visible)) {
-                    if (($visible[$id] ?? 0) !== 1) {
-                        return false;
-                    }
-                    continue;
-                }
-                if (!$schoolAdminDefaultFullAccess) {
-                    return false;
-                }
-            }
-            return true;
-        } catch (Throwable $exception) {
-            error_log('school_sidebar_action_allowed_for_item: ' . $exception->getMessage());
-            return false;
         }
+
+        return false;
     }
 }
 
@@ -2571,6 +2610,50 @@ if (!function_exists('school_current_page_capabilities')) {
             $result[$key] = (bool)$allowed;
         }
         $result['add'] = $result['create'];
+
+        /*
+         * Branch module permission is an additional ceiling on top of Role
+         * Permissions. OFF keeps View/Print/PDF/Export available for existing
+         * current-branch records, but mutation actions become read-only.
+         */
+        if (
+            $pdo instanceof PDO
+            && function_exists('branch_module_canonical_key')
+            && function_exists('branch_module_current_scope')
+            && function_exists('branch_module_is_enabled')
+            && function_exists('branch_module_filter_capabilities')
+        ) {
+            try {
+                $branchModuleKey = branch_module_canonical_key($pageKey);
+
+                if ($branchModuleKey !== '') {
+                    $branchScope = branch_module_current_scope();
+
+                    if (
+                        (int)($branchScope['tenant_id'] ?? 0) > 0
+                        && (int)($branchScope['branch_id'] ?? 0) > 0
+                    ) {
+                        $branchModuleEnabled = branch_module_is_enabled(
+                            $pdo,
+                            (int)$branchScope['tenant_id'],
+                            (int)$branchScope['branch_id'],
+                            $branchModuleKey,
+                            true
+                        );
+
+                        $result = branch_module_filter_capabilities(
+                            $result,
+                            $branchModuleEnabled
+                        );
+                    }
+                }
+            } catch (Throwable $exception) {
+                error_log(
+                    'school_current_page_capabilities branch module: '
+                    . $exception->getMessage()
+                );
+            }
+        }
 
         return $result;
     }
@@ -3176,6 +3259,23 @@ if (!function_exists('current_theme_settings')) {
         }
 
         try {
+            $themeTenantId = 0;
+            foreach ([
+                $_SESSION['school_id'] ?? null,
+                $_SESSION['tenant_id'] ?? null,
+            ] as $candidateTenantId) {
+                $candidateTenantId = (int)$candidateTenantId;
+                if ($candidateTenantId > 0) {
+                    $themeTenantId = $candidateTenantId;
+                    break;
+                }
+            }
+
+            /* No school context means no school-specific theme. */
+            if ($themeTenantId <= 0) {
+                return $theme;
+            }
+
             $stmt = $pdo->prepare(
                 "SELECT setting_key, setting_value
                  FROM website_color_settings
@@ -3183,7 +3283,7 @@ if (!function_exists('current_theme_settings')) {
                    AND is_active = 1"
             );
             $stmt->execute([
-                'tenant_id' => max(1, (int)($_SESSION['tenant_id'] ?? 1)),
+                'tenant_id' => $themeTenantId,
             ]);
 
             foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
@@ -3258,9 +3358,20 @@ if (!function_exists('school_role_dashboard_path')) {
         if (!empty($_SESSION['user_id']) && current_user_has_platform_role()) {
             return 'super-admin/dashboard.php';
         }
-        return school_normalize_role_key($roleKey, $roleName) === 'super_admin'
-            ? 'super-admin/dashboard.php'
-            : 'school/dashboard.php';
+        $normalizedRole = school_normalize_role_key(
+            $roleKey,
+            $roleName
+        );
+
+        if ($normalizedRole === 'super_admin') {
+            return 'super-admin/dashboard.php';
+        }
+
+        if ($normalizedRole === 'parent') {
+            return 'parent/s_dashboard.php';
+        }
+
+        return 'school/dashboard.php';
     }
 }
 
@@ -4036,6 +4147,86 @@ if (!function_exists('school_action_from_request')) {
     }
 }
 
+
+if (!function_exists('school_enforce_branch_module_action')) {
+    function school_enforce_branch_module_action(
+        string $pageKey,
+        string $action,
+        bool $isApi = false
+    ): void {
+        global $pdo;
+
+        if (
+            !($pdo instanceof PDO)
+            || !function_exists('branch_module_canonical_key')
+            || !function_exists('branch_module_current_scope')
+            || !function_exists('branch_module_is_enabled')
+            || !function_exists('branch_module_is_write_action')
+        ) {
+            return;
+        }
+
+        $moduleKey = branch_module_canonical_key($pageKey);
+
+        if ($moduleKey === '') {
+            return;
+        }
+
+        $scope = branch_module_current_scope();
+
+        $tenantId = (int)($scope['tenant_id'] ?? 0);
+        $branchId = (int)($scope['branch_id'] ?? 0);
+
+        /*
+         * A branch-controlled School module must always have a concrete branch
+         * context. This prevents a missing branch from silently turning a
+         * tenant-wide query into an "all branches" query.
+         */
+        if ($tenantId > 0 && $branchId <= 0) {
+            school_forbid_permission_request(
+                'Select an active Branch before opening this module.',
+                $isApi
+            );
+        }
+
+        if (
+            $tenantId <= 0
+            || $branchId <= 0
+            || !branch_module_is_write_action($action)
+        ) {
+            return;
+        }
+
+        if (
+            branch_module_is_enabled(
+                $pdo,
+                $tenantId,
+                $branchId,
+                $moduleKey,
+                true
+            )
+        ) {
+            return;
+        }
+
+        $catalog = function_exists('branch_module_catalog')
+            ? branch_module_catalog()
+            : [];
+
+        $label = (string)(
+            $catalog[$moduleKey]['label']
+            ?? $moduleKey
+        );
+
+        school_forbid_permission_request(
+            $label
+            . ' is OFF for the active Branch. '
+            . 'Existing current-branch data is read-only.',
+            $isApi
+        );
+    }
+}
+
 if (!function_exists('enforce_current_school_page_permission')) {
     function enforce_current_school_page_permission(
         string $relativePath
@@ -4059,6 +4250,14 @@ if (!function_exists('enforce_current_school_page_permission')) {
             );
         }
 
+        if (function_exists('school_enforce_branch_module_action')) {
+            school_enforce_branch_module_action(
+                $pageKey,
+                'view',
+                false
+            );
+        }
+
         $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
         $action = school_action_from_request();
 
@@ -4077,6 +4276,14 @@ if (!function_exists('enforce_current_school_page_permission')) {
             && !school_effective_permission($pageKey, $action)) {
             school_forbid_permission_request(
                 'You do not have permission to perform this action.',
+                school_is_api_request()
+            );
+        }
+
+        if (function_exists('school_enforce_branch_module_action')) {
+            school_enforce_branch_module_action(
+                $pageKey,
+                $action,
                 school_is_api_request()
             );
         }
@@ -4129,12 +4336,22 @@ if (!function_exists('enforce_current_school_api_permission')) {
                 true
             );
         }
+
+        if (function_exists('school_enforce_branch_module_action')) {
+            school_enforce_branch_module_action(
+                (string)$page['page_key'],
+                $action,
+                true
+            );
+        }
     }
 }
 
 if (!function_exists('school_enforce_role_panel_access')) {
     function school_enforce_role_panel_access(): void
     {
+        global $pdo;
+
         if (!is_logged_in()) {
             return;
         }
@@ -4206,6 +4423,84 @@ if (!function_exists('school_enforce_role_panel_access')) {
             exit;
         }
 
+        if ($currentPanel === 'parent' && !$isSuperAdmin) {
+            $current = function_exists('current_user')
+                ? current_user()
+                : [];
+            $loggedRole = school_normalize_role_key(
+                (string)($current['role_key'] ?? $_SESSION['role_key'] ?? ''),
+                (string)($current['role_name'] ?? $_SESSION['role_name'] ?? '')
+            );
+
+            if ($loggedRole !== 'parent') {
+                http_response_code(403);
+                header(
+                    'Location: '
+                    . school_current_role_dashboard_url()
+                );
+                exit;
+            }
+
+            $parentTenantId = (int)(
+                $current['tenant_id']
+                ?? $_SESSION['school_id']
+                ?? $_SESSION['tenant_id']
+                ?? 0
+            );
+            $parentRoleId = (int)(
+                $current['role_id']
+                ?? $_SESSION['role_id']
+                ?? 0
+            );
+
+            /*
+             * Parent pages are a single portal with several sidebar anchors.
+             * Permit the portal when this school has at least one enabled Parent
+             * master item with View access. Individual sidebar visibility is
+             * still filtered item-by-item by school_sidebar_get_items().
+             */
+            $parentPortalAllowed = false;
+            if ($parentTenantId > 0
+                && $parentRoleId > 0
+                && $pdo instanceof PDO
+                && school_table_exists($pdo, 'sidebar_role_master_items')) {
+                try {
+                    $stmt = $pdo->query(
+                        "SELECT sidebar_item_id
+                         FROM sidebar_role_master_items
+                         WHERE role_key='parent'
+                           AND is_enabled=1
+                         ORDER BY COALESCE(display_order,9999),id"
+                    );
+                    foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $parentItemId) {
+                        if (pc_effective_role_action(
+                            $pdo,
+                            $parentTenantId,
+                            $parentRoleId,
+                            (int)$parentItemId,
+                            'view'
+                        )) {
+                            $parentPortalAllowed = true;
+                            break;
+                        }
+                    }
+                } catch (Throwable $exception) {
+                    error_log(
+                        'Parent portal permission-chain access: '
+                        . $exception->getMessage()
+                    );
+                }
+            }
+
+            if (!$parentPortalAllowed) {
+                http_response_code(403);
+                exit(
+                    'Access denied. Parent Portal is disabled '
+                    . 'for this school.'
+                );
+            }
+        }
+
         if ($currentPanel === 'school' && !$isSuperAdmin) {
             /*
              * Sidebar assignment is a backend authorization boundary.
@@ -4238,7 +4533,6 @@ if (!function_exists('school_enforce_role_panel_access')) {
         $legacyRolePanels = [
             'teacher',
             'student',
-            'parent',
             'accountant',
             'principal',
             'staff',

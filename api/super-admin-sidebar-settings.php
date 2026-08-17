@@ -585,6 +585,206 @@ try {
         ], 201);
     }
 
+    if ($action === 'update_item') {
+        $itemId = (int)($input['sidebar_item_id'] ?? 0);
+
+        if (
+            $itemId <= 0
+            || !in_array($itemId, $allowedIds, true)
+        ) {
+            throw new InvalidArgumentException(
+                'Invalid sidebar item'
+            );
+        }
+
+        $title = trim(
+            (string)($input['menu_title'] ?? '')
+        );
+
+        $route = trim(
+            (string)($input['route'] ?? '#')
+        );
+
+        $icon = strtolower(trim(
+            (string)($input['icon'] ?? 'circle')
+        ));
+
+        $parentId =
+            isset($input['parent_id'])
+            && $input['parent_id'] !== null
+            && $input['parent_id'] !== ''
+                ? (int)$input['parent_id']
+                : null;
+
+        $displayOrder = max(
+            0,
+            min(
+                9999,
+                (int)($input['display_order'] ?? 0)
+            )
+        );
+
+        $canShow =
+            !empty($input['can_show']) ? 1 : 0;
+
+        $isVisible =
+            !empty($input['is_visible']) ? 1 : 0;
+
+        $isActive =
+            !empty($input['is_active']) ? 1 : 0;
+
+        if (
+            $title === ''
+            || mb_strlen($title) > 120
+        ) {
+            throw new InvalidArgumentException(
+                'Menu Title is required and cannot exceed 120 characters'
+            );
+        }
+
+        if ($route === '') {
+            $route = '#';
+        }
+
+        if (mb_strlen($route) > 255) {
+            throw new InvalidArgumentException(
+                'Route cannot exceed 255 characters'
+            );
+        }
+
+        if ($icon === '') {
+            $icon = 'circle';
+        }
+
+        if (
+            preg_match(
+                '/^[a-z0-9]+(?:-[a-z0-9]+)*$/',
+                $icon
+            ) !== 1
+        ) {
+            throw new InvalidArgumentException(
+                'Invalid Lucide icon name'
+            );
+        }
+
+        if ($parentId !== null) {
+            if (!in_array($parentId, $allowedIds, true)) {
+                throw new InvalidArgumentException(
+                    'Invalid parent sidebar option'
+                );
+            }
+
+            $descendantIds = sa_descendant_ids(
+                $pdo,
+                $itemId,
+                $scope
+            );
+
+            if (in_array($parentId, $descendantIds, true)) {
+                throw new InvalidArgumentException(
+                    'A sidebar item cannot be moved under itself or one of its child items'
+                );
+            }
+        }
+
+        $pdo->beginTransaction();
+
+        $update = $pdo->prepare(
+            "UPDATE sidebar_items
+             SET parent_id = :parent_id,
+                 menu_title = :menu_title,
+                 route = :route,
+                 icon = :icon,
+                 display_order = :display_order,
+                 show_in_sidebar = :show_in_sidebar,
+                 is_active = :is_active
+             WHERE id = :item_id"
+        );
+
+        $update->execute([
+            'parent_id' => $parentId,
+            'menu_title' => $title,
+            'route' => $route,
+            'icon' => $icon,
+            'display_order' => $displayOrder,
+            'show_in_sidebar' => $isVisible,
+            'is_active' => $isActive,
+            'item_id' => $itemId,
+        ]);
+
+        $permission = $pdo->prepare(
+            "INSERT INTO role_sidebar_permissions
+                (role_id,sidebar_item_id,can_show)
+             VALUES
+                (:role_id,:item_id,:can_show)
+             ON DUPLICATE KEY UPDATE
+                can_show = VALUES(can_show),
+                updated_at = CURRENT_TIMESTAMP"
+        );
+
+        $permission->execute([
+            'role_id' => $targetRoleId,
+            'item_id' => $itemId,
+            'can_show' => $canShow,
+        ]);
+
+        if ($hasOverrides) {
+            $override = $pdo->prepare(
+                "INSERT INTO tenant_sidebar_items
+                    (tenant_id,sidebar_item_id,custom_title,custom_icon,
+                     display_order,is_visible)
+                 VALUES
+                    (:tenant_id,:item_id,NULL,NULL,:display_order,:is_visible)
+                 ON DUPLICATE KEY UPDATE
+                    custom_title = NULL,
+                    custom_icon = NULL,
+                    display_order = VALUES(display_order),
+                    is_visible = VALUES(is_visible),
+                    updated_at = CURRENT_TIMESTAMP"
+            );
+
+            $override->execute([
+                'tenant_id' => $tenantId,
+                'item_id' => $itemId,
+                'display_order' => $displayOrder,
+                'is_visible' => $isVisible,
+            ]);
+        }
+
+        sa_activity(
+            $pdo,
+            $tenantId,
+            $currentRoleId,
+            'sidebar_item_updated',
+            $itemId,
+            'Updated Super Admin sidebar option ' . $title,
+            [
+                'menu_title' => $title,
+                'route' => $route,
+                'icon' => $icon,
+                'parent_id' => $parentId,
+                'display_order' => $displayOrder,
+                'can_show' => $canShow,
+                'is_visible' => $isVisible,
+                'is_active' => $isActive,
+            ]
+        );
+
+        $pdo->commit();
+
+        sa_json(
+            true,
+            'Sidebar option updated successfully',
+            [
+                'sidebar_item_id' => $itemId,
+                'csrf_token' =>
+                    function_exists('csrfToken')
+                        ? csrfToken()
+                        : null,
+            ]
+        );
+    }
+
     if ($action === 'delete_item') {
         $itemId = (int)($input['sidebar_item_id'] ?? 0);
 
@@ -678,8 +878,6 @@ try {
     );
 
     if ($action === 'repair_consistency') {
-        $pdo->beginTransaction();
-
         $itemCount = sa_repair_database_hierarchy(
             $pdo,
             $scope,
@@ -821,8 +1019,9 @@ try {
         }
 
         $icon = trim((string)(
-            $item['custom_icon']
-            ?? $item['icon']
+            $item['icon']
+            ?? $item['effective_icon']
+            ?? $item['custom_icon']
             ?? 'circle'
         ));
 
@@ -830,9 +1029,11 @@ try {
             $icon = 'circle';
         }
 
+        $icon = strtolower($icon);
+
         if (
             preg_match(
-                '/^[a-zA-Z0-9_-]{1,80}$/',
+                '/^[a-z0-9]+(?:-[a-z0-9]+)*$/',
                 $icon
             ) !== 1
         ) {

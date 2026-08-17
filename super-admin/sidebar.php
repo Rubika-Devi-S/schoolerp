@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-15-super-admin-sidebar-brand-settings-v2 */
+
 /*
 |--------------------------------------------------------------------------
 | Load the shared application bootstrap and PDO connection
@@ -218,7 +220,6 @@ if (!function_exists('superAdminIntegrateMasterMenus')) {
 
 $menus = [];
 $sidebarLoadedFromDatabase = false;
-$sidebarDatabaseAvailable = false;
 
 if (isset($pdo) && $pdo instanceof PDO
     && function_exists('school_table_exists')
@@ -260,8 +261,6 @@ if (isset($pdo) && $pdo instanceof PDO
                     si.menu_key,
                     si.route,
                     si.badge_text,
-                    si.is_active,
-                    si.show_in_sidebar,
                     {$orderOverride} AS display_order,
                     {$selectOverride}
                 FROM sidebar_items si
@@ -285,34 +284,32 @@ if (isset($pdo) && $pdo instanceof PDO
 
         $stmt->execute($params);
         $loadedMenus = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        $sidebarDatabaseAvailable = true;
-        $sidebarLoadedFromDatabase = true;
-        $menus = is_array($loadedMenus)
-            ? $loadedMenus
-            : [];
+
+        if (is_array($loadedMenus) && $loadedMenus) {
+            $menus = $loadedMenus;
+            $sidebarLoadedFromDatabase = true;
+        }
     } catch (Throwable $e) {
         error_log('super-admin/sidebar.php: ' . $e->getMessage());
     }
 }
 
-/*
- * The database is the source of truth whenever the sidebar tables are
- * available. Hardcoded master definitions are used only as an emergency
- * fallback when the database cannot be queried.
- */
-if (!$sidebarDatabaseAvailable) {
+if (!$menus) {
     $menus = $fallbackMenus;
-    $menus = superAdminIntegrateMasterMenus(
-        $menus,
-        true
-    );
 }
+
+$menus = superAdminIntegrateMasterMenus(
+    $menus,
+    !$sidebarLoadedFromDatabase
+);
 
 $menuTree = [];
 $menuLookup = [];
 
 foreach ($menus as $menu) {
-    if (!is_array($menu)) continue;
+    if (!is_array($menu)) {
+        continue;
+    }
 
     $menu += [
         'id' => 0,
@@ -322,63 +319,55 @@ foreach ($menus as $menu) {
         'route' => '#',
         'display_icon' => 'circle',
         'badge_text' => null,
-        'display_order' => 0,
         'children' => [],
     ];
 
-    $menu['id'] = (int)$menu['id'];
-    $menu['parent_id'] = !empty($menu['parent_id'])
-        ? (int)$menu['parent_id']
-        : null;
-    $menu['display_order'] = (int)$menu['display_order'];
     $menu['children'] = [];
-
-    $menuLookup[$menu['id']] = $menu;
+    $menuLookup[(int)$menu['id']] = $menu;
 }
 
 foreach ($menuLookup as $id => $menu) {
-    $parentId = $menu['parent_id'];
+    $parentId = (int)($menu['parent_id'] ?? 0);
 
-    if (
-        $parentId !== null
-        && $parentId !== $id
-        && isset($menuLookup[$parentId])
-    ) {
+    if ($parentId > 0 && isset($menuLookup[$parentId])) {
         $menuLookup[$parentId]['children'][] = &$menuLookup[$id];
     }
 }
 
 foreach ($menuLookup as $id => &$menu) {
-    $parentId = $menu['parent_id'];
-
-    if (
-        $parentId === null
-        || $parentId === $id
-        || !isset($menuLookup[$parentId])
-    ) {
+    if ((int)($menu['parent_id'] ?? 0) <= 0
+        || !isset($menuLookup[(int)$menu['parent_id']])) {
         $menuTree[] = &$menu;
     }
 }
 unset($menu);
 
 if (!function_exists('superAdminSortSidebarTree')) {
+    /**
+     * Keep every existing item while sorting each dropdown by display order.
+     *
+     * @param array<int,array<string,mixed>> $items
+     */
     function superAdminSortSidebarTree(array &$items): void
     {
         usort(
             $items,
             static function (array $left, array $right): int {
-                return ((int)($left['display_order'] ?? 0))
-                    <=> ((int)($right['display_order'] ?? 0))
-                    ?: strcmp(
-                        (string)($left['display_title'] ?? ''),
-                        (string)($right['display_title'] ?? '')
-                    )
-                    ?: ((int)($left['id'] ?? 0) <=> (int)($right['id'] ?? 0));
+                $leftOrder = (int)($left['display_order'] ?? 0);
+                $rightOrder = (int)($right['display_order'] ?? 0);
+
+                if ($leftOrder !== $rightOrder) {
+                    return $leftOrder <=> $rightOrder;
+                }
+
+                return (int)($left['id'] ?? 0)
+                    <=> (int)($right['id'] ?? 0);
             }
         );
 
         foreach ($items as &$item) {
-            if (!empty($item['children']) && is_array($item['children'])) {
+            if (!empty($item['children'])
+                && is_array($item['children'])) {
                 superAdminSortSidebarTree($item['children']);
             }
         }
@@ -623,26 +612,173 @@ $school = function_exists('current_tenant_branding')
     : [];
 
 $platformName = defined('APP_NAME')
-    ? (string)APP_NAME
+    ? trim((string)APP_NAME)
     : 'School ERP';
 
-$logo = trim((string)($school['logo_path'] ?? ''));
-$logoAbsolutePath = dirname(__DIR__) . '/' . ltrim($logo, '/');
-$hasValidLogo = $logo !== '' && is_file($logoAbsolutePath);
+if ($platformName === '') {
+    $platformName = 'School ERP';
+}
+
+/*
+ * General Settings controls only this existing Super Admin sidebar header.
+ * It does not add another brand block to the Topbar.
+ *
+ * The column names are retained from the first General Settings build so
+ * existing saved name/image settings continue to work without SQL changes.
+ */
+$platformBrandType = 'image';
+$platformBrandIcon = 'shield-check';
+$platformBrandImage = trim(
+    (string)($school['logo_path'] ?? '')
+);
+
+if (
+    isset($pdo)
+    && $pdo instanceof PDO
+    && function_exists('school_table_exists')
+    && school_table_exists(
+        $pdo,
+        'platform_general_settings'
+    )
+) {
+    try {
+        $brandStatement = $pdo->query(
+            "SELECT
+                topbar_brand_name,
+                topbar_brand_type,
+                topbar_brand_icon,
+                topbar_brand_image_path
+             FROM platform_general_settings
+             WHERE id = 1
+             LIMIT 1"
+        );
+
+        $brandSettings = $brandStatement->fetch(
+            PDO::FETCH_ASSOC
+        );
+
+        if (is_array($brandSettings)) {
+            $savedName = trim(
+                (string)(
+                    $brandSettings['topbar_brand_name']
+                    ?? ''
+                )
+            );
+
+            if ($savedName !== '') {
+                $platformName = $savedName;
+            }
+
+            $savedType = strtolower(
+                trim(
+                    (string)(
+                        $brandSettings['topbar_brand_type']
+                        ?? ''
+                    )
+                )
+            );
+
+            if (in_array(
+                $savedType,
+                ['icon', 'image'],
+                true
+            )) {
+                $platformBrandType = $savedType;
+            }
+
+            $savedIcon = strtolower(
+                trim(
+                    (string)(
+                        $brandSettings['topbar_brand_icon']
+                        ?? ''
+                    )
+                )
+            );
+
+            if (
+                $savedIcon !== ''
+                && preg_match(
+                    '/^[a-z0-9][a-z0-9-]{0,79}$/',
+                    $savedIcon
+                ) === 1
+            ) {
+                $platformBrandIcon = $savedIcon;
+            }
+
+            $savedImage = trim(
+                (string)(
+                    $brandSettings[
+                        'topbar_brand_image_path'
+                    ]
+                    ?? ''
+                )
+            );
+
+            if ($savedImage !== '') {
+                $platformBrandImage = $savedImage;
+            }
+        }
+    } catch (Throwable $brandException) {
+        error_log(
+            'super-admin/sidebar.php branding: '
+            . $brandException->getMessage()
+        );
+    }
+}
+
+$platformBrandImageAbsolute = $platformBrandImage !== ''
+    ? dirname(__DIR__)
+        . '/'
+        . ltrim(
+            str_replace(
+                '\\',
+                '/',
+                $platformBrandImage
+            ),
+            '/'
+        )
+    : '';
+
+$platformBrandHasImage =
+    $platformBrandType === 'image'
+    && $platformBrandImageAbsolute !== ''
+    && is_file($platformBrandImageAbsolute);
+
+$platformBrandImageUrl = $platformBrandHasImage
+    ? $baseUrl
+        . ltrim(
+            str_replace(
+                '\\',
+                '/',
+                $platformBrandImage
+            ),
+            '/'
+        )
+    : '';
 ?>
+<style>
+#sidebar .sidebar-brand .brand-monogram svg{
+    width:18px;
+    height:18px;
+}
+</style>
 <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
 
 <aside id="sidebar">
     <div class="sidebar-brand">
         <a href="<?= e($baseUrl . 'super-admin/dashboard.php') ?>" class="brand-link">
             <span class="brand-logo">
-                <?php if ($hasValidLogo): ?>
+                <?php if ($platformBrandHasImage): ?>
                     <img
-                        src="<?= e($baseUrl . ltrim($logo, '/')) ?>"
+                        src="<?= e($platformBrandImageUrl) ?>"
                         alt="<?= e($platformName) ?>"
                     >
                 <?php else: ?>
-                    <span class="brand-monogram">SA</span>
+                    <span class="brand-monogram">
+                        <i
+                            data-lucide="<?= e($platformBrandIcon) ?>"
+                        ></i>
+                    </span>
                 <?php endif; ?>
             </span>
 

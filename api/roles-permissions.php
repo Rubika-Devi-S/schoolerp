@@ -6,12 +6,14 @@ ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
+require_once dirname(__DIR__) . '/includes/sidebar-manager.php';
+require_once dirname(__DIR__) . '/includes/permission-chain.php';
 
 if (session_status() !== PHP_SESSION_ACTIVE) {
     session_start();
 }
 
-const RP_API_BUILD = '2026-08-06-strict-action-permissions-v6';
+const RP_API_BUILD = '2026-08-14-super-admin-school-branch-ceiling-v24';
 
 function rpJson(bool $success, string $message = '', array $data = [], int $status = 200): never
 {
@@ -86,6 +88,12 @@ function rpScope(PDO $pdo): array
             ?? $_SESSION['school_id']
             ?? 0
         ),
+        'branch_id' => (int)(
+            $user['branch_id']
+            ?? $_SESSION['branch_id']
+            ?? $_SESSION['default_branch_id']
+            ?? 0
+        ),
         'user_id' => (int)(
             $user['id']
             ?? $user['user_id']
@@ -107,6 +115,8 @@ function rpScope(PDO $pdo): array
             ?? $_SESSION['role_name']
             ?? ''
         ))),
+        'school_name' => '',
+        'branch_name' => '',
     ];
 
     if ($scope['role_key'] === '' && $scope['role_id'] > 0 && rpTable($pdo, 'roles')) {
@@ -125,33 +135,64 @@ function rpScope(PDO $pdo): array
         }
     }
 
+    if ($scope['tenant_id'] > 0 && rpTable($pdo, 'tenants')) {
+        try {
+            $stmt = $pdo->prepare(
+                "SELECT school_name
+                 FROM tenants
+                 WHERE id = :tenant_id
+                 LIMIT 1"
+            );
+            $stmt->execute(['tenant_id' => $scope['tenant_id']]);
+            $scope['school_name'] = trim((string)($stmt->fetchColumn() ?: ''));
+        } catch (Throwable $exception) {
+            error_log('Roles permission school context: ' . $exception->getMessage());
+        }
+    }
+
+    if ($scope['branch_id'] > 0 && rpTable($pdo, 'branches')) {
+        try {
+            $stmt = $pdo->prepare(
+                "SELECT branch_name
+                 FROM branches
+                 WHERE id = :branch_id
+                   AND tenant_id = :tenant_id
+                   AND status = 'active'
+                 LIMIT 1"
+            );
+            $stmt->execute([
+                'branch_id' => $scope['branch_id'],
+                'tenant_id' => $scope['tenant_id'],
+            ]);
+            $branchName = $stmt->fetchColumn();
+
+            if ($branchName === false) {
+                $scope['branch_id'] = 0;
+            } else {
+                $scope['branch_name'] = trim((string)$branchName);
+            }
+        } catch (Throwable $exception) {
+            error_log('Roles permission branch context: ' . $exception->getMessage());
+            $scope['branch_id'] = 0;
+        }
+    }
+
     return $scope;
 }
 
 function rpIsAdministrator(array $scope): bool
 {
+    /*
+     * Only the SaaS / Platform Super Admin bypasses this page's permission
+     * checks. School Admin must obey the Super Admin school / branch ceiling.
+     */
     return in_array(
         $scope['role_key'],
-        [
-            'super_admin',
-            'super-administrator',
-            'super_administrator',
-            'school_admin',
-            'school-administrator',
-            'school_administrator',
-            'admin',
-        ],
+        ['super_admin', 'super-administrator', 'super_administrator'],
         true
     ) || in_array(
         $scope['role_name'],
-        [
-            'super administrator',
-            'super admin',
-            'school administrator',
-            'school admin',
-            'administrator',
-            'admin',
-        ],
+        ['super administrator', 'super admin'],
         true
     );
 }
@@ -160,6 +201,31 @@ function rpCan(array $scope, string $action): bool
 {
     if (rpIsAdministrator($scope)) {
         return true;
+    }
+
+    $action = pc_normalize_action($action);
+
+    /*
+     * Use the same runtime permission chain as the School panel. This makes
+     * the Roles & Permissions buttons obey the exact Super Admin ceiling for
+     * the logged school and branch instead of treating School Admin as an
+     * unrestricted user.
+     */
+    if (function_exists('school_effective_permission')) {
+        try {
+            return (bool)school_effective_permission(
+                'roles_permissions',
+                $action,
+                (int)$scope['tenant_id'],
+                (int)($scope['branch_id'] ?? 0),
+                (int)$scope['user_id']
+            );
+        } catch (Throwable $exception) {
+            error_log(
+                'Roles permission chain check failed: '
+                . $exception->getMessage()
+            );
+        }
     }
 
     if (function_exists('has_permission')) {
@@ -268,226 +334,62 @@ function rpRequiredTables(PDO $pdo): void
 function rpAssignedSidebar(PDO $pdo, array $scope): array
 {
     $tenantId = (int)$scope['tenant_id'];
-    if ($tenantId <= 0) {
+    $adminRoleId = pc_role_id($pdo, $tenantId, 'school_admin');
+
+    if ($tenantId <= 0 || $adminRoleId <= 0) {
         return [];
     }
 
-    $hasPortalScope = rpColumn($pdo, 'sidebar_items', 'portal_scope');
-    $hasOwnerTenant = rpColumn($pdo, 'sidebar_items', 'owner_tenant_id');
-    $hasCustomTitle = rpColumn($pdo, 'tenant_sidebar_items', 'custom_title');
-    $hasCustomIcon = rpColumn($pdo, 'tenant_sidebar_items', 'custom_icon');
-    $hasCustomRoute = rpColumn($pdo, 'tenant_sidebar_items', 'custom_route');
-    $hasCustomParent = rpColumn($pdo, 'tenant_sidebar_items', 'custom_parent_id');
-    $hasDisplayOrder = rpColumn($pdo, 'tenant_sidebar_items', 'display_order');
-    $hasModuleId = rpColumn($pdo, 'sidebar_items', 'module_id');
-    $hasShowInSidebar = rpColumn($pdo, 'sidebar_items', 'show_in_sidebar');
-    $hasIsActive = rpColumn($pdo, 'sidebar_items', 'is_active');
-    $hasTenantModules = $hasModuleId
-        && rpTable($pdo, 'tenant_modules')
-        && rpColumn($pdo, 'tenant_modules', 'tenant_id')
-        && rpColumn($pdo, 'tenant_modules', 'module_id')
-        && rpColumn($pdo, 'tenant_modules', 'is_enabled');
+    $runtime = school_sidebar_get_items($pdo, $adminRoleId, $tenantId);
+    $out = [];
+    $sequence = 0;
 
-    $parentExpression = $hasCustomParent
-        ? 'COALESCE(tsi.custom_parent_id, si.parent_id)'
-        : 'si.parent_id';
-
-    $titleExpression = $hasCustomTitle
-        ? "COALESCE(NULLIF(TRIM(tsi.custom_title), ''), si.menu_title)"
-        : 'si.menu_title';
-
-    $iconExpression = $hasCustomIcon
-        ? "COALESCE(NULLIF(TRIM(tsi.custom_icon), ''), si.icon)"
-        : 'si.icon';
-
-    $routeExpression = $hasCustomRoute
-        ? "COALESCE(NULLIF(TRIM(tsi.custom_route), ''), si.route)"
-        : 'si.route';
-
-    $orderExpression = $hasDisplayOrder
-        ? 'COALESCE(tsi.display_order, si.display_order)'
-        : 'si.display_order';
-
-    $where = ['tsi.is_visible = 1'];
-    $parameters = [
-        'override_tenant_id' => $tenantId,
-    ];
-
-    if ($hasPortalScope) {
-        $where[] = "si.portal_scope IN ('school', 'all')";
-    } else {
-        $where[] = "si.menu_key NOT LIKE 'sa\\_%'";
-    }
-
-    if ($hasOwnerTenant) {
-        $where[] = '(si.owner_tenant_id IS NULL OR si.owner_tenant_id = :owner_tenant_id)';
-        $parameters['owner_tenant_id'] = $tenantId;
-    }
-
-    if ($hasShowInSidebar) {
-        $where[] = 'si.show_in_sidebar = 1';
-    }
-
-    if ($hasIsActive) {
-        $where[] = 'si.is_active = 1';
-    }
-
-    $moduleSelect = $hasModuleId ? 'si.module_id' : 'NULL AS module_id';
-    $tenantModuleJoin = '';
-
-    if ($hasTenantModules) {
-        $tenantModuleJoin = 'LEFT JOIN tenant_modules AS tm
-                ON tm.module_id = si.module_id
-               AND tm.tenant_id = :module_tenant_id';
-        $where[] = '(si.module_id IS NULL OR COALESCE(tm.is_enabled, 1) = 1)';
-        $parameters['module_tenant_id'] = $tenantId;
-    }
-
-    /*
-     * Use the same source, hierarchy fields and sibling ordering as the
-     * School Admin sidebar loader. The final result is flattened in recursive
-     * sidebar render order: parent, then each child subtree.
-     */
-    $sql = "SELECT
-                si.id,
-                {$parentExpression} AS parent_id,
-                {$moduleSelect},
-                si.menu_key,
-                si.menu_title,
-                {$titleExpression} AS display_title,
-                {$iconExpression} AS display_icon,
-                {$routeExpression} AS effective_route,
-                {$orderExpression} AS display_order
-            FROM sidebar_items AS si
-            INNER JOIN tenant_sidebar_items AS tsi
-                ON tsi.sidebar_item_id = si.id
-               AND tsi.tenant_id = :override_tenant_id
-               AND tsi.is_visible = 1
-            {$tenantModuleJoin}
-            WHERE " . implode(' AND ', $where) . "
-            ORDER BY
-                COALESCE({$parentExpression}, 0),
-                {$orderExpression},
-                si.id";
-
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute($parameters);
-
-    $raw = [];
-    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+    foreach ($runtime as $row) {
         $id = (int)($row['id'] ?? 0);
         if ($id <= 0) {
             continue;
         }
 
-        $row['id'] = $id;
-        $row['parent_id'] = (int)($row['parent_id'] ?? 0);
-        $row['module_id'] = (int)($row['module_id'] ?? 0);
-        $row['display_order'] = (int)($row['display_order'] ?? 0);
-        $raw[$id] = $row;
+        /*
+         * The School Admin role-permission page must expose only the menu
+         * ceiling currently allowed by Super Admin for this school / branch.
+         */
+        $caps = rpCaps($pdo, $scope, $id);
+        if ((int)($caps['view'] ?? 0) !== 1) {
+            continue;
+        }
+
+        $sequence++;
+
+        $out[$id] = [
+            'id' => $id,
+            'parent_id' => (int)($row['parent_id'] ?? 0),
+            'module_id' => (int)($row['module_id'] ?? 0),
+            'menu_key' => (string)($row['menu_key'] ?? ''),
+            'menu_title' => (string)(
+                $row['display_title']
+                ?? $row['menu_title']
+                ?? 'Menu'
+            ),
+            'display_title' => (string)(
+                $row['display_title']
+                ?? $row['menu_title']
+                ?? 'Menu'
+            ),
+            'display_icon' => (string)(
+                $row['display_icon']
+                ?? $row['icon']
+                ?? 'circle'
+            ),
+            'effective_route' => (string)($row['route'] ?? '#'),
+            'display_order' => (int)($row['display_order'] ?? 0),
+            'sidebar_sequence' => $sequence,
+            'depth' => (int)($row['depth'] ?? 0),
+            'super_admin_caps' => $caps,
+        ];
     }
 
-    /* A child is valid only when every parent is also assigned. */
-    $state = [];
-    $valid = [];
-
-    $isValid = static function (int $id) use (&$isValid, &$state, &$valid, $raw): bool {
-        if (($state[$id] ?? 0) === 2) {
-            return true;
-        }
-
-        if (($state[$id] ?? 0) === 1 || ($state[$id] ?? 0) === -1) {
-            return false;
-        }
-
-        if (!isset($raw[$id])) {
-            return false;
-        }
-
-        $state[$id] = 1;
-        $parentId = (int)($raw[$id]['parent_id'] ?? 0);
-        $ok = $parentId <= 0 || (isset($raw[$parentId]) && $isValid($parentId));
-        $state[$id] = $ok ? 2 : -1;
-
-        if ($ok) {
-            $valid[$id] = $raw[$id];
-        }
-
-        return $ok;
-    };
-
-    foreach (array_keys($raw) as $id) {
-        $isValid((int)$id);
-    }
-
-    if ($valid === []) {
-        return [];
-    }
-
-    $sortSiblings = static function (array &$ids) use ($valid): void {
-        usort(
-            $ids,
-            static function (int $leftId, int $rightId) use ($valid): int {
-                $left = $valid[$leftId];
-                $right = $valid[$rightId];
-
-                return ((int)$left['display_order'] <=> (int)$right['display_order'])
-                    ?: ($leftId <=> $rightId);
-            }
-        );
-    };
-
-    $children = [];
-    $roots = [];
-
-    foreach ($valid as $id => $item) {
-        $parentId = (int)($item['parent_id'] ?? 0);
-
-        if ($parentId > 0 && isset($valid[$parentId])) {
-            $children[$parentId][] = (int)$id;
-        } else {
-            $roots[] = (int)$id;
-        }
-    }
-
-    $sortSiblings($roots);
-    foreach ($children as &$childIds) {
-        $sortSiblings($childIds);
-    }
-    unset($childIds);
-
-    $ordered = [];
-    $sequence = 0;
-    $visited = [];
-
-    $appendTree = static function (int $id, int $depth) use (
-        &$appendTree,
-        &$ordered,
-        &$sequence,
-        &$visited,
-        $valid,
-        $children
-    ): void {
-        if (isset($visited[$id]) || !isset($valid[$id])) {
-            return;
-        }
-
-        $visited[$id] = true;
-        $item = $valid[$id];
-        $item['depth'] = $depth;
-        $item['sidebar_sequence'] = ++$sequence;
-        $ordered[$id] = $item;
-
-        foreach ($children[$id] ?? [] as $childId) {
-            $appendTree((int)$childId, $depth + 1);
-        }
-    };
-
-    foreach ($roots as $rootId) {
-        $appendTree((int)$rootId, 0);
-    }
-
-    return $ordered;
+    return $out;
 }
 
 function rpRolePermissionPageAssigned(array $assigned): bool
@@ -557,48 +459,67 @@ function rpUserCount(PDO $pdo, int $tenantId, int $roleId): int
     return (int)$stmt->fetchColumn();
 }
 
-function rpVisiblePermissionCount(PDO $pdo, int $tenantId, int $roleId): int
-{
-    if (rpTable($pdo, 'school_sidebar_action_permissions')) {
-        $stmt = $pdo->prepare(
-            'SELECT COUNT(*)
-             FROM school_sidebar_action_permissions AS sap
-             INNER JOIN tenant_sidebar_items AS tsi
-                ON tsi.tenant_id = sap.tenant_id
-               AND tsi.sidebar_item_id = sap.sidebar_item_id
-               AND tsi.is_visible = 1
-             WHERE sap.tenant_id = :tenant_id
-               AND sap.role_id = :role_id
-               AND sap.can_view = 1'
-        );
-        $stmt->execute([
-            'tenant_id' => $tenantId,
-            'role_id' => $roleId,
-        ]);
-
-        return (int)$stmt->fetchColumn();
+function rpVisiblePermissionCount(
+    PDO $pdo,
+    array $scope,
+    int $roleId,
+    array $assigned = []
+): int {
+    if ($roleId <= 0) {
+        return 0;
     }
 
-    if (rpTable($pdo, 'role_sidebar_permissions')) {
-        $stmt = $pdo->prepare(
-            'SELECT COUNT(*)
-             FROM role_sidebar_permissions AS rsp
-             INNER JOIN tenant_sidebar_items AS tsi
-                ON tsi.sidebar_item_id = rsp.sidebar_item_id
-               AND tsi.tenant_id = :tenant_id
-               AND tsi.is_visible = 1
-             WHERE rsp.role_id = :role_id
-               AND rsp.can_show = 1'
-        );
-        $stmt->execute([
-            'tenant_id' => $tenantId,
-            'role_id' => $roleId,
-        ]);
-
-        return (int)$stmt->fetchColumn();
+    if ($assigned === []) {
+        $assigned = rpAssignedSidebar($pdo, $scope);
     }
 
-    return 0;
+    if ($assigned === []) {
+        return 0;
+    }
+
+    $roleStmt = $pdo->prepare(
+        "SELECT role_key
+         FROM roles
+         WHERE id = :role_id
+           AND tenant_id = :tenant_id
+         LIMIT 1"
+    );
+    $roleStmt->execute([
+        'role_id' => $roleId,
+        'tenant_id' => (int)$scope['tenant_id'],
+    ]);
+    $roleKey = strtolower(trim((string)($roleStmt->fetchColumn() ?: '')));
+    $locked = in_array(
+        $roleKey,
+        ['school_admin', 'school-administrator', 'school_administrator'],
+        true
+    );
+
+    $saved = $locked
+        ? []
+        : rpPermissionRows(
+            $pdo,
+            (int)$scope['tenant_id'],
+            $roleId
+        );
+
+    $count = 0;
+
+    foreach ($assigned as $itemId => $item) {
+        $caps = is_array($item['super_admin_caps'] ?? null)
+            ? $item['super_admin_caps']
+            : rpCaps($pdo, $scope, (int)$itemId);
+
+        if ((int)($caps['view'] ?? 0) !== 1) {
+            continue;
+        }
+
+        if ($locked || (int)($saved[(int)$itemId]['view'] ?? 0) === 1) {
+            $count++;
+        }
+    }
+
+    return $count;
 }
 
 function rpRole(PDO $pdo, array $scope, int $roleId): array
@@ -626,7 +547,7 @@ function rpRole(PDO $pdo, array $scope, int $roleId): array
     );
     $role['permission_count'] = rpVisiblePermissionCount(
         $pdo,
-        (int)$scope['tenant_id'],
+        $scope,
         (int)$role['id']
     );
 
@@ -652,7 +573,7 @@ function rpListRoles(PDO $pdo, array $scope, array $filter): array
     $page = max(1, (int)($filter['page'] ?? 1));
     $perPage = min(100, max(5, (int)($filter['per_page'] ?? 10)));
 
-    $where = [rpRoleWhere($pdo, 'r')];
+    $where = [rpRoleWhere($pdo, 'r'), "r.role_key <> 'parent'"];
     $params = ['tenant_id' => $scope['tenant_id']];
 
     if ($search !== '') {
@@ -706,7 +627,7 @@ function rpListRoles(PDO $pdo, array $scope, array $filter): array
         );
         $record['permission_count'] = rpVisiblePermissionCount(
             $pdo,
-            (int)$scope['tenant_id'],
+            $scope,
             (int)$record['id']
         );
         $record['is_protected'] = rpProtectedRole($record);
@@ -719,23 +640,41 @@ function rpListRoles(PDO $pdo, array $scope, array $filter): array
     }
     unset($record);
 
+    /*
+     * Statistics use the same role population shown in this page. Parent is
+     * managed separately by Parent Sidebar Permission and is not counted here.
+     */
     $statsStmt = $pdo->prepare(
         'SELECT
             COUNT(*) AS total_roles,
-            SUM(status = \'active\') AS active_roles,
-            SUM(is_system = 1) AS protected_roles
+            COALESCE(SUM(r.status = \'active\'),0) AS active_roles,
+            COALESCE(SUM(r.is_system = 1),0) AS protected_roles,
+            COALESCE(SUM(r.is_system = 0),0) AS custom_roles
          FROM roles AS r
-         WHERE ' . rpRoleWhere($pdo, 'r')
+         WHERE ' . rpRoleWhere($pdo, 'r') . "
+           AND r.role_key <> 'parent'"
     );
     $statsStmt->execute(['tenant_id' => $scope['tenant_id']]);
     $stats = $statsStmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
-    $usersWhere = ['tenant_id = :tenant_id'];
+    $usersWhere = [
+        'u.tenant_id = :tenant_id',
+        "r.role_key <> 'parent'",
+    ];
     if (rpColumn($pdo, 'users', 'deleted_at')) {
-        $usersWhere[] = 'deleted_at IS NULL';
+        $usersWhere[] = 'u.deleted_at IS NULL';
     }
+    if (rpColumn($pdo, 'roles', 'deleted_at')) {
+        $usersWhere[] = 'r.deleted_at IS NULL';
+    }
+
     $usersStmt = $pdo->prepare(
-        'SELECT COUNT(*) FROM users WHERE ' . implode(' AND ', $usersWhere)
+        'SELECT COUNT(*)
+         FROM users AS u
+         INNER JOIN roles AS r
+            ON r.id = u.role_id
+           AND r.tenant_id = u.tenant_id
+         WHERE ' . implode(' AND ', $usersWhere)
     );
     $usersStmt->execute(['tenant_id' => $scope['tenant_id']]);
     $stats['assigned_users'] = (int)$usersStmt->fetchColumn();
@@ -756,89 +695,249 @@ function rpListRoles(PDO $pdo, array $scope, array $filter): array
             'delete' => rpCan($scope, 'delete'),
             'manage' => rpCan($scope, 'edit') || rpCan($scope, 'manage_settings'),
         ],
+        'scope' => [
+            'school_id' => (int)$scope['tenant_id'],
+            'school_name' => (string)($scope['school_name'] ?? ''),
+            'branch_id' => (int)($scope['branch_id'] ?? 0),
+            'branch_name' => (string)($scope['branch_name'] ?? ''),
+        ],
     ];
 }
 
 /**
  * @return array<int,array<string,int>> keyed by sidebar item id
  */
+function rpActionCatalog(PDO $pdo): array
+{
+    return pc_action_catalog($pdo);
+}
+
+function rpActionKeys(PDO $pdo): array
+{
+    return array_values(array_unique(array_map(
+        static fn(array $row): string => (string)$row['action_key'],
+        rpActionCatalog($pdo)
+    )));
+}
+
+function rpSuperAdminActionAllowed(
+    PDO $pdo,
+    array $scope,
+    int $itemId,
+    string $action
+): bool {
+    $tenantId = (int)$scope['tenant_id'];
+    $branchId = (int)($scope['branch_id'] ?? 0);
+    $adminRoleId = pc_role_id($pdo, $tenantId, 'school_admin');
+
+    if ($tenantId <= 0 || $adminRoleId <= 0 || $itemId <= 0) {
+        return false;
+    }
+
+    $action = pc_normalize_action($action);
+
+    /*
+     * New branch-aware permission-chain build: read the School ceiling first,
+     * then apply the current Branch override. A branch may only reduce the
+     * school permission.
+     */
+    if (function_exists('pc_school_role_action')) {
+        $allowed = pc_school_role_action(
+            $pdo,
+            $tenantId,
+            $adminRoleId,
+            $itemId,
+            $action,
+            true
+        );
+
+        if (
+            $allowed
+            && $action === 'view'
+            && function_exists('pc_effective_school_visibility')
+        ) {
+            $allowed = pc_effective_school_visibility(
+                $pdo,
+                $tenantId,
+                $itemId
+            );
+        }
+
+        if (!$allowed) {
+            return false;
+        }
+
+        if ($branchId > 0) {
+            if (function_exists('pc_branch_role_action_override')) {
+                $branchDecision = pc_branch_role_action_override(
+                    $pdo,
+                    $tenantId,
+                    $branchId,
+                    $adminRoleId,
+                    $itemId,
+                    $action
+                );
+
+                if ($branchDecision !== null) {
+                    return $branchDecision;
+                }
+            } elseif (rpTable($pdo, 'branch_sidebar_permission_grants')) {
+                $stmt = $pdo->prepare(
+                    "SELECT is_allowed
+                     FROM branch_sidebar_permission_grants
+                     WHERE tenant_id = :tenant_id
+                       AND branch_id = :branch_id
+                       AND role_id = :role_id
+                       AND sidebar_item_id = :item_id
+                       AND action_key = :action_key
+                     LIMIT 1"
+                );
+                $base = [
+                    'tenant_id' => $tenantId,
+                    'branch_id' => $branchId,
+                    'role_id' => $adminRoleId,
+                    'item_id' => $itemId,
+                ];
+
+                $stmt->execute(
+                    $base + ['action_key' => $action]
+                );
+                $branchValue = $stmt->fetchColumn();
+
+                if ($branchValue !== false) {
+                    return (int)$branchValue === 1;
+                }
+
+                if ($action !== 'full_access') {
+                    $stmt->execute(
+                        $base + ['action_key' => 'full_access']
+                    );
+                    $full = $stmt->fetchColumn();
+
+                    if ($full !== false) {
+                        return (int)$full === 1;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /*
+     * Compatibility with older permission-chain builds. pc_super_cap() is the
+     * existing Super Admin ceiling and, when the branch-aware build is
+     * installed, already uses the logged branch.
+     */
+    return pc_super_cap(
+        $pdo,
+        $tenantId,
+        $itemId,
+        $action,
+        'school_admin'
+    );
+}
+
+function rpCaps(PDO $pdo, array $scope, int $itemId): array
+{
+    $caps = [];
+
+    foreach (rpActionKeys($pdo) as $action) {
+        $caps[$action] = rpSuperAdminActionAllowed(
+            $pdo,
+            $scope,
+            $itemId,
+            $action
+        ) ? 1 : 0;
+    }
+
+    return $caps;
+}
+
 function rpPermissionRows(PDO $pdo, int $tenantId, int $roleId): array
 {
-    $rows = [];
-
-    if (rpTable($pdo, 'school_sidebar_action_permissions')) {
-        $stmt = $pdo->prepare(
-            'SELECT sidebar_item_id, can_view, can_add, can_edit, can_delete
-             FROM school_sidebar_action_permissions
-             WHERE tenant_id = :tenant_id
-               AND role_id = :role_id'
-        );
-        $stmt->execute([
-            'tenant_id' => $tenantId,
-            'role_id' => $roleId,
-        ]);
-
-        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-            $id = (int)$row['sidebar_item_id'];
-            $rows[$id] = [
-                'can_view' => (int)$row['can_view'],
-                'can_add' => (int)$row['can_add'],
-                'can_edit' => (int)$row['can_edit'],
-                'can_delete' => (int)$row['can_delete'],
-            ];
-        }
-
-        return $rows;
-    }
-
-    if (rpTable($pdo, 'role_sidebar_permissions')) {
-        $stmt = $pdo->prepare(
-            'SELECT sidebar_item_id, can_show
-             FROM role_sidebar_permissions
-             WHERE role_id = :role_id'
-        );
-        $stmt->execute(['role_id' => $roleId]);
-
-        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-            $id = (int)$row['sidebar_item_id'];
-            $rows[$id] = [
-                'can_view' => (int)$row['can_show'],
-                'can_add' => 0,
-                'can_edit' => 0,
-                'can_delete' => 0,
-            ];
+    $rows=[];
+    if(rpTable($pdo,'school_sidebar_permission_grants')){
+        $q=$pdo->prepare("SELECT sidebar_item_id,action_key,is_allowed
+            FROM school_sidebar_permission_grants
+            WHERE tenant_id=:tenant_id AND role_id=:role_id
+              AND action_key NOT LIKE 'parent_delegate\\_%'");
+        $q->execute(['tenant_id'=>$tenantId,'role_id'=>$roleId]);
+        foreach($q->fetchAll(PDO::FETCH_ASSOC) as $r){
+            $id=(int)$r['sidebar_item_id'];
+            $key=pc_normalize_action((string)$r['action_key']);
+            if($id>0&&$key!=='')$rows[$id][$key]=(int)$r['is_allowed'];
         }
     }
-
+    if(rpTable($pdo,'school_sidebar_action_permissions')){
+        $map=['view'=>'can_view','create'=>'can_add','edit'=>'can_edit','delete'=>'can_delete',
+            'print'=>'can_print','pdf'=>'can_pdf','export'=>'can_export','import'=>'can_import',
+            'approve'=>'can_approve','reject'=>'can_reject','restore'=>'can_restore',
+            'manage_settings'=>'can_manage','manage_visibility'=>'can_manage_visibility'];
+        $avail=[];
+        foreach($map as $k=>$c) if(rpColumn($pdo,'school_sidebar_action_permissions',$c))$avail[$k]=$c;
+        if($avail){
+            $q=$pdo->prepare("SELECT ".implode(',',array_unique(['sidebar_item_id',...array_values($avail)]))."
+              FROM school_sidebar_action_permissions
+              WHERE tenant_id=:tenant_id AND role_id=:role_id");
+            $q->execute(['tenant_id'=>$tenantId,'role_id'=>$roleId]);
+            foreach($q->fetchAll(PDO::FETCH_ASSOC) as $r){
+                $id=(int)$r['sidebar_item_id'];
+                foreach($avail as $k=>$c)
+                    if(!array_key_exists($k,$rows[$id]??[]))$rows[$id][$k]=(int)($r[$c]??0);
+            }
+        }
+    }
     return $rows;
 }
 
 function rpMatrix(PDO $pdo, array $scope, int $roleId, array $assigned): array
 {
     $role = rpRole($pdo, $scope, $roleId);
+
+    if (pc_role_key((string)($role['role_key'] ?? '')) === 'parent') {
+        throw new RuntimeException(
+            'Use Parent Sidebar Permission to manage Parent access.',
+            422
+        );
+    }
+
     $locked = rpProtectedRole($role);
     $saved = rpPermissionRows(
         $pdo,
         (int)$scope['tenant_id'],
         (int)$role['id']
     );
-
+    $actions = rpActionCatalog($pdo);
     $items = [];
-    foreach ($assigned as $id => $item) {
-        $permission = $saved[(int)$id] ?? [
-            'can_view' => 0,
-            'can_add' => 0,
-            'can_edit' => 0,
-            'can_delete' => 0,
-        ];
 
-        if ($locked) {
-            $permission = [
-                'can_view' => 1,
-                'can_add' => 1,
-                'can_edit' => 1,
-                'can_delete' => 1,
-            ];
+    foreach ($assigned as $id => $item) {
+        $caps = is_array($item['super_admin_caps'] ?? null)
+            ? $item['super_admin_caps']
+            : rpCaps($pdo, $scope, (int)$id);
+
+        /*
+         * View=0 means Super Admin did not assign this menu to the current
+         * school/branch. Do not expose it as an option at all.
+         */
+        if ((int)($caps['view'] ?? 0) !== 1) {
+            continue;
+        }
+
+        $permissions = [];
+
+        foreach ($actions as $actionRow) {
+            $key = (string)$actionRow['action_key'];
+            $cap = (int)($caps[$key] ?? 0);
+
+            $permissions[$key] = $locked
+                ? $cap
+                : (
+                    $cap === 1
+                    && (int)($saved[(int)$id][$key] ?? 0) === 1
+                        ? 1
+                        : 0
+                );
         }
 
         $items[] = [
@@ -846,199 +945,137 @@ function rpMatrix(PDO $pdo, array $scope, int $roleId, array $assigned): array
             'parent_id' => (int)($item['parent_id'] ?? 0),
             'module_id' => (int)($item['module_id'] ?? 0),
             'menu_key' => (string)($item['menu_key'] ?? ''),
-            'menu_title' => (string)($item['display_title'] ?? $item['menu_title'] ?? 'Menu'),
+            'menu_title' => (string)($item['display_title'] ?? 'Menu'),
             'route' => (string)($item['effective_route'] ?? '#'),
             'icon' => (string)($item['display_icon'] ?? 'circle'),
             'display_order' => (int)($item['display_order'] ?? 0),
-            'sidebar_sequence' => (int)($item['sidebar_sequence'] ?? (count($items) + 1)),
+            'sidebar_sequence' => (int)(
+                $item['sidebar_sequence']
+                ?? count($items) + 1
+            ),
             'depth' => (int)($item['depth'] ?? 0),
-            'is_container' => trim((string)($item['effective_route'] ?? '#')) === '#' ? 1 : 0,
-            'can_view' => (int)$permission['can_view'],
-            'can_add' => (int)$permission['can_add'],
-            'can_edit' => (int)$permission['can_edit'],
-            'can_delete' => (int)$permission['can_delete'],
+            'is_container' => trim(
+                (string)($item['effective_route'] ?? '#')
+            ) === '#' ? 1 : 0,
+            'permissions' => $permissions,
+            'caps' => $caps,
+            'can_view' => (int)($permissions['view'] ?? 0),
+            'can_add' => (int)($permissions['create'] ?? 0),
+            'can_edit' => (int)($permissions['edit'] ?? 0),
+            'can_delete' => (int)($permissions['delete'] ?? 0),
         ];
     }
 
     return [
         'role' => $role,
         'items' => $items,
+        'actions' => $actions,
         'is_locked' => $locked,
         'assigned_count' => count($items),
+        'scope' => [
+            'school_id' => (int)$scope['tenant_id'],
+            'school_name' => (string)($scope['school_name'] ?? ''),
+            'branch_id' => (int)($scope['branch_id'] ?? 0),
+            'branch_name' => (string)($scope['branch_name'] ?? ''),
+        ],
+        'permission_chain' => (int)($scope['branch_id'] ?? 0) > 0
+            ? 'Super Admin School Permission → Branch Permission → School Role Permission'
+            : 'Super Admin School Permission → School Role Permission',
     ];
 }
 
-/**
- * Normalize the permission rows and enforce the parent-child visibility rule.
- *
- * @param array<int,array<string,mixed>> $submitted
- * @return array<int,array<string,int>> keyed by assigned sidebar item id
- */
-function rpNormalizeRows(array $submitted, array $assigned, bool $locked): array
+function rpNormalizeRows(array $submitted, array $assigned, bool $locked, PDO $pdo, array $scope): array
 {
-    $normalized = [];
+    $actions=rpActionKeys($pdo); $out=[];
+    foreach($assigned as $id=>$item){
+        $caps=rpCaps($pdo,$scope,(int)$id); $out[(int)$id]=[];
+        foreach($actions as $a)$out[(int)$id][$a]=$locked?(int)($caps[$a]??0):0;
+    }
+    if($locked)return $out;
 
-    foreach ($assigned as $id => $item) {
-        $normalized[(int)$id] = [
-            'can_view' => $locked ? 1 : 0,
-            'can_add' => $locked ? 1 : 0,
-            'can_edit' => $locked ? 1 : 0,
-            'can_delete' => $locked ? 1 : 0,
-        ];
+    foreach($submitted as $row){
+        if(!is_array($row))continue;
+        $id=(int)($row['sidebar_item_id']??0); if(!isset($assigned[$id]))continue;
+        $caps=rpCaps($pdo,$scope,$id);
+        $p=is_array($row['permissions']??null)?$row['permissions']:[];
+        foreach(['view'=>'can_view','create'=>'can_add','edit'=>'can_edit','delete'=>'can_delete'] as $k=>$legacy)
+            if(array_key_exists($legacy,$row)&&!array_key_exists($k,$p))$p[$k]=$row[$legacy];
+        foreach($actions as $a)$out[$id][$a]=!empty($p[$a])&&!empty($caps[$a])?1:0;
+        if(!empty($out[$id]['full_access']))
+            foreach($actions as $a)if($a!=='full_access')$out[$id][$a]=!empty($caps[$a])?1:0;
+        $any=false;
+        foreach($out[$id] as $a=>$v)if(!in_array($a,['view','full_access'],true)&&$v===1){$any=true;break;}
+        if($any&&!empty($caps['view']))$out[$id]['view']=1;
+        if(empty($out[$id]['view']))foreach($actions as $a)if($a!=='view')$out[$id][$a]=0;
     }
 
-    if (!$locked) {
-        foreach ($submitted as $row) {
-            if (!is_array($row)) {
-                continue;
-            }
+    $children=[];
+    foreach($assigned as $id=>$item)$children[(int)($item['parent_id']??0)][]=(int)$id;
+    $clear=function(int $pid)use(&$clear,&$out,$children){
+        foreach($children[$pid]??[] as $cid){foreach($out[$cid] as $a=>$_)$out[$cid][$a]=0;$clear($cid);}
+    };
+    foreach($out as $id=>$p)if(empty($p['view']))$clear((int)$id);
 
-            $id = (int)($row['sidebar_item_id'] ?? 0);
-            if (!isset($assigned[$id])) {
-                continue;
-            }
-
-            $canAdd = !empty($row['can_add']) ? 1 : 0;
-            $canEdit = !empty($row['can_edit']) ? 1 : 0;
-            $canDelete = !empty($row['can_delete']) ? 1 : 0;
-            $canView = !empty($row['can_view']) || $canAdd || $canEdit || $canDelete
-                ? 1
-                : 0;
-
-            $normalized[$id] = [
-                'can_view' => $canView,
-                'can_add' => $canAdd,
-                'can_edit' => $canEdit,
-                'can_delete' => $canDelete,
-            ];
+    foreach(array_keys($out) as $id){
+        if(empty($out[$id]['view']))continue;
+        $pid=(int)($assigned[$id]['parent_id']??0);$seen=[];$ok=true;
+        while($pid>0&&isset($assigned[$pid])&&!isset($seen[$pid])){
+            $seen[$pid]=1;
+            if(!pc_super_cap($pdo,(int)$scope['tenant_id'],$pid,'view','school_admin')){$ok=false;break;}
+            $out[$pid]['view']=1;$pid=(int)($assigned[$pid]['parent_id']??0);
         }
-
-        /*
-         * A hidden parent wins and clears every descendant permission. The
-         * client sends the complete matrix, so this also blocks manually
-         * crafted requests that try to keep a child visible under a hidden
-         * module.
-         */
-        $children = [];
-        foreach ($assigned as $id => $item) {
-            $parentId = (int)($item['parent_id'] ?? 0);
-            $children[$parentId][] = (int)$id;
-        }
-
-        $clearChildren = static function (int $parentId) use (&$clearChildren, &$normalized, $children): void {
-            foreach ($children[$parentId] ?? [] as $childId) {
-                $normalized[$childId] = [
-                    'can_view' => 0,
-                    'can_add' => 0,
-                    'can_edit' => 0,
-                    'can_delete' => 0,
-                ];
-                $clearChildren($childId);
-            }
-        };
-
-        foreach ($normalized as $id => $permission) {
-            if ((int)$permission['can_view'] === 0) {
-                $clearChildren((int)$id);
-            }
-        }
-
-        /* Enabling a remaining child automatically enables every parent View. */
-        foreach ($normalized as $id => $permission) {
-            if ((int)$permission['can_view'] !== 1) {
-                continue;
-            }
-
-            $parentId = (int)($assigned[$id]['parent_id'] ?? 0);
-            $visited = [];
-
-            while ($parentId > 0 && isset($assigned[$parentId]) && !isset($visited[$parentId])) {
-                $visited[$parentId] = true;
-                $normalized[$parentId]['can_view'] = 1;
-                $parentId = (int)($assigned[$parentId]['parent_id'] ?? 0);
-            }
-        }
+        if(!$ok)foreach($out[$id] as $a=>$_)$out[$id][$a]=0;
     }
-
-    return $normalized;
+    return $out;
 }
 
-function rpSaveMatrix(
-    PDO $pdo,
-    array $scope,
-    int $roleId,
-    array $rows,
-    array $assigned,
-    bool $locked
-): void {
-    $normalized = rpNormalizeRows($rows, $assigned, $locked);
-    $assignedIds = array_map('intval', array_keys($assigned));
+function rpSaveMatrix(PDO $pdo,array $scope,int $roleId,array $rows,array $assigned,bool $locked): void
+{
+    if($locked)return;
+    $normalized=rpNormalizeRows($rows,$assigned,false,$pdo,$scope);
 
-    if ($assignedIds === []) {
-        return;
+    $grant=rpTable($pdo,'school_sidebar_permission_grants')?$pdo->prepare(
+        "INSERT INTO school_sidebar_permission_grants
+         (tenant_id,role_id,sidebar_item_id,action_key,is_allowed)
+         VALUES(:tenant_id,:role_id,:item_id,:action_key,:allowed)
+         ON DUPLICATE KEY UPDATE is_allowed=VALUES(is_allowed),updated_at=CURRENT_TIMESTAMP"
+    ):null;
+
+    $map=['view'=>'can_view','create'=>'can_add','edit'=>'can_edit','delete'=>'can_delete',
+        'print'=>'can_print','pdf'=>'can_pdf','export'=>'can_export','import'=>'can_import',
+        'approve'=>'can_approve','reject'=>'can_reject','restore'=>'can_restore',
+        'manage_settings'=>'can_manage','manage_visibility'=>'can_manage_visibility'];
+    $avail=[];
+    if(rpTable($pdo,'school_sidebar_action_permissions'))
+        foreach($map as $k=>$c)if(rpColumn($pdo,'school_sidebar_action_permissions',$c))$avail[$k]=$c;
+
+    $matrix=null;
+    if($avail){
+        $cols=['tenant_id','role_id','sidebar_item_id',...array_values($avail)];
+        $vals=[':tenant_id',':role_id',':item_id',...array_map(fn($k)=>':'.$k,array_keys($avail))];
+        $ups=array_map(fn($c)=>$c.'=VALUES('.$c.')',array_values($avail));
+        $matrix=$pdo->prepare("INSERT INTO school_sidebar_action_permissions(".implode(',',$cols).")
+         VALUES(".implode(',',$vals).") ON DUPLICATE KEY UPDATE ".implode(',',$ups).",updated_at=CURRENT_TIMESTAMP");
     }
+    $legacy=rpTable($pdo,'role_sidebar_permissions')?$pdo->prepare(
+        "INSERT INTO role_sidebar_permissions(role_id,sidebar_item_id,can_show)
+         VALUES(:role_id,:item_id,:can_show)
+         ON DUPLICATE KEY UPDATE can_show=VALUES(can_show),updated_at=CURRENT_TIMESTAMP"
+    ):null;
 
-    if (rpTable($pdo, 'school_sidebar_action_permissions')) {
-        $upsert = $pdo->prepare(
-            'INSERT INTO school_sidebar_action_permissions
-                (tenant_id, role_id, sidebar_item_id,
-                 can_view, can_add, can_edit, can_delete, can_manage_visibility)
-             VALUES
-                (:tenant_id, :role_id, :sidebar_item_id,
-                 :can_view, :can_add, :can_edit, :can_delete, 0)
-             ON DUPLICATE KEY UPDATE
-                can_view = VALUES(can_view),
-                can_add = VALUES(can_add),
-                can_edit = VALUES(can_edit),
-                can_delete = VALUES(can_delete),
-                updated_at = CURRENT_TIMESTAMP'
-        );
-
-        foreach ($normalized as $sidebarId => $permission) {
-            $upsert->execute([
-                'tenant_id' => $scope['tenant_id'],
-                'role_id' => $roleId,
-                'sidebar_item_id' => $sidebarId,
-                'can_view' => $permission['can_view'],
-                'can_add' => $permission['can_add'],
-                'can_edit' => $permission['can_edit'],
-                'can_delete' => $permission['can_delete'],
-            ]);
-        }
-
-        /* Remove role access for sidebar items no longer assigned to the school. */
-        $placeholders = implode(',', array_fill(0, count($assignedIds), '?'));
-        $delete = $pdo->prepare(
-            "DELETE FROM school_sidebar_action_permissions
-             WHERE tenant_id = ?
-               AND role_id = ?
-               AND sidebar_item_id NOT IN ({$placeholders})"
-        );
-        $delete->execute([
-            (int)$scope['tenant_id'],
-            $roleId,
-            ...$assignedIds,
+    foreach($normalized as $itemId=>$p){
+        if($grant)foreach($p as $action=>$allowed)$grant->execute([
+            'tenant_id'=>$scope['tenant_id'],'role_id'=>$roleId,'item_id'=>$itemId,
+            'action_key'=>$action,'allowed'=>$allowed
         ]);
-    }
-
-    if (rpTable($pdo, 'role_sidebar_permissions')) {
-        $legacy = $pdo->prepare(
-            'INSERT INTO role_sidebar_permissions
-                (role_id, sidebar_item_id, can_show)
-             VALUES
-                (:role_id, :sidebar_item_id, :can_show)
-             ON DUPLICATE KEY UPDATE
-                can_show = VALUES(can_show)'
-        );
-
-        foreach ($normalized as $sidebarId => $permission) {
-            $legacy->execute([
-                'role_id' => $roleId,
-                'sidebar_item_id' => $sidebarId,
-                'can_show' => $permission['can_view'],
-            ]);
+        if($matrix){
+            $params=['tenant_id'=>$scope['tenant_id'],'role_id'=>$roleId,'item_id'=>$itemId];
+            foreach($avail as $k=>$c)$params[$k]=(int)($p[$k]??0);
+            $matrix->execute($params);
         }
+        if($legacy)$legacy->execute(['role_id'=>$roleId,'item_id'=>$itemId,'can_show'=>(int)($p['view']??0)]);
     }
+    school_sidebar_service_bump_version($pdo,(int)$scope['tenant_id']);
 }
 
 function rpAudit(
@@ -1256,6 +1293,14 @@ try {
                 ]);
             }
 
+            school_sidebar_service_ensure_role_master(
+                $pdo,
+                $protected ?? false
+                    ? (string)($existing['role_key'] ?? $roleKey)
+                    : $roleKey,
+                (int)$scope['user_id'] ?: null
+            );
+
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -1421,6 +1466,12 @@ try {
             ]);
             $newRoleId = (int)$pdo->lastInsertId();
 
+            school_sidebar_service_ensure_role_master(
+                $pdo,
+                $newKey,
+                (int)$scope['user_id'] ?: null
+            );
+
             $sourceRows = rpPermissionRows(
                 $pdo,
                 (int)$scope['tenant_id'],
@@ -1433,7 +1484,7 @@ try {
                 }
                 $submitted[] = [
                     'sidebar_item_id' => $sidebarId,
-                    ...$permission,
+                    'permissions' => $permission,
                 ];
             }
             rpSaveMatrix(
@@ -1507,7 +1558,7 @@ try {
         rpJson(
             true,
             $locked
-                ? 'Protected School Administrator access synchronized successfully.'
+                ? 'School Administrator permissions are controlled by Super Admin and were not changed.'
                 : 'Role permissions saved successfully.'
         );
     }

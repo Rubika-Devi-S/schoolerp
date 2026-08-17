@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-15-classes-branch-visibility-v56 */
+
 $pageTitle = 'Class Management';
 $pageKey = 'classes';
 $sidebarFile = __DIR__ . '/sidebar.php';
@@ -538,6 +540,7 @@ if (
     let rows = [];
     let meta = {};
     let classStats = {};
+    let branchDataEnabled = true;
     let permissions = {
         view: Boolean(serverPermissions.view),
         add: Boolean(serverPermissions.add),
@@ -720,29 +723,52 @@ if (
     }
 
     function applyPermissionVisibility() {
+        const classDataAvailable =
+            Boolean(branchDataEnabled);
+
         if (cmAdd) {
-            cmAdd.hidden = !can('add');
-            cmAdd.style.display = can('add') ? '' : 'none';
+            const visible =
+                classDataAvailable
+                && can('add');
+
+            cmAdd.hidden = !visible;
+            cmAdd.style.display = visible ? '' : 'none';
         }
 
         document.querySelectorAll('.js-related-add').forEach((button) => {
-            button.hidden = !can('add');
-            button.style.display = can('add') ? '' : 'none';
+            const visible =
+                classDataAvailable
+                && can('add');
+
+            button.hidden = !visible;
+            button.style.display = visible ? '' : 'none';
         });
 
         if (cmPrint) {
-            cmPrint.hidden = !can('print');
-            cmPrint.style.display = can('print') ? '' : 'none';
+            const visible =
+                classDataAvailable
+                && can('print');
+
+            cmPrint.hidden = !visible;
+            cmPrint.style.display = visible ? '' : 'none';
         }
 
         if (cmPdf) {
-            cmPdf.hidden = !can('pdf');
-            cmPdf.style.display = can('pdf') ? '' : 'none';
+            const visible =
+                classDataAvailable
+                && can('pdf');
+
+            cmPdf.hidden = !visible;
+            cmPdf.style.display = visible ? '' : 'none';
         }
 
         if (cmExcel) {
-            cmExcel.hidden = !can('export');
-            cmExcel.style.display = can('export') ? '' : 'none';
+            const visible =
+                classDataAvailable
+                && can('export');
+
+            cmExcel.hidden = !visible;
+            cmExcel.style.display = visible ? '' : 'none';
         }
     }
 
@@ -772,7 +798,11 @@ if (
                     <td><span class="cm-badge ${escapeHtml(record.status)}">${escapeHtml(record.status)}</span></td>
                     <td><div class="cm-actions">${viewButton}${editButton}${deleteButton}</div></td>
                 </tr>`;
-        }).join('') || '<tr><td colspan="11" class="text-center py-5">No classes found.</td></tr>';
+        }).join('') || (
+            branchDataEnabled
+                ? '<tr><td colspan="11" class="text-center py-5">No classes found.</td></tr>'
+                : '<tr><td colspan="11" class="text-center py-5">Classes File is OFF for the active Branch in Branch Settings.</td></tr>'
+        );
 
         cmCopy.textContent = `Showing ${rows.length} class${rows.length === 1 ? '' : 'es'}`;
         cmTotal.textContent = String(rows.length);
@@ -803,7 +833,7 @@ if (
                     showMessage('Delete permission is not assigned.', false, 'warning');
                     return;
                 }
-                if (!confirm('Delete this class?')) {
+                if (!confirm('Delete this class from Class Management? Linked student enrollment records will be preserved.')) {
                     return;
                 }
 
@@ -827,6 +857,15 @@ if (
     }
 
     function openClass(record = null, viewOnly = false) {
+        if (!branchDataEnabled) {
+            showMessage(
+                'Classes File is OFF for the active Branch in Branch Settings.',
+                false,
+                'warning'
+            );
+            return;
+        }
+
         const isEdit = Boolean(record && Number(record.id) > 0);
         const requiredAction = isEdit ? 'edit' : 'add';
 
@@ -897,6 +936,22 @@ if (
 
         try {
             const result = await request('list', filters());
+
+            if (
+                result.data
+                && Object.prototype.hasOwnProperty.call(
+                    result.data,
+                    'branch_data_enabled'
+                )
+            ) {
+                branchDataEnabled =
+                    Boolean(
+                        result.data.branch_data_enabled
+                    );
+
+                applyPermissionVisibility();
+            }
+
             rows = result.data.classes || [];
             classStats = result.data.stats || {};
             render();
@@ -1037,6 +1092,15 @@ if (
     }
 
     function openRelated(type) {
+        if (!branchDataEnabled) {
+            showMessage(
+                'Classes File is OFF for the active Branch in Branch Settings.',
+                false,
+                'warning'
+            );
+            return;
+        }
+
         if (!can('add')) {
             showMessage('Add permission is not assigned.', false, 'warning');
             return;
@@ -1164,6 +1228,10 @@ if (
             const result = await request('meta');
             csrf = result.data.csrf_token || csrf;
             meta = result.data.meta || {};
+            branchDataEnabled =
+                result.data?.branch_data_enabled !== false
+                && meta.branch_data_enabled !== false;
+
             permissions = {
                 view: Boolean(result.data.permissions?.view),
                 add: Boolean(
@@ -1194,6 +1262,24 @@ if (
             showMessage(error.message);
         }
     }
+
+    window.addEventListener(
+        'storage',
+        event => {
+            if (
+                event.key
+                !== 'schoolerp_classes_visibility_changed'
+            ) {
+                return;
+            }
+
+            /*
+             * Re-load metadata/list so another Branch Settings tab can
+             * immediately hide/show the active Branch without stale data.
+             */
+            init();
+        }
+    );
 
     init();
     window.lucide?.createIcons();

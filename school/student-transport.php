@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Student Transport UI - Build 2026-08-14-class-management-filter-v4 */
+
 $pageTitle='Student Transport';
 $pageKey='transport';
 
@@ -25,13 +27,13 @@ require dirname(__DIR__).'/includes/layout-start.php';
 .st-card-head{padding:14px 16px;border-bottom:1px solid var(--border-soft,#e7ebf3);display:flex;justify-content:space-between;align-items:center;gap:10px}
 .st-filter{padding:14px 16px;display:grid;grid-template-columns:minmax(220px,1.4fr) repeat(3,minmax(145px,.75fr)) auto;gap:10px;border-bottom:1px solid var(--border-soft,#e7ebf3)}
 .st-table-wrap{overflow:auto}
-.st-table{min-width:1180px}
+.st-table{min-width:1220px}
 .st-table th{font-size:10px}
 .st-table td{font-size:11px;vertical-align:middle}
 .st-empty{padding:40px 18px!important;text-align:center!important;color:var(--text-muted,#64748b)}
-.st-badge{display:inline-flex;align-items:center;padding:5px 9px;border-radius:999px;font-size:9px;font-weight:800}
-.st-badge.yes,.st-badge.active{color:#16834f;background:#e8f8ef}
-.st-badge.no,.st-badge.inactive{color:#64748b;background:#f1f5f9}
+.st-route{display:grid;gap:3px}
+.st-route strong{font-size:11px}
+.st-route small{font-size:9px;color:var(--text-muted,#64748b)}
 @media(max-width:1000px){.st-filter{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:800px){.st-stats{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:575px){.st-stats,.st-filter{grid-template-columns:1fr}}
@@ -41,7 +43,7 @@ require dirname(__DIR__).'/includes/layout-start.php';
 <div class="page-heading">
  <div>
   <h1 class="page-title">Student Transport</h1>
-  <p class="page-subtitle">Route-wise student bus fee assignments and balances.</p>
+  <p class="page-subtitle">Only students currently using school transport are shown.</p>
  </div>
  <div class="page-actions">
   <button id="refreshBtn" class="btn-ui" type="button">
@@ -54,14 +56,14 @@ require dirname(__DIR__).'/includes/layout-start.php';
 
 <section class="st-stats">
  <article class="st-stat purple"><span class="st-stat-icon"><i data-lucide="users"></i></span><div><small>Transport Students</small><strong id="statStudents">0</strong><div class="trend">Students using school transport</div></div></article>
- <article class="st-stat green"><span class="st-stat-icon"><i data-lucide="route"></i></span><div><small>Active Routes</small><strong id="statRoutes">0</strong><div class="trend">Routes represented</div></div></article>
- <article class="st-stat orange"><span class="st-stat-icon"><i data-lucide="indian-rupee"></i></span><div><small>Bus Fee Assigned</small><strong id="statFee">₹0</strong><div class="trend">Route-wise bus fees</div></div></article>
+ <article class="st-stat green"><span class="st-stat-icon"><i data-lucide="route"></i></span><div><small>Active Routes</small><strong id="statRoutes">0</strong><div class="trend">Routes used by listed students</div></div></article>
+ <article class="st-stat orange"><span class="st-stat-icon"><i data-lucide="indian-rupee"></i></span><div><small>Bus Fee Assigned</small><strong id="statFee">₹0</strong><div class="trend">Fixed transport fee assigned</div></div></article>
  <article class="st-stat blue"><span class="st-stat-icon"><i data-lucide="wallet-cards"></i></span><div><small>Total Balance</small><strong id="statBalance">₹0</strong><div class="trend">Complete student fee balance</div></div></article>
 </section>
 
 <section class="ui-card st-card">
  <div class="st-card-head">
-  <strong>Student Transport List</strong>
+  <strong>Transport Student List</strong>
   <small id="recordInfo" class="text-muted">Loading...</small>
  </div>
 
@@ -81,8 +83,8 @@ require dirname(__DIR__).'/includes/layout-start.php';
      <th>Admission No.</th>
      <th>Academic Year</th>
      <th>Class / Section</th>
-     <th>Transport</th>
      <th>Route</th>
+     <th>Boarding Stop</th>
      <th>Bus Fee</th>
      <th>Total Fee</th>
      <th>Paid</th>
@@ -128,6 +130,7 @@ async function request(action,data={}){
  try{
   result=JSON.parse(text);
  }catch{
+  console.error(text);
   throw new Error('Student Transport API returned an invalid response.');
  }
 
@@ -140,8 +143,12 @@ async function request(action,data={}){
 
 function fill(id,rows,key,label,first='',firstValue=''){
  const element=$(id);
+ const selected=element.value;
  element.innerHTML=(first?`<option value="${esc(firstValue)}">${esc(first)}</option>`:'')
   +rows.map(row=>`<option value="${esc(row[key])}">${esc(row[label])}</option>`).join('');
+ if([...element.options].some(option=>option.value===selected)){
+  element.value=selected;
+ }
 }
 
 function refreshClasses(){
@@ -170,17 +177,22 @@ function render(){
    <td>${esc(row.admission_no)}</td>
    <td>${esc(row.year_name)}</td>
    <td>${esc(row.class_name||'-')} / ${esc(row.section_name||'-')}</td>
-   <td><span class="st-badge ${Number(row.transport_required)===1?'yes':'no'}">${Number(row.transport_required)===1?'Yes':'No'}</span></td>
-   <td>${esc(row.route_name||'-')}</td>
+   <td>
+    <div class="st-route">
+     <strong>${esc(row.route_name||'-')}</strong>
+     <small>${esc(row.route_code||'')}</small>
+    </div>
+   </td>
+   <td>${esc(row.boarding_stop_name||'-')}</td>
    <td><strong>${money(row.bus_fee_amount)}</strong></td>
    <td>${money(row.net_amount)}</td>
    <td>${money(row.paid_amount)}</td>
    <td><strong>${money(row.balance_amount)}</strong></td>
   </tr>
  `).join('')
- ||'<tr><td colspan="10" class="st-empty">No student transport records found.</td></tr>';
+ ||'<tr><td colspan="10" class="st-empty">No transport students found.</td></tr>';
 
- $('recordInfo').textContent=`${records.length} student${records.length===1?'':'s'}`;
+ $('recordInfo').textContent=`${records.length} transport student${records.length===1?'':'s'}`;
  window.lucide?.createIcons();
 }
 
@@ -202,13 +214,14 @@ async function load(){
    if(current)$('yearId').value=String(current.id);
   }
 
-  if($('routeId').options.length<=1){
-   fill('routeId',meta.routes||[],'id','route_name','All Routes','all');
-  }
-
+  fill('routeId',meta.routes||[],'id','route_name','All Routes','all');
   refreshClasses();
   renderStats(result.data.stats||{});
   render();
+
+  const box=$('message');
+  box.className='alert d-none';
+  box.textContent='';
  }catch(error){
   const box=$('message');
   box.className='alert alert-danger';
@@ -218,6 +231,7 @@ async function load(){
 
 $('yearId').onchange=()=>{
  refreshClasses();
+ $('classId').value='all';
  load();
 };
 $('classId').onchange=load;

@@ -456,6 +456,70 @@ if (!function_exists('school_theme_normalize_preset')) {
     }
 }
 
+if (!function_exists('school_theme_context_tenant_id')) {
+    /**
+     * Resolve the active School/Tenant ID without ever falling back to School #1.
+     * This prevents one school's theme from leaking into another school.
+     */
+    function school_theme_context_tenant_id(array $user = []): int
+    {
+        $candidates = [
+            $user['tenant_id'] ?? null,
+            $user['school_id'] ?? null,
+            $_SESSION['school_id'] ?? null,
+            $_SESSION['tenant_id'] ?? null,
+        ];
+
+        foreach ($candidates as $candidate) {
+            $tenantId = (int)$candidate;
+
+            if ($tenantId > 0) {
+                return $tenantId;
+            }
+        }
+
+        return 0;
+    }
+}
+
+if (!function_exists('school_theme_session_settings')) {
+    /** @return array<string,string> */
+    function school_theme_session_settings(int $tenantId): array
+    {
+        if ($tenantId <= 0) {
+            return [];
+        }
+
+        $all = $_SESSION['school_theme_settings_by_tenant'] ?? [];
+        if (!is_array($all)) {
+            return [];
+        }
+
+        $settings = $all[(string)$tenantId] ?? [];
+        return is_array($settings) ? $settings : [];
+    }
+}
+
+if (!function_exists('school_theme_cache_session_settings')) {
+    /** @param array<string,string> $settings */
+    function school_theme_cache_session_settings(
+        int $tenantId,
+        array $settings
+    ): void {
+        if ($tenantId <= 0) {
+            return;
+        }
+
+        if (!isset($_SESSION['school_theme_settings_by_tenant'])
+            || !is_array($_SESSION['school_theme_settings_by_tenant'])) {
+            $_SESSION['school_theme_settings_by_tenant'] = [];
+        }
+
+        $_SESSION['school_theme_settings_by_tenant'][(string)$tenantId] =
+            $settings;
+    }
+}
+
 if (!function_exists('school_theme_load_settings')) {
     /** @return array<string,string> */
     function school_theme_load_settings(
@@ -463,13 +527,22 @@ if (!function_exists('school_theme_load_settings')) {
         int $tenantId
     ): array {
         $settings = school_theme_default_settings();
+        $tenantId = (int)$tenantId;
+
+        /*
+         * Never map an unknown school context to tenant 1. If no valid
+         * School ID is available, return defaults only.
+         */
+        if ($tenantId <= 0) {
+            return $settings;
+        }
 
         if (!($pdo instanceof PDO)
             || !function_exists('school_table_exists')
             || !school_table_exists($pdo, 'website_color_settings')) {
-            $sessionSettings = $_SESSION['school_theme_settings'] ?? [];
+            $sessionSettings = school_theme_session_settings($tenantId);
 
-            return is_array($sessionSettings)
+            return $sessionSettings
                 ? array_merge($settings, $sessionSettings)
                 : $settings;
         }
@@ -482,7 +555,7 @@ if (!function_exists('school_theme_load_settings')) {
                    AND is_active = 1"
             );
 
-            $stmt->execute(['tenant_id' => max(1, $tenantId)]);
+            $stmt->execute(['tenant_id' => $tenantId]);
 
             $fontOptions = school_theme_font_options();
             $presets = school_theme_presets();
@@ -547,7 +620,7 @@ if (!function_exists('school_theme_load_settings')) {
             );
         }
 
-        $_SESSION['school_theme_settings'] = $settings;
+        school_theme_cache_session_settings($tenantId, $settings);
 
         return $settings;
     }

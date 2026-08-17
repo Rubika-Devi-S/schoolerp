@@ -1117,3 +1117,40 @@ table td {
     background-position: 0 0 !important;
   }
 }
+
+/* SUPER_ADMIN_THEME_START */
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]){
+  --sidebar-bg:#ffffff;
+  --sidebar-text:#3f3f46;
+  --sidebar-active-bg-1:#e11d48;
+  --sidebar-active-bg-2:#c026d3;
+  --sidebar-active-text:#ffffff;
+  --sidebar-hover-bg:#fff1f2;
+  --sidebar-hover-text:#9f1239;
+  --topbar-bg-1:#e11d48;
+  --topbar-bg-2:#a21caf;
+  --topbar-text:#ffffff;
+  --body-bg:#fff8fa;
+  --card-bg:#ffffff;
+  --text-main:#4c0519;
+  --text-muted:#71717a;
+  --border-soft:#fecdd3;
+  --brand-1:#e11d48;
+  --brand-2:#c026d3;
+  --header-gradient-start:#e11d48;
+  --header-gradient-end:#a21caf;
+  --header-text:#ffffff;
+}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]){background:var(--body-bg)!important;color:var(--text-main)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #sidebar{background:var(--sidebar-bg)!important;color:var(--sidebar-text)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #sidebar .sidebar-brand,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #sidebar .brand-link{background:var(--sidebar-bg)!important;color:var(--sidebar-text)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #sidebar .school-name-primary,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #sidebar .sidebar-link{color:var(--sidebar-text)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #sidebar .sidebar-link:hover{background:var(--sidebar-hover-bg)!important;color:var(--sidebar-hover-text)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #sidebar .sidebar-link.active{background:linear-gradient(135deg,var(--sidebar-active-bg-1),var(--sidebar-active-bg-2))!important;color:var(--sidebar-active-text)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) #topbar{background:linear-gradient(90deg,var(--topbar-bg-1),var(--topbar-bg-2))!important;color:var(--topbar-text)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .app-content{background:var(--body-bg)!important;color:var(--text-main)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .ui-card,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .modal-content,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .dropdown-menu{background:var(--card-bg)!important;color:var(--text-main)!important;border-color:var(--border-soft)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .page-title,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .ui-card-title,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) h1,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) h2,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) h3,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) h4,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) h5,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) h6{color:var(--text-main);}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .page-subtitle,body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .text-muted{color:var(--text-muted)!important;}
+body:has(#sidebar .brand-link[href*="super-admin/dashboard.php"]) .btn-primary-ui{background:linear-gradient(135deg,var(--brand-1),var(--brand-2))!important;border-color:transparent!important;color:#fff!important;}
+/* SUPER_ADMIN_THEME_END */

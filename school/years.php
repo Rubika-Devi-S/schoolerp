@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-15-academic-year-branch-isolation-v7 */
+
 $pageTitle = 'Academic Year Management';
 $pageKey = 'academic_years';
 $sidebarFile = __DIR__ . '/sidebar.php';
@@ -30,6 +32,13 @@ $currentUser = function_exists('current_user') ? current_user() : [];
 $tenantId = (int)($currentUser['tenant_id'] ?? $currentUser['school_id'] ?? $_SESSION['tenant_id'] ?? $_SESSION['school_id'] ?? 0);
 $roleId = (int)($currentUser['role_id'] ?? $_SESSION['role_id'] ?? 0);
 $userId = (int)($currentUser['id'] ?? $currentUser['user_id'] ?? $_SESSION['user_id'] ?? 0);
+$branchId = (int)(
+    $currentUser['branch_id']
+    ?? $currentUser['default_branch_id']
+    ?? $_SESSION['branch_id']
+    ?? $_SESSION['default_branch_id']
+    ?? 0
+);
 if (session_status() !== PHP_SESSION_ACTIVE) {
     session_start();
 }
@@ -81,57 +90,247 @@ $fieldSchemas = [
     ]
 ];
 
-function academicYearCan(string $moduleKey, string $action): bool
+function academicYearFullAccess(): bool
 {
-    $moduleKey = strtolower(trim($moduleKey));
-    $permissionAction = strtolower(trim($action));
+    if (function_exists('is_super_admin')) {
+        try {
+            if ((bool)is_super_admin()) {
+                return true;
+            }
+        } catch (Throwable) {
+        }
+    }
+
+    $user = function_exists('current_user')
+        ? current_user()
+        : [];
+
+    $roleText = strtolower(trim((string)(
+        $user['role_key']
+        ?? $user['role_name']
+        ?? $user['role']
+        ?? $user['user_type']
+        ?? $_SESSION['role_key']
+        ?? $_SESSION['role_name']
+        ?? $_SESSION['role']
+        ?? ''
+    )));
+
+    $roleKey = preg_replace(
+        '/[^a-z0-9]+/',
+        '_',
+        $roleText
+    ) ?? '';
+
+    return in_array(
+        trim($roleKey, '_'),
+        [
+            'platform_owner',
+            'platformowner',
+            'platform_admin',
+            'platformadministrator',
+            'super_admin',
+            'superadministrator',
+        ],
+        true
+    );
+}
+
+function academicYearCan(
+    string $moduleKey,
+    string $action
+): bool {
+    $moduleKey = strtolower(
+        trim($moduleKey)
+    );
+
+    $permissionAction = strtolower(
+        trim($action)
+    );
 
     $permissionAction = match ($permissionAction) {
         'add', 'create', 'store', 'insert' => 'create',
         'edit', 'update', 'archive', 'status' => 'edit',
         'delete', 'remove', 'destroy' => 'delete',
+        'export', 'download' => 'export',
+        'import', 'upload' => 'import',
         default => 'view',
     };
 
-    if (function_exists('is_super_admin') && is_super_admin()) {
+    if (academicYearFullAccess()) {
         return true;
-    }
-
-    if (!function_exists('school_effective_permission')) {
-        return false;
     }
 
     try {
         /*
-         * The exact child permission is authoritative. A denied child must not
-         * be widened by the old academic_year_management parent permission.
+         * Child permission is authoritative. This keeps Academic Years,
+         * Calendar, Terms/Semesters and Holidays independently controlled.
          */
-        if (function_exists('school_sidebar_permission_decision')) {
-            $decision = school_sidebar_permission_decision(
-                $moduleKey,
-                $permissionAction
-            );
+        if (
+            function_exists(
+                'school_sidebar_permission_decision'
+            )
+        ) {
+            $decision =
+                school_sidebar_permission_decision(
+                    $moduleKey,
+                    $permissionAction
+                );
 
             if ($decision !== null) {
-                return $decision;
+                return (bool)$decision;
             }
         }
 
-        /* Compatibility only for installations that still have one simple
-         * Academic Year sidebar item and no child catalogue entries. */
-        return school_effective_permission('academic_year', $permissionAction);
+        if (
+            function_exists(
+                'school_effective_permission'
+            )
+        ) {
+            if (
+                school_effective_permission(
+                    $moduleKey,
+                    $permissionAction
+                )
+            ) {
+                return true;
+            }
+
+            /*
+             * Compatibility fallback only when the installation still
+             * uses the older single Academic Year sidebar entry.
+             */
+            return (bool)school_effective_permission(
+                'academic_year',
+                $permissionAction
+            );
+        }
     } catch (Throwable $exception) {
-        error_log('Academic Year page permission: ' . $exception->getMessage());
-        return false;
+        error_log(
+            'Academic Year page permission: '
+            . $exception->getMessage()
+        );
     }
+
+    return false;
 }
 
 require dirname(__DIR__) . '/includes/layout-start.php';
+
+/*
+ * Use the existing ERP common toast system.
+ * No separate toast implementation is created on this page.
+ */
+$commonToastFile = dirname(__DIR__) . '/includes/common-toast.php';
+
+if (is_file($commonToastFile)) {
+    require_once $commonToastFile;
+}
 
 $visibleModules = [];
 foreach ($moduleDefinitions as $moduleKey => $module) {
     if (academicYearCan($moduleKey, 'view')) {
         $visibleModules[$moduleKey] = $module;
+    }
+}
+
+$academicYearOptions = [];
+$defaultAcademicYearId = 0;
+
+if (
+    isset($pdo)
+    && $pdo instanceof PDO
+    && $tenantId > 0
+) {
+    try {
+        /* Resolve the same active branch used by branch-scoped School APIs. */
+        if ($branchId <= 0 && $userId > 0) {
+            try {
+                $branchStatement = $pdo->prepare(
+                    "SELECT default_branch_id
+                     FROM users
+                     WHERE id=:user_id
+                       AND tenant_id=:tenant_id
+                     LIMIT 1"
+                );
+                $branchStatement->execute([
+                    'user_id' => $userId,
+                    'tenant_id' => $tenantId,
+                ]);
+                $branchId = (int)$branchStatement->fetchColumn();
+            } catch (Throwable) {
+                $branchId = 0;
+            }
+        }
+
+        if ($branchId <= 0) {
+            try {
+                $branchStatement = $pdo->prepare(
+                    "SELECT id
+                     FROM branches
+                     WHERE tenant_id=:tenant_id
+                       AND status='active'
+                     ORDER BY is_main DESC,id ASC
+                     LIMIT 1"
+                );
+                $branchStatement->execute(['tenant_id' => $tenantId]);
+                $branchId = (int)$branchStatement->fetchColumn();
+            } catch (Throwable) {
+                $branchId = 0;
+            }
+        }
+
+        /*
+         * The API adds academic_years.branch_id on first use. Until that
+         * migration has happened, do not fall back to school-wide years here;
+         * the AJAX response will rebuild this selector using branch data.
+         */
+        $columnStatement = $pdo->prepare(
+            "SELECT COUNT(*)
+             FROM information_schema.columns
+             WHERE table_schema=DATABASE()
+               AND table_name='academic_years'
+               AND column_name='branch_id'"
+        );
+        $columnStatement->execute();
+        $hasAcademicYearBranch = (int)$columnStatement->fetchColumn() > 0;
+
+        if ($branchId > 0 && $hasAcademicYearBranch) {
+            $yearStatement = $pdo->prepare(
+                "SELECT
+                    id,
+                    year_name,
+                    is_current,
+                    status
+                 FROM academic_years
+                 WHERE tenant_id=:tenant_id
+                   AND branch_id=:branch_id
+                 ORDER BY
+                    is_current DESC,
+                    start_date DESC,
+                    id DESC"
+            );
+
+            $yearStatement->execute([
+                'tenant_id' => $tenantId,
+                'branch_id' => $branchId,
+            ]);
+
+            $academicYearOptions = $yearStatement->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($academicYearOptions as $academicYearOption) {
+                if ((int)($academicYearOption['is_current'] ?? 0) === 1) {
+                    $defaultAcademicYearId = (int)$academicYearOption['id'];
+                    break;
+                }
+            }
+
+            if ($defaultAcademicYearId <= 0 && !empty($academicYearOptions)) {
+                $defaultAcademicYearId = (int)$academicYearOptions[0]['id'];
+            }
+        }
+    } catch (Throwable $exception) {
+        error_log('Academic Year branch selector: ' . $exception->getMessage());
     }
 }
 ?>
@@ -186,22 +385,29 @@ foreach ($moduleDefinitions as $moduleKey => $module) {
 #academicRecordModal .modal-content{max-height:calc(100dvh - 32px);overflow:hidden}
 #academicRecordModal form{display:flex;flex-direction:column;max-height:calc(100dvh - 32px)}
 #academicRecordModal .modal-body{overflow-y:auto;min-height:0}
+.academic-context-card{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px;border:1px solid var(--border-soft,#e7ebf3);border-radius:14px;background:#fff}
+.academic-context-copy{display:flex;align-items:center;gap:12px;min-width:0}
+.academic-context-icon{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;background:#eef2ff;color:#4f46e5;flex:0 0 auto}
+.academic-context-icon svg{width:20px;height:20px}
+.academic-context-copy strong{display:block;font-size:13px;color:#111b46}
+.academic-context-copy small{display:block;margin-top:3px;font-size:10px;color:#64748b}
+.academic-context-control{min-width:250px;max-width:340px}
+.academic-context-badge{display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:999px;background:#eef2ff;color:#4338ca;font-size:9px;font-weight:800}
+.academic-context-badge svg{width:12px;height:12px}
+.academic-card-title-wrap{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.academic-import-note{padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid #e7ebf3;font-size:10px;color:#64748b}
+.academic-import-result{display:none;margin-top:12px;padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid #e7ebf3;font-size:10px;white-space:pre-wrap}
+.academic-import-result.show{display:block}
 @media(max-width:900px){.academic-stats{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:575px){.academic-stats,.academic-filter{grid-template-columns:1fr}.academic-card-head{flex-direction:column;align-items:flex-start}.academic-card-actions{width:100%}}
+@media(max-width:575px){.academic-stats,.academic-filter{grid-template-columns:1fr}.academic-card-head{flex-direction:column;align-items:flex-start}.academic-card-actions{width:100%}.academic-context-card{align-items:stretch;flex-direction:column}.academic-context-control{min-width:0;max-width:none;width:100%}}
 </style>
 
+<!-- Build: 2026-08-10-academic-year-selected-card-removed-v3 -->
 <div class="academic-suite">
     <div class="page-heading">
         <div>
             <h1 class="page-title">Academic Year Management</h1>
             <p class="page-subtitle">Manage academic years, terms, holidays and calendars.</p>
-        </div>
-        <div class="page-actions">
-            <?php if (academicYearCan('academic_years', 'add')): ?>
-                <button class="btn-ui btn-primary-ui js-add" type="button" data-module="academic_years" data-permission-key="academic_years" data-permission-action="add">
-                    <i data-lucide="plus"></i> Add Academic Year
-                </button>
-            <?php endif; ?>
         </div>
     </div>
 
@@ -240,6 +446,34 @@ foreach ($moduleDefinitions as $moduleKey => $module) {
         </article>
     </section>
 
+    <!--
+        Academic Year context is intentionally hidden.
+        Related Calendar / Terms / Holidays logic still uses the current year.
+    -->
+    <select
+        id="academicYearContext"
+        class="d-none"
+        aria-hidden="true"
+        tabindex="-1"
+        <?= empty($academicYearOptions) ? 'disabled' : '' ?>
+    >
+        <?php if (empty($academicYearOptions)): ?>
+            <option value="">No Academic Years Available</option>
+        <?php else: ?>
+            <?php foreach ($academicYearOptions as $academicYearOption): ?>
+                <option
+                    value="<?= (int)$academicYearOption['id'] ?>"
+                    <?= (int)$academicYearOption['id'] === $defaultAcademicYearId ? 'selected' : '' ?>
+                >
+                    <?= e((string)$academicYearOption['year_name']) ?>
+                    <?= (int)($academicYearOption['is_current'] ?? 0) === 1 ? ' (Current)' : '' ?>
+                </option>
+            <?php endforeach; ?>
+        <?php endif; ?>
+    </select>
+
+
+
     <?php if (empty($visibleModules)): ?>
         <div class="ui-card"><div class="academic-empty">No Academic Year sections are enabled for your role.</div></div>
     <?php else: ?>
@@ -257,15 +491,68 @@ foreach ($moduleDefinitions as $moduleKey => $module) {
                 <div class="academic-panel-grid">
                     <section class="ui-card academic-card">
                         <div class="academic-card-head">
-                            <strong><?= e((string)$module['title']) ?></strong>
+                            <div class="academic-card-title-wrap">
+                                <strong><?= e((string)$module['title']) ?></strong>
+
+                                <?php if ($key !== 'academic_years'): ?>
+                                    <span
+                                        class="academic-context-badge"
+                                        data-year-badge="<?= e($key) ?>"
+                                    >
+                                        <i data-lucide="calendar-range"></i>
+                                        <span>Selected Academic Year</span>
+                                    </span>
+                                <?php endif; ?>
+                            </div>
+
                             <div class="academic-card-actions">
-                                <button class="btn-ui js-refresh" type="button" data-module="<?= e($key) ?>">
-                                    <i data-lucide="refresh-cw"></i> Refresh
+                                <button
+                                    class="btn-ui js-refresh"
+                                    type="button"
+                                    data-module="<?= e($key) ?>"
+                                >
+                                    <i data-lucide="refresh-cw"></i>
+                                    Refresh
                                 </button>
+
+                                <?php if (academicYearCan($key, 'export')): ?>
+                                    <button
+                                        class="btn-ui js-export"
+                                        type="button"
+                                        data-module="<?= e($key) ?>"
+                                        data-permission-key="<?= e($key) ?>"
+                                        data-permission-action="export"
+                                    >
+                                        <i data-lucide="download"></i>
+                                        Export
+                                    </button>
+                                <?php endif; ?>
+
+                                <?php if (academicYearCan($key, 'import')): ?>
+                                    <button
+                                        class="btn-ui js-import"
+                                        type="button"
+                                        data-module="<?= e($key) ?>"
+                                        data-permission-key="<?= e($key) ?>"
+                                        data-permission-action="import"
+                                    >
+                                        <i data-lucide="upload"></i>
+                                        Import
+                                    </button>
+                                <?php endif; ?>
+
                                 <?php if (academicYearCan($key, 'add')): ?>
-                                    <button class="btn-ui btn-primary-ui js-add" type="button" data-module="<?= e($key) ?>" data-permission-key="<?= e($key) ?>" data-permission-action="add">
+                                    <button
+                                        class="btn-ui btn-primary-ui js-add"
+                                        type="button"
+                                        data-module="<?= e($key) ?>"
+                                        data-permission-key="<?= e($key) ?>"
+                                        data-permission-action="add"
+                                    >
                                         <i data-lucide="plus"></i>
-                                        <?= $key === 'academic_years' ? 'Add Academic Year' : 'Add Record' ?>
+                                        <?= $key === 'academic_years'
+                                            ? 'Add Academic Year'
+                                            : 'Add Record' ?>
                                     </button>
                                 <?php endif; ?>
                             </div>
@@ -330,12 +617,113 @@ foreach ($moduleDefinitions as $moduleKey => $module) {
                 <div class="modal-body">
                     <input id="academicRecordId" type="hidden">
                     <input id="academicModuleKey" type="hidden">
+
+                    <div
+                        id="academicRecordYearContext"
+                        class="academic-import-note mb-3"
+                        style="display:none"
+                    ></div>
+
                     <div id="academicDynamicFields" class="row g-3"></div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn-ui" data-bs-dismiss="modal">Cancel</button>
                     <button id="academicSaveButton" type="submit" class="btn-ui btn-primary-ui" data-permission-action="add">
                         <i data-lucide="save"></i> Save
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+
+<!-- Import Modal -->
+<div
+    class="modal fade"
+    id="academicImportModal"
+    tabindex="-1"
+    aria-hidden="true"
+>
+    <div class="modal-dialog modal-md modal-dialog-centered">
+        <div class="modal-content">
+            <form id="academicImportForm">
+                <div class="modal-header">
+                    <div>
+                        <h5
+                            id="academicImportTitle"
+                            class="modal-title"
+                        >
+                            Import Records
+                        </h5>
+                        <small class="text-muted">
+                            CSV and XLSX files are supported.
+                        </small>
+                    </div>
+
+                    <button
+                        type="button"
+                        class="btn-close"
+                        data-bs-dismiss="modal"
+                    ></button>
+                </div>
+
+                <div class="modal-body">
+                    <input
+                        id="academicImportModule"
+                        type="hidden"
+                    >
+
+                    <div
+                        id="academicImportYearContext"
+                        class="academic-import-note mb-3"
+                    ></div>
+
+                    <label class="form-label fw-semibold">
+                        Import File
+                    </label>
+
+                    <input
+                        id="academicImportFile"
+                        class="form-control"
+                        type="file"
+                        accept=".csv,.xlsx"
+                        required
+                    >
+
+                    <div class="d-flex gap-2 mt-3 flex-wrap">
+                        <button
+                            id="academicTemplateButton"
+                            class="btn-ui"
+                            type="button"
+                        >
+                            <i data-lucide="file-down"></i>
+                            Download Template
+                        </button>
+                    </div>
+
+                    <div
+                        id="academicImportResult"
+                        class="academic-import-result"
+                    ></div>
+                </div>
+
+                <div class="modal-footer">
+                    <button
+                        type="button"
+                        class="btn-ui"
+                        data-bs-dismiss="modal"
+                    >
+                        Cancel
+                    </button>
+
+                    <button
+                        id="academicImportSubmit"
+                        type="submit"
+                        class="btn-ui btn-primary-ui"
+                    >
+                        <i data-lucide="upload"></i>
+                        Import
                     </button>
                 </div>
             </form>
@@ -358,6 +746,8 @@ const permissions = <?= json_encode(array_combine(
             'add' => academicYearCan($key, 'add'),
             'edit' => academicYearCan($key, 'edit'),
             'delete' => academicYearCan($key, 'delete'),
+            'export' => academicYearCan($key, 'export'),
+            'import' => academicYearCan($key, 'import'),
         ],
         array_keys($visibleModules)
     )
@@ -366,6 +756,19 @@ const permissions = <?= json_encode(array_combine(
 let csrfToken = <?= json_encode($csrfToken) ?>;
 const records = {};
 let currentTab = '';
+
+const moduleTitles = <?= json_encode(array_map(
+    static fn(array $module): string => (string)$module['title'],
+    $moduleDefinitions
+), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
+
+let selectedYearId = Number(
+    document.getElementById(
+        'academicYearContext'
+    )?.value
+    || <?= (int)$defaultAcademicYearId ?>
+    || 0
+);
 
 const esc = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 
@@ -377,6 +780,164 @@ function getModal() {
     }
     return { show: () => { el.style.display = 'block'; }, hide: () => { el.style.display = 'none'; } };
 }
+
+
+function getImportModal() {
+    const el = document.getElementById(
+        'academicImportModal'
+    );
+
+    if (!el) {
+        return null;
+    }
+
+    if (window.bootstrap?.Modal) {
+        return window.bootstrap.Modal
+            .getOrCreateInstance(el);
+    }
+
+    return {
+        show: () => {
+            el.style.display = 'block';
+        },
+        hide: () => {
+            el.style.display = 'none';
+        }
+    };
+}
+
+function selectedAcademicYearId() {
+    const select = document.getElementById(
+        'academicYearContext'
+    );
+
+    selectedYearId = Number(
+        select?.value
+        || selectedYearId
+        || 0
+    );
+
+    return selectedYearId;
+}
+
+function selectedAcademicYearName() {
+    const select = document.getElementById(
+        'academicYearContext'
+    );
+
+    return select
+        ?.options[
+            select.selectedIndex
+        ]
+        ?.textContent
+        ?.replace(/\s+\(Current\)\s*$/, '')
+        ?.trim()
+        || 'No Academic Year Selected';
+}
+
+function updateYearContextUI() {
+    const name = selectedAcademicYearName();
+
+    document
+        .querySelectorAll(
+            '[data-year-badge]'
+        )
+        .forEach(badge => {
+            const text = badge.querySelector(
+                'span'
+            );
+
+            if (text) {
+                text.textContent = name;
+            }
+        });
+}
+
+function rebuildAcademicYearContext() {
+    const select = document.getElementById(
+        'academicYearContext'
+    );
+
+    if (!select) {
+        return;
+    }
+
+    const years = records.academic_years || [];
+
+    if (!years.length) {
+        select.innerHTML =
+            '<option value="">No Academic Years Available</option>';
+        select.disabled = true;
+        selectedYearId = 0;
+        updateYearContextUI();
+        return;
+    }
+
+    const previous = Number(
+        select.value
+        || selectedYearId
+        || 0
+    );
+
+    const current = years.find(
+        row =>
+            Number(
+                row.data?.is_current
+                || 0
+            ) === 1
+    );
+
+    const fallbackId = Number(
+        current?.id
+        || years[0]?.id
+        || 0
+    );
+
+    const chosenId = years.some(
+        row =>
+            Number(row.id) === previous
+    )
+        ? previous
+        : fallbackId;
+
+    select.innerHTML = years.map(row => {
+        const isCurrent =
+            Number(
+                row.data?.is_current
+                || 0
+            ) === 1;
+
+        return `
+            <option
+                value="${Number(row.id)}"
+                ${
+                    Number(row.id) === chosenId
+                        ? 'selected'
+                        : ''
+                }
+            >
+                ${esc(row.data?.year_name || '')}
+                ${isCurrent ? ' (Current)' : ''}
+            </option>
+        `;
+    }).join('');
+
+    select.disabled = false;
+    selectedYearId = chosenId;
+    updateYearContextUI();
+}
+
+function moduleRequestContext(moduleKey) {
+    if (moduleKey === 'academic_years') {
+        return {};
+    }
+
+    return {
+        academic_year_id:
+            selectedAcademicYearId()
+    };
+}
+
 
 async function request(moduleKey, action, data = {}, method = 'GET') {
     try {
@@ -427,12 +988,76 @@ async function request(moduleKey, action, data = {}, method = 'GET') {
     }
 }
 
-function showMessage(moduleKey, text, success) {
-    const box = document.querySelector(`[data-message="${moduleKey}"]`);
-    if (!box) return;
-    box.className = 'alert academic-message show ' + (success ? 'alert-success' : 'alert-danger');
-    box.textContent = text;
-    setTimeout(() => { box.className = 'alert academic-message'; }, 5000);
+function showMessage(moduleKey, text, success, title = '') {
+    const message = String(text || '').trim();
+
+    if (!message) {
+        return;
+    }
+
+    const type = success ? 'success' : 'error';
+
+    /*
+     * Existing includes/common-toast.php API.
+     */
+    if (typeof window.schoolToast === 'function') {
+        window.schoolToast(
+            type,
+            message,
+            title || (
+                success
+                    ? 'Success'
+                    : 'Action failed'
+            )
+        );
+        return;
+    }
+
+    /*
+     * Compatibility with installations where the common file exposes
+     * showToast() instead of schoolToast().
+     */
+    if (typeof window.showToast === 'function') {
+        window.showToast(
+            type,
+            message,
+            title || (
+                success
+                    ? 'Success'
+                    : 'Action failed'
+            )
+        );
+        return;
+    }
+
+    /*
+     * Fallback only. This is not a second toast system.
+     */
+    const box = document.querySelector(
+        `[data-message="${moduleKey}"]`
+    );
+
+    if (!box) {
+        return;
+    }
+
+    box.className =
+        'alert academic-message show '
+        + (
+            success
+                ? 'alert-success'
+                : 'alert-danger'
+        );
+
+    box.textContent = message;
+
+    window.setTimeout(
+        () => {
+            box.className =
+                'alert academic-message';
+        },
+        5000
+    );
 }
 
 function filtered(moduleKey) {
@@ -584,8 +1209,23 @@ function openForm(moduleKey, record = null) {
     const moduleField = document.getElementById('academicModuleKey');
     const title = document.getElementById('academicModalTitle');
     const wrap = document.getElementById('academicDynamicFields');
+    const yearContext = document.getElementById(
+        'academicRecordYearContext'
+    );
 
     if (!form || !idField || !moduleField || !title || !wrap) return;
+
+    if (
+        moduleKey !== 'academic_years'
+        && selectedAcademicYearId() <= 0
+    ) {
+        showMessage(
+            moduleKey,
+            'Select an Academic Year first.',
+            false
+        );
+        return;
+    }
 
     form.reset();
     form.classList.remove('was-validated');
@@ -596,6 +1236,18 @@ function openForm(moduleKey, record = null) {
         (document.querySelector(`.academic-tab[data-module="${moduleKey}"]`)?.textContent.trim() || 'Record');
 
     title.textContent = (record ? 'Edit ' : 'Add ') + moduleTitle;
+
+    if (yearContext) {
+        if (moduleKey === 'academic_years') {
+            yearContext.style.display = 'none';
+            yearContext.textContent = '';
+        } else {
+            yearContext.style.display = '';
+            yearContext.textContent =
+                'Academic Year: '
+                + selectedAcademicYearName();
+        }
+    }
 
     const saveButton = document.getElementById('academicSaveButton');
     if (saveButton) {
@@ -639,10 +1291,50 @@ function openForm(moduleKey, record = null) {
 
 async function load(moduleKey) {
     try {
-        const x = await request(moduleKey, 'list');
-        csrfToken = x.data.csrf_token || csrfToken;
-        records[moduleKey] = x.data.records || [];
+        const x = await request(
+            moduleKey,
+            'list',
+            moduleRequestContext(moduleKey)
+        );
+
+        csrfToken =
+            x.data.csrf_token
+            || csrfToken;
+
+        records[moduleKey] =
+            x.data.records
+            || [];
+
+        /*
+         * The API returns only Academic Years belonging to the active Branch.
+         * Keep the hidden context selector synchronized even when the user does
+         * not have permission to open the Academic Years tab itself.
+         */
+        if (
+            moduleKey !== 'academic_years'
+            && Array.isArray(x.data.academic_years)
+        ) {
+            records.academic_years = x.data.academic_years.map(year => ({
+                id: Number(year.id || 0),
+                status: String(year.status || 'active'),
+                data: {
+                    academic_year_code: String(year.academic_year_code || ''),
+                    year_name: String(year.year_name || ''),
+                    start_date: String(year.start_date || ''),
+                    end_date: String(year.end_date || ''),
+                    is_current: Number(year.is_current || 0),
+                    status: String(year.status || 'active')
+                }
+            }));
+            rebuildAcademicYearContext();
+        }
+
         render(moduleKey);
+
+        if (moduleKey === 'academic_years') {
+            rebuildAcademicYearContext();
+            updateAcademicDashboard();
+        }
     } catch (e) {
         showMessage(moduleKey, e.message, false);
         const body = document.querySelector(`[data-body="${moduleKey}"]`);
@@ -652,6 +1344,238 @@ async function load(moduleKey) {
             </td></tr>`;
         }
     }
+}
+
+
+function exportModule(moduleKey) {
+    if (!permissions[moduleKey]?.export) {
+        showMessage(
+            moduleKey,
+            'You do not have export permission for this section.',
+            false
+        );
+        return;
+    }
+
+    if (
+        moduleKey !== 'academic_years'
+        && selectedAcademicYearId() <= 0
+    ) {
+        showMessage(
+            moduleKey,
+            'Select an Academic Year before exporting.',
+            false
+        );
+        return;
+    }
+
+    const url = new URL(endpoint);
+
+    url.searchParams.set(
+        'module_key',
+        moduleKey
+    );
+
+    url.searchParams.set(
+        'action',
+        'export'
+    );
+
+    if (moduleKey !== 'academic_years') {
+        url.searchParams.set(
+            'academic_year_id',
+            String(
+                selectedAcademicYearId()
+            )
+        );
+    }
+
+    window.location.href =
+        url.toString();
+}
+
+function templateModule(moduleKey) {
+    if (!permissions[moduleKey]?.import) {
+        showMessage(
+            moduleKey,
+            'You do not have import permission for this section.',
+            false
+        );
+        return;
+    }
+
+    const url = new URL(endpoint);
+
+    url.searchParams.set(
+        'module_key',
+        moduleKey
+    );
+
+    url.searchParams.set(
+        'action',
+        'template'
+    );
+
+    window.location.href =
+        url.toString();
+}
+
+function openImport(moduleKey) {
+    if (!permissions[moduleKey]?.import) {
+        showMessage(
+            moduleKey,
+            'You do not have import permission for this section.',
+            false
+        );
+        return;
+    }
+
+    if (
+        moduleKey !== 'academic_years'
+        && selectedAcademicYearId() <= 0
+    ) {
+        showMessage(
+            moduleKey,
+            'Select an Academic Year before importing.',
+            false
+        );
+        return;
+    }
+
+    const form = document.getElementById(
+        'academicImportForm'
+    );
+
+    form?.reset();
+
+    document.getElementById(
+        'academicImportModule'
+    ).value = moduleKey;
+
+    document.getElementById(
+        'academicImportTitle'
+    ).textContent =
+        'Import '
+        + (
+            moduleTitles[moduleKey]
+            || 'Records'
+        );
+
+    const context =
+        document.getElementById(
+            'academicImportYearContext'
+        );
+
+    if (context) {
+        context.textContent =
+            moduleKey === 'academic_years'
+                ? 'Academic Years import is not limited to one selected year.'
+                : (
+                    'Academic Year: '
+                    + selectedAcademicYearName()
+                );
+    }
+
+    const result =
+        document.getElementById(
+            'academicImportResult'
+        );
+
+    if (result) {
+        result.className =
+            'academic-import-result';
+        result.textContent = '';
+    }
+
+    window.lucide?.createIcons();
+
+    getImportModal()?.show();
+}
+
+async function submitImport(
+    moduleKey,
+    file
+) {
+    const formData = new FormData();
+
+    formData.append(
+        'module_key',
+        moduleKey
+    );
+
+    formData.append(
+        'action',
+        'import'
+    );
+
+    formData.append(
+        'csrf_token',
+        csrfToken
+    );
+
+    if (moduleKey !== 'academic_years') {
+        formData.append(
+            'academic_year_id',
+            String(
+                selectedAcademicYearId()
+            )
+        );
+    }
+
+    formData.append(
+        'import_file',
+        file
+    );
+
+    const response = await fetch(
+        endpoint,
+        {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                Accept:
+                    'application/json'
+            },
+            body: formData
+        }
+    );
+
+    const text =
+        await response.text();
+
+    let result;
+
+    try {
+        result = JSON.parse(text);
+    } catch {
+        throw new Error(
+            `Academic Year Import returned HTTP ${response.status}. `
+            + (
+                text
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 220)
+                || 'Invalid server response.'
+            )
+        );
+    }
+
+    if (
+        !response.ok
+        || !result.success
+    ) {
+        throw new Error(
+            result.message
+            || 'Import failed.'
+        );
+    }
+
+    if (result.data?.csrf_token) {
+        csrfToken =
+            result.data.csrf_token;
+    }
+
+    return result;
 }
 
 // ============================================
@@ -680,6 +1604,175 @@ document.querySelectorAll('.js-add').forEach(b => {
 document.querySelectorAll('.js-refresh').forEach(b => {
     b.addEventListener('click', () => load(b.dataset.module));
 });
+
+
+// Export buttons
+document.querySelectorAll('.js-export').forEach(button => {
+    button.addEventListener(
+        'click',
+        () => exportModule(
+            button.dataset.module
+        )
+    );
+});
+
+// Import buttons
+document.querySelectorAll('.js-import').forEach(button => {
+    button.addEventListener(
+        'click',
+        () => openImport(
+            button.dataset.module
+        )
+    );
+});
+
+document.getElementById(
+    'academicTemplateButton'
+)?.addEventListener(
+    'click',
+    () => {
+        const moduleKey =
+            document.getElementById(
+                'academicImportModule'
+            )?.value
+            || '';
+
+        if (moduleKey) {
+            templateModule(moduleKey);
+        }
+    }
+);
+
+document.getElementById(
+    'academicImportForm'
+)?.addEventListener(
+    'submit',
+    async event => {
+        event.preventDefault();
+
+        const moduleKey =
+            document.getElementById(
+                'academicImportModule'
+            )?.value
+            || '';
+
+        const file =
+            document.getElementById(
+                'academicImportFile'
+            )?.files?.[0];
+
+        const resultBox =
+            document.getElementById(
+                'academicImportResult'
+            );
+
+        if (!file) {
+            if (resultBox) {
+                resultBox.className =
+                    'academic-import-result show';
+                resultBox.textContent =
+                    'Choose a CSV or XLSX file.';
+            }
+            return;
+        }
+
+        try {
+            const result =
+                await submitImport(
+                    moduleKey,
+                    file
+                );
+
+            const imported =
+                Number(
+                    result.data?.imported
+                    || 0
+                );
+
+            const skipped =
+                Number(
+                    result.data?.skipped
+                    || 0
+                );
+
+            const errors =
+                Array.isArray(
+                    result.data?.errors
+                )
+                    ? result.data.errors
+                    : [];
+
+            if (resultBox) {
+                resultBox.className =
+                    'academic-import-result show';
+
+                resultBox.textContent =
+                    `Imported: ${imported}\n`
+                    + `Skipped: ${skipped}`
+                    + (
+                        errors.length
+                            ? '\n\n'
+                                + errors
+                                    .slice(0, 20)
+                                    .join('\n')
+                            : ''
+                    );
+            }
+
+            showMessage(
+                moduleKey,
+                result.message,
+                true
+            );
+
+            await load(moduleKey);
+
+            if (
+                moduleKey
+                === 'academic_years'
+            ) {
+                rebuildAcademicYearContext();
+            }
+        } catch (error) {
+            if (resultBox) {
+                resultBox.className =
+                    'academic-import-result show';
+
+                resultBox.textContent =
+                    error.message;
+            }
+
+            showMessage(
+                moduleKey,
+                error.message,
+                false
+            );
+        }
+    }
+);
+
+// Academic Year context selector
+document.getElementById(
+    'academicYearContext'
+)?.addEventListener(
+    'change',
+    async event => {
+        selectedYearId =
+            Number(
+                event.currentTarget.value
+                || 0
+            );
+
+        updateYearContextUI();
+
+        if (
+            currentTab
+            && currentTab !== 'academic_years'
+        ) {
+            await load(currentTab);
+        }
+    }
+);
 
 // Search and filter
 document.querySelectorAll('.js-search, .js-status').forEach(el => {
@@ -725,8 +1818,28 @@ document.getElementById('academicRecordForm')?.addEventListener('submit', async 
     });
 
     try {
-        const action = id ? 'update' : 'create';
-        const result = await request(moduleKey, action, { id, data, status: data.status || 'active' }, 'POST');
+        const action =
+            id
+                ? 'update'
+                : 'create';
+
+        const payload = {
+            id,
+            data,
+            status:
+                data.status
+                || 'active',
+            ...moduleRequestContext(
+                moduleKey
+            )
+        };
+
+        const result = await request(
+            moduleKey,
+            action,
+            payload,
+            'POST'
+        );
         
         const modal = getModal();
         if (modal) modal.hide();
@@ -743,20 +1856,50 @@ document.getElementById('academicRecordForm')?.addEventListener('submit', async 
 // INITIAL LOAD
 // ============================================
 
-const firstTab = document.querySelector('.academic-tab.active')?.dataset.module;
+const firstTab =
+    document.querySelector(
+        '.academic-tab.active'
+    )?.dataset.module;
+
 if (firstTab) {
+    currentTab = firstTab;
     load(firstTab);
 } else {
-    const first = document.querySelector('.academic-tab');
+    const first =
+        document.querySelector(
+            '.academic-tab'
+        );
+
     if (first) {
-        first.classList.add('active');
-        const panel = document.querySelector(`[data-panel="${first.dataset.module}"]`);
-        if (panel) panel.classList.add('active');
-        load(first.dataset.module);
+        first.classList.add(
+            'active'
+        );
+
+        const panel =
+            document.querySelector(
+                `[data-panel="${first.dataset.module}"]`
+            );
+
+        if (panel) {
+            panel.classList.add(
+                'active'
+            );
+        }
+
+        currentTab =
+            first.dataset.module;
+
+        load(
+            first.dataset.module
+        );
     }
 }
 
-if (window.lucide) window.lucide.createIcons();
+updateYearContextUI();
+
+if (window.lucide) {
+    window.lucide.createIcons();
+}
 
 })();
 </script>

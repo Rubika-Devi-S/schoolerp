@@ -1,1491 +1,41 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-17-attendance-strict-branch-v3 */
+
 $pageTitle = 'Attendance Management';
 $pageKey = 'student_attendance';
 $sidebarFile = __DIR__ . '/sidebar.php';
 
 if (isset($_GET['api']) && $_GET['api'] === '1') {
-    require_once dirname(__DIR__) . '/includes/bootstrap.php';
-
-function attendanceJson(bool $success,string $message='',array $data=[],int $status=200): never
-{
-    while(ob_get_level()>0)ob_end_clean();
-    http_response_code($status);
-    header('Content-Type: application/json; charset=utf-8');
-    header('Cache-Control: no-store');
-    echo json_encode(
-        ['success'=>$success,'message'=>$message,'data'=>$data],
-        JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES
-    );
+    /*
+     * Keep the existing same-page API fallback, but route it through the
+     * single strict branch-aware API so both endpoints always behave alike.
+     */
+    require dirname(__DIR__) . '/api/attendance.php';
     exit;
 }
 
-function attendanceInput(): array
-{
-    $json=json_decode((string)file_get_contents('php://input'),true);
-    return is_array($json)?$json:$_POST;
-}
-
-function attendanceUser(): array
-{
-    $user=function_exists('current_user')?current_user():[];
-    return is_array($user)?$user:[];
-}
-
-function attendanceScope(): array
-{
-    $user=attendanceUser();
-
-    return [
-        'tenant_id'=>(int)(
-            $user['tenant_id']
-            ??$user['school_id']
-            ??$_SESSION['tenant_id']
-            ??$_SESSION['school_id']
-            ??0
-        ),
-        'branch_id'=>(int)(
-            $user['branch_id']
-            ??$_SESSION['branch_id']
-            ??0
-        ),
-        'user_id'=>(int)(
-            $user['id']
-            ??$user['user_id']
-            ??$_SESSION['user_id']
-            ??0
-        ),
-    ];
-}
-
-function attendanceCan(string $action): bool
-{
-    if(function_exists('is_super_admin')&&is_super_admin())return true;
-    if(!function_exists('has_permission'))return true;
-
-    return has_permission('attendance_management',$action)
-        ||has_permission('attendance',$action)
-        ||has_permission('student_management',$action);
-}
-
-function attendanceCsrf(array $input): void
-{
-    if(session_status()!==PHP_SESSION_ACTIVE){
-        session_start();
-    }
-
-    $sessionToken=(string)(
-        $_SESSION['attendance_csrf_token']
-        ??''
-    );
-
-    $requestToken=trim(
-        (string)(
-            $input['csrf_token']
-            ??$_SERVER['HTTP_X_CSRF_TOKEN']
-            ??''
-        )
-    );
-
-    if(
-        $sessionToken===''
-        ||$requestToken===''
-        ||!hash_equals($sessionToken,$requestToken)
-    ){
-        attendanceJson(
-            false,
-            'Invalid or expired CSRF token. Refresh the page and try again.',
-            [],
-            419
-        );
-    }
-}
-
-function tableExists(PDO $pdo,string $table): bool
-{
-    $query=$pdo->prepare(
-        "SELECT COUNT(*)
-         FROM information_schema.tables
-         WHERE table_schema=DATABASE()
-           AND table_name=:table_name"
-    );
-    $query->execute(['table_name'=>$table]);
-    return (int)$query->fetchColumn()>0;
-}
-
-function ensureAttendanceTables(PDO $pdo): void
-{
-    if(!tableExists($pdo,'student_attendance')){
-        $pdo->exec(
-            "CREATE TABLE student_attendance(
-                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                tenant_id BIGINT UNSIGNED NOT NULL,
-                branch_id BIGINT UNSIGNED NOT NULL,
-                academic_year_id BIGINT UNSIGNED NOT NULL,
-                student_id BIGINT UNSIGNED NOT NULL,
-                attendance_date DATE NOT NULL,
-                status ENUM(
-                    'present','absent','half_day','late',
-                    'leave','on_duty','holiday'
-                ) NOT NULL DEFAULT 'present',
-                check_in TIME NULL,
-                check_out TIME NULL,
-                late_minutes INT NOT NULL DEFAULT 0,
-                remarks VARCHAR(255) NULL,
-                source ENUM('manual','biometric','import','api')
-                    NOT NULL DEFAULT 'manual',
-                marked_by BIGINT UNSIGNED NOT NULL,
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(id),
-                UNIQUE KEY uk_student_attendance(
-                    student_id,attendance_date
-                ),
-                KEY idx_attendance_tenant_date(
-                    tenant_id,attendance_date
-                )
-            ) ENGINE=InnoDB
-              DEFAULT CHARSET=utf8mb4
-              COLLATE=utf8mb4_unicode_ci"
-        );
-    }
-
-    if(!tableExists($pdo,'student_attendance_logs')){
-        $pdo->exec(
-            "CREATE TABLE student_attendance_logs(
-                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                tenant_id BIGINT UNSIGNED NOT NULL,
-                branch_id BIGINT UNSIGNED NULL,
-                attendance_id BIGINT UNSIGNED NULL,
-                student_id BIGINT UNSIGNED NULL,
-                user_id BIGINT UNSIGNED NULL,
-                action_name VARCHAR(80) NOT NULL,
-                old_values JSON NULL,
-                new_values JSON NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(id),
-                KEY idx_attendance_logs(
-                    tenant_id,branch_id,student_id,created_at
-                )
-            ) ENGINE=InnoDB
-              DEFAULT CHARSET=utf8mb4
-              COLLATE=utf8mb4_unicode_ci"
-        );
-    }
-}
-
-function logAttendance(
-    PDO $pdo,
-    array $scope,
-    string $action,
-    ?int $attendanceId,
-    ?int $studentId,
-    ?array $old,
-    ?array $new
-): void {
-    $query=$pdo->prepare(
-        "INSERT INTO student_attendance_logs(
-            tenant_id,branch_id,attendance_id,student_id,
-            user_id,action_name,old_values,new_values
-        ) VALUES(
-            :tenant_id,:branch_id,:attendance_id,:student_id,
-            :user_id,:action_name,:old_values,:new_values
-        )"
-    );
-
-    $query->execute([
-        'tenant_id'=>$scope['tenant_id'],
-        'branch_id'=>$scope['branch_id']?:null,
-        'attendance_id'=>$attendanceId,
-        'student_id'=>$studentId,
-        'user_id'=>$scope['user_id']?:null,
-        'action_name'=>$action,
-        'old_values'=>$old?json_encode($old):null,
-        'new_values'=>$new?json_encode($new):null,
-    ]);
-}
-
-function studentNameSql(string $alias='s'): string
-{
-    return "TRIM(CONCAT(
-        COALESCE({$alias}.first_name,''),
-        CASE
-            WHEN COALESCE({$alias}.last_name,'')=''
-            THEN ''
-            ELSE CONCAT(' ',{$alias}.last_name)
-        END
-    ))";
-}
-
-function attendanceMeta(PDO $pdo,array $scope): array
-{
-    $years=[];
-    $classes=[];
-    $sections=[];
-    $students=[];
-
-    if(tableExists($pdo,'academic_years')){
-        $query=$pdo->prepare(
-            "SELECT id,year_name
-             FROM academic_years
-             WHERE tenant_id=:tenant_id
-             ORDER BY is_current DESC,start_date DESC,id DESC"
-        );
-        $query->execute(['tenant_id'=>$scope['tenant_id']]);
-        $years=$query->fetchAll(PDO::FETCH_ASSOC);
-    }
-
-    if(tableExists($pdo,'classes')){
-        $query=$pdo->prepare(
-            "SELECT id,class_name,academic_year_id
-             FROM classes
-             WHERE tenant_id=:tenant_id
-               AND status='active'
-             ORDER BY academic_year_id DESC,display_order,class_name"
-        );
-        $query->execute(['tenant_id'=>$scope['tenant_id']]);
-        $classes=$query->fetchAll(PDO::FETCH_ASSOC);
-    }
-
-    if(tableExists($pdo,'sections')){
-        $query=$pdo->prepare(
-            "SELECT
-                sec.id,
-                sec.class_id,
-                sec.section_name,
-                c.academic_year_id
-             FROM sections sec
-             INNER JOIN classes c
-                ON c.id=sec.class_id
-               AND c.tenant_id=sec.tenant_id
-             WHERE sec.tenant_id=:tenant_id
-               AND sec.status='active'
-             ORDER BY c.display_order,c.class_name,sec.section_name"
-        );
-        $query->execute(['tenant_id'=>$scope['tenant_id']]);
-        $sections=$query->fetchAll(PDO::FETCH_ASSOC);
-    }
-
-    if(
-        tableExists($pdo,'students')
-        &&tableExists($pdo,'student_enrollments')
-    ){
-        $nameSql=studentNameSql('s');
-
-        $query=$pdo->prepare(
-            "SELECT
-                s.id,
-                s.admission_no AS admission_number,
-                {$nameSql} AS student_name,
-                e.academic_year_id,
-                e.class_id,
-                c.class_name,
-                e.section_id,
-                sec.section_name
-             FROM students s
-             INNER JOIN student_enrollments e
-                ON e.student_id=s.id
-               AND e.tenant_id=s.tenant_id
-               AND e.enrollment_status='active'
-             INNER JOIN classes c
-                ON c.id=e.class_id
-               AND c.tenant_id=e.tenant_id
-             INNER JOIN sections sec
-                ON sec.id=e.section_id
-               AND sec.tenant_id=e.tenant_id
-             WHERE s.tenant_id=:tenant_id
-               AND (:branch_scope=0 OR s.branch_id=:branch_value)
-               AND s.status='active'
-               AND s.deleted_at IS NULL
-             ORDER BY c.display_order,c.class_name,
-                      sec.section_name,student_name"
-        );
-
-        $query->execute([
-            'tenant_id'=>$scope['tenant_id'],
-            'branch_scope'=>$scope['branch_id'],
-            'branch_value'=>$scope['branch_id'],
-        ]);
-
-        $students=$query->fetchAll(PDO::FETCH_ASSOC);
-    }
-
-    return [
-        'academic_years'=>$years,
-        'classes'=>$classes,
-        'sections'=>$sections,
-        'students'=>$students,
-        'statuses'=>[
-            'present',
-            'absent',
-            'half_day',
-            'late',
-            'leave',
-            'on_duty',
-            'holiday',
-        ],
-        'current_academic_year_id'=>(int)($years[0]['id']??0),
-    ];
-}
-
-
-function attendanceLoadStudents(
-    PDO $pdo,
-    array $scope,
-    array $filters
-): array {
-    $academicYearId=(int)($filters['academic_year_id']??0);
-    $classId=(int)($filters['class_id']??0);
-    $sectionId=(int)($filters['section_id']??0);
-    $attendanceDate=trim((string)($filters['attendance_date']??$filters['date']??''));
-
-    if($academicYearId<=0){
-        throw new InvalidArgumentException('Please select an academic year.');
-    }
-
-    if($classId<=0){
-        throw new InvalidArgumentException('Please select a class.');
-    }
-
-    if($sectionId<=0){
-        throw new InvalidArgumentException('Please select a section.');
-    }
-
-    $date=DateTimeImmutable::createFromFormat('Y-m-d',$attendanceDate);
-    $dateErrors=DateTimeImmutable::getLastErrors();
-    $hasDateErrors=is_array($dateErrors)
-        &&(
-            ($dateErrors['warning_count']??0)>0
-            ||($dateErrors['error_count']??0)>0
-        );
-
-    if(
-        !$date
-        ||$hasDateErrors
-        ||$date->format('Y-m-d')!==$attendanceDate
-    ){
-        throw new InvalidArgumentException('Please select a valid attendance date.');
-    }
-
-    $selectionCheck=$pdo->prepare(
-        "SELECT COUNT(*)
-         FROM classes c
-         INNER JOIN sections sec
-            ON sec.class_id=c.id
-           AND sec.tenant_id=c.tenant_id
-         WHERE c.id=:class_id
-           AND sec.id=:section_id
-           AND c.tenant_id=:tenant_id
-           AND c.academic_year_id=:academic_year_id
-           AND c.status='active'
-           AND sec.status='active'"
-    );
-
-    $selectionCheck->execute([
-        'class_id'=>$classId,
-        'section_id'=>$sectionId,
-        'tenant_id'=>$scope['tenant_id'],
-        'academic_year_id'=>$academicYearId,
-    ]);
-
-    if((int)$selectionCheck->fetchColumn()===0){
-        throw new InvalidArgumentException(
-            'The selected class and section do not belong to the selected academic year.'
-        );
-    }
-
-    $nameSql=studentNameSql('s');
-
-    $query=$pdo->prepare(
-        "SELECT
-            s.id,
-            s.admission_no AS admission_number,
-            {$nameSql} AS student_name,
-            e.roll_no,
-            e.academic_year_id,
-            e.class_id,
-            c.class_name,
-            e.section_id,
-            sec.section_name,
-            a.id AS attendance_id,
-            a.status AS saved_status,
-            a.remarks
-         FROM student_enrollments e
-         INNER JOIN students s
-            ON s.id=e.student_id
-           AND s.tenant_id=e.tenant_id
-         INNER JOIN classes c
-            ON c.id=e.class_id
-           AND c.tenant_id=e.tenant_id
-         INNER JOIN sections sec
-            ON sec.id=e.section_id
-           AND sec.tenant_id=e.tenant_id
-         LEFT JOIN student_attendance a
-            ON a.student_id=e.student_id
-           AND a.tenant_id=e.tenant_id
-           AND a.academic_year_id=e.academic_year_id
-           AND a.attendance_date=:attendance_date
-         WHERE e.tenant_id=:tenant_id
-           AND e.academic_year_id=:academic_year_id
-           AND e.class_id=:class_id
-           AND e.section_id=:section_id
-           AND e.enrollment_status='active'
-           AND (:branch_scope=0 OR s.branch_id=:branch_value)
-           AND s.status='active'
-           AND s.deleted_at IS NULL
-         ORDER BY
-            CASE
-                WHEN e.roll_no REGEXP '^[0-9]+$'
-                THEN CAST(e.roll_no AS UNSIGNED)
-                ELSE 999999999
-            END,
-            e.roll_no,
-            s.first_name,
-            s.last_name,
-            s.id"
-    );
-
-    $query->execute([
-        'attendance_date'=>$attendanceDate,
-        'tenant_id'=>$scope['tenant_id'],
-        'academic_year_id'=>$academicYearId,
-        'class_id'=>$classId,
-        'section_id'=>$sectionId,
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
-    ]);
-
-    $students=$query->fetchAll(PDO::FETCH_ASSOC);
-    $counts=[
-        'total'=>count($students),
-        'present'=>0,
-        'absent'=>0,
-        'leave'=>0,
-    ];
-    $markedCount=0;
-
-    foreach($students as &$student){
-        $savedStatus=trim((string)($student['saved_status']??''));
-        $student['attendance_exists']=(int)($student['attendance_id']??0)>0;
-
-        if($student['attendance_exists']){
-            $markedCount++;
-        }
-
-        $student['status']=$savedStatus!==''?$savedStatus:'present';
-        $student['remarks']=(string)($student['remarks']??'');
-
-        if($student['status']==='absent'){
-            $counts['absent']++;
-        }elseif($student['status']==='leave'){
-            $counts['leave']++;
-        }else{
-            $counts['present']++;
-        }
-
-        unset($student['saved_status']);
-    }
-    unset($student);
-
-    return [
-        'students'=>$students,
-        'attendance_exists'=>$markedCount>0,
-        'marked_count'=>$markedCount,
-        'is_complete'=>$counts['total']>0
-            &&$markedCount===$counts['total'],
-        'counts'=>$counts,
-    ];
-}
-
-function attendanceRows(
-    PDO $pdo,
-    array $scope,
-    array $filters
-): array {
-    $where=[
-        'a.tenant_id=:tenant_id',
-        '(:branch_scope=0 OR a.branch_id=:branch_value)',
-        'a.attendance_date=:attendance_date',
-    ];
-
-    $params=[
-        'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
-        'attendance_date'=>trim(
-            (string)($filters['date']??date('Y-m-d'))
-        ),
-    ];
-
-    $search=trim((string)($filters['search']??''));
-
-    if($search!==''){
-        $where[]="(
-            s.admission_no LIKE :search_term
-            OR s.first_name LIKE :search_term
-            OR s.last_name LIKE :search_term
-            OR s.mobile LIKE :search_term
-        )";
-        $params['search_term']='%'.$search.'%';
-    }
-
-    foreach(
-        ['academic_year_id','class_id','section_id','status']
-        as $field
-    ){
-        $value=trim((string)($filters[$field]??''));
-
-        if($value!==''&&$value!=='all'){
-            if(in_array($field,['class_id','section_id'],true)){
-                $where[]="e.{$field}=:{$field}";
-            }else{
-                $where[]="a.{$field}=:{$field}";
-            }
-            $params[$field]=$value;
-        }
-    }
-
-    $nameSql=studentNameSql('s');
-
-    $query=$pdo->prepare(
-        "SELECT
-            a.id,
-            a.tenant_id,
-            a.branch_id,
-            a.academic_year_id,
-            a.student_id,
-            a.attendance_date,
-            a.status,
-            a.check_in AS check_in_time,
-            a.check_out AS check_out_time,
-            a.late_minutes,
-            a.remarks,
-            a.source,
-            a.marked_by,
-            a.created_at,
-            s.admission_no AS admission_number,
-            s.mobile,
-            {$nameSql} AS student_name,
-            e.class_id,
-            c.class_name,
-            e.section_id,
-            sec.section_name,
-            ay.year_name AS academic_year_name
-         FROM student_attendance a
-         INNER JOIN students s
-            ON s.id=a.student_id
-           AND s.tenant_id=a.tenant_id
-         LEFT JOIN student_enrollments e
-            ON e.student_id=a.student_id
-           AND e.academic_year_id=a.academic_year_id
-           AND e.tenant_id=a.tenant_id
-         LEFT JOIN classes c
-            ON c.id=e.class_id
-           AND c.tenant_id=e.tenant_id
-         LEFT JOIN sections sec
-            ON sec.id=e.section_id
-           AND sec.tenant_id=e.tenant_id
-         LEFT JOIN academic_years ay
-            ON ay.id=a.academic_year_id
-           AND ay.tenant_id=a.tenant_id
-         WHERE ".implode(' AND ',$where)."
-         ORDER BY
-            COALESCE(c.display_order,9999),
-            COALESCE(c.class_name,''),
-            COALESCE(sec.section_name,''),
-            s.first_name,
-            s.last_name"
-    );
-
-    $query->execute($params);
-    return $query->fetchAll(PDO::FETCH_ASSOC);
-}
-
-function attendanceStats(
-    PDO $pdo,
-    array $scope,
-    string $date
-): array {
-    $totalQuery=$pdo->prepare(
-        "SELECT COUNT(DISTINCT s.id)
-         FROM students s
-         INNER JOIN student_enrollments e
-            ON e.student_id=s.id
-           AND e.tenant_id=s.tenant_id
-           AND e.enrollment_status='active'
-         WHERE s.tenant_id=:tenant_id
-           AND (:branch_scope=0 OR s.branch_id=:branch_value)
-           AND s.status='active'
-           AND s.deleted_at IS NULL"
-    );
-
-    $totalQuery->execute([
-        'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
-    ]);
-
-    $total=(int)$totalQuery->fetchColumn();
-
-    $query=$pdo->prepare(
-        "SELECT
-            SUM(status='present') AS present,
-            SUM(status='absent') AS absent,
-            SUM(status='leave') AS leave_count,
-            SUM(status='late') AS late_count,
-            SUM(status='half_day') AS half_day_count,
-            SUM(status='on_duty') AS on_duty_count,
-            COUNT(*) AS marked
-         FROM student_attendance
-         WHERE tenant_id=:tenant_id
-           AND (:branch_scope=0 OR branch_id=:branch_value)
-           AND attendance_date=:attendance_date"
-    );
-
-    $query->execute([
-        'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
-        'attendance_date'=>$date,
-    ]);
-
-    $row=$query->fetch(PDO::FETCH_ASSOC)?:[];
-
-    $present=(int)($row['present']??0);
-    $late=(int)($row['late_count']??0);
-    $onDuty=(int)($row['on_duty_count']??0);
-    $halfDay=(int)($row['half_day_count']??0);
-    $marked=(int)($row['marked']??0);
-
-    $effectivePresent=$present+$late+$onDuty+($halfDay*0.5);
-
-    $row['total_students']=$total;
-    $row['attendance_percentage']=$marked>0
-        ?($effectivePresent/$marked)*100
-        :0;
-
-    return $row;
-}
-
-function weeklyData(PDO $pdo,array $scope): array
-{
-    $start=(new DateTimeImmutable('monday this week'))
-        ->format('Y-m-d');
-
-    $end=(new DateTimeImmutable('saturday this week'))
-        ->format('Y-m-d');
-
-    $query=$pdo->prepare(
-        "SELECT
-            e.class_id,
-            c.class_name,
-            e.section_id,
-            sec.section_name,
-            a.attendance_date,
-            SUM(
-                a.status IN('present','late','on_duty')
-            ) AS full_present,
-            SUM(a.status='half_day') AS half_day,
-            COUNT(*) AS marked
-         FROM student_attendance a
-         INNER JOIN student_enrollments e
-            ON e.student_id=a.student_id
-           AND e.academic_year_id=a.academic_year_id
-           AND e.tenant_id=a.tenant_id
-         INNER JOIN classes c
-            ON c.id=e.class_id
-           AND c.tenant_id=e.tenant_id
-         INNER JOIN sections sec
-            ON sec.id=e.section_id
-           AND sec.tenant_id=e.tenant_id
-         WHERE a.tenant_id=:tenant_id
-           AND (:branch_scope=0 OR a.branch_id=:branch_value)
-           AND a.attendance_date BETWEEN :start_date AND :end_date
-         GROUP BY
-            e.class_id,c.class_name,
-            e.section_id,sec.section_name,
-            a.attendance_date,c.display_order
-         ORDER BY
-            c.display_order,c.class_name,
-            sec.section_name,a.attendance_date"
-    );
-
-    $query->execute([
-        'tenant_id'=>$scope['tenant_id'],
-        'branch_scope'=>$scope['branch_id'],
-        'branch_value'=>$scope['branch_id'],
-        'start_date'=>$start,
-        'end_date'=>$end,
-    ]);
-
-    $map=[];
-
-    foreach($query->fetchAll(PDO::FETCH_ASSOC) as $row){
-        $key=$row['class_id'].'-'.$row['section_id'];
-
-        if(!isset($map[$key])){
-            $map[$key]=[
-                'class_name'=>$row['class_name'],
-                'section_name'=>$row['section_name'],
-                'mon'=>0,
-                'tue'=>0,
-                'wed'=>0,
-                'thu'=>0,
-                'fri'=>0,
-                'sat'=>0,
-            ];
-        }
-
-        $day=strtolower(
-            (new DateTimeImmutable($row['attendance_date']))
-                ->format('D')
-        );
-
-        $marked=(int)$row['marked'];
-        $attended=(int)$row['full_present']
-            +((int)$row['half_day']*0.5);
-
-        if(isset($map[$key][$day])){
-            $map[$key][$day]=$marked>0
-                ?($attended/$marked)*100
-                :0;
-        }
-    }
-
-    return array_values($map);
-}
-
-if(!isset($pdo)||!$pdo instanceof PDO){
-    attendanceJson(false,'Database connection unavailable.',[],500);
-}
-
-try{
-    $pdo->setAttribute(PDO::ATTR_EMULATE_PREPARES,true);
-    ensureAttendanceTables($pdo);
-}catch(Throwable $error){
-    attendanceJson(
-        false,
-        'Unable to initialize attendance module: '
-        .$error->getMessage(),
-        [],
-        500
-    );
-}
-
-if(session_status()!==PHP_SESSION_ACTIVE){
-    session_start();
-}
-
-if(
-    empty($_SESSION['attendance_csrf_token'])
-    ||!is_string($_SESSION['attendance_csrf_token'])
-){
-    $_SESSION['attendance_csrf_token']=bin2hex(random_bytes(32));
-}
-
-$scope=attendanceScope();
-
-if($scope['tenant_id']<=0){
-    attendanceJson(
-        false,
-        'School tenant session was not found.',
-        [],
-        401
-    );
-}
-
-$input=attendanceInput();
-
-$action=strtolower(
-    trim(
-        (string)(
-            $input['action']
-            ??$_GET['action']
-            ??''
-        )
-    )
-);
-
-try{
-    if($action==='meta'){
-        if(!attendanceCan('view')){
-            throw new RuntimeException('Permission denied.',403);
-        }
-
-        attendanceJson(
-            true,
-            'Metadata loaded.',
-            [
-                'csrf_token'=>(string)
-                    $_SESSION['attendance_csrf_token'],
-                'meta'=>attendanceMeta($pdo,$scope),
-                'permissions'=>[
-                    'view'=>attendanceCan('view'),
-                    'add'=>attendanceCan('add')
-                        ||attendanceCan('create'),
-                    'edit'=>attendanceCan('edit'),
-                    'delete'=>attendanceCan('delete'),
-                    'export'=>attendanceCan('export'),
-                ],
-            ]
-        );
-    }
-
-
-    if($action==='load_students'){
-        if(!attendanceCan('view')){
-            throw new RuntimeException('Permission denied.',403);
-        }
-
-        attendanceJson(
-            true,
-            'Students loaded successfully.',
-            attendanceLoadStudents(
-                $pdo,
-                $scope,
-                $_GET+$input
-            )
-        );
-    }
-
-    if($action==='list'){
-        if(!attendanceCan('view')){
-            throw new RuntimeException('Permission denied.',403);
-        }
-
-        $filters=$_GET+$input;
-        $date=trim(
-            (string)(
-                $filters['date']
-                ??date('Y-m-d')
-            )
-        );
-
-        attendanceJson(
-            true,
-            'Attendance loaded.',
-            [
-                'records'=>attendanceRows(
-                    $pdo,
-                    $scope,
-                    $filters
-                ),
-                'stats'=>attendanceStats(
-                    $pdo,
-                    $scope,
-                    $date
-                ),
-                'weekly'=>weeklyData(
-                    $pdo,
-                    $scope
-                ),
-            ]
-        );
-    }
-
-    if($action==='export'){
-        if(!attendanceCan('export')){
-            throw new RuntimeException('Permission denied.',403);
-        }
-
-        $rows=attendanceRows($pdo,$scope,$_GET);
-
-        while(ob_get_level()>0)ob_end_clean();
-
-        header('Content-Type:text/csv; charset=utf-8');
-        header(
-            'Content-Disposition:attachment; '
-            .'filename="student-attendance-'
-            .date('Ymd-His').'.csv"'
-        );
-
-        $file=fopen('php://output','wb');
-
-        fputcsv(
-            $file,
-            [
-                'Date',
-                'Admission No',
-                'Student',
-                'Class',
-                'Section',
-                'Status',
-                'Check-in',
-                'Check-out',
-                'Remarks',
-            ]
-        );
-
-        foreach($rows as $row){
-            fputcsv(
-                $file,
-                [
-                    $row['attendance_date'],
-                    $row['admission_number'],
-                    $row['student_name'],
-                    $row['class_name'],
-                    $row['section_name'],
-                    $row['status'],
-                    $row['check_in_time'],
-                    $row['check_out_time'],
-                    $row['remarks'],
-                ]
-            );
-        }
-
-        fclose($file);
-        exit;
-    }
-
-    if($action==='save'){
-        attendanceCsrf($input);
-
-        $id=(int)($input['id']??0);
-
-        if(
-            !attendanceCan($id?'edit':'add')
-            &&!attendanceCan($id?'edit':'create')
-        ){
-            throw new RuntimeException('Permission denied.',403);
-        }
-
-        foreach(
-            [
-                'attendance_date',
-                'academic_year_id',
-                'student_id',
-                'status',
-            ]
-            as $field
-        ){
-            if(trim((string)($input[$field]??''))===''){
-                throw new InvalidArgumentException(
-                    'Complete all required attendance fields.'
-                );
-            }
-        }
-
-        $allowedStatuses=[
-            'present','absent','half_day','late',
-            'leave','on_duty','holiday',
-        ];
-
-        $status=trim((string)$input['status']);
-
-        if(!in_array($status,$allowedStatuses,true)){
-            throw new InvalidArgumentException(
-                'Invalid attendance status.'
-            );
-        }
-
-        $studentId=(int)$input['student_id'];
-        $yearId=(int)$input['academic_year_id'];
-
-        $studentCheck=$pdo->prepare(
-            "SELECT COUNT(*)
-             FROM students s
-             INNER JOIN student_enrollments e
-                ON e.student_id=s.id
-               AND e.tenant_id=s.tenant_id
-             WHERE s.id=:student_id
-               AND s.tenant_id=:tenant_id
-               AND e.academic_year_id=:academic_year_id"
-        );
-
-        $studentCheck->execute([
-            'student_id'=>$studentId,
-            'tenant_id'=>$scope['tenant_id'],
-            'academic_year_id'=>$yearId,
-        ]);
-
-        if((int)$studentCheck->fetchColumn()===0){
-            throw new InvalidArgumentException(
-                'Student enrollment was not found for the selected academic year.'
-            );
-        }
-
-        $data=[
-            'tenant_id'=>$scope['tenant_id'],
-            'branch_id'=>$scope['branch_id'],
-            'academic_year_id'=>$yearId,
-            'student_id'=>$studentId,
-            'attendance_date'=>trim(
-                (string)$input['attendance_date']
-            ),
-            'status'=>$status,
-            'check_in'=>trim(
-                (string)($input['check_in_time']??'')
-            )?:null,
-            'check_out'=>trim(
-                (string)($input['check_out_time']??'')
-            )?:null,
-            'late_minutes'=>max(
-                0,
-                (int)($input['late_minutes']??0)
-            ),
-            'remarks'=>mb_substr(
-                trim((string)($input['remarks']??'')),
-                0,
-                255
-            ),
-            'source'=>in_array(
-                (string)($input['source']??'manual'),
-                ['manual','biometric','import','api'],
-                true
-            )
-                ?(string)$input['source']
-                :'manual',
-            'marked_by'=>$scope['user_id'],
-        ];
-
-        if($data['branch_id']<=0){
-            throw new InvalidArgumentException(
-                'Branch session was not found.'
-            );
-        }
-
-        if($data['marked_by']<=0){
-            throw new InvalidArgumentException(
-                'Logged-in user session was not found.'
-            );
-        }
-
-        $old=null;
-
-        if($id>0){
-            $find=$pdo->prepare(
-                "SELECT *
-                 FROM student_attendance
-                 WHERE id=:id
-                   AND tenant_id=:tenant_id"
-            );
-            $find->execute([
-                'id'=>$id,
-                'tenant_id'=>$scope['tenant_id'],
-            ]);
-
-            $old=$find->fetch(PDO::FETCH_ASSOC);
-
-            if(!$old){
-                throw new RuntimeException(
-                    'Attendance record not found.',
-                    404
-                );
-            }
-
-            $query=$pdo->prepare(
-                "UPDATE student_attendance SET
-                    branch_id=:branch_id,
-                    academic_year_id=:academic_year_id,
-                    student_id=:student_id,
-                    attendance_date=:attendance_date,
-                    status=:status,
-                    check_in=:check_in,
-                    check_out=:check_out,
-                    late_minutes=:late_minutes,
-                    remarks=:remarks,
-                    source=:source,
-                    marked_by=:marked_by
-                 WHERE id=:id
-                   AND tenant_id=:tenant_id"
-            );
-
-            $query->execute(
-                $data+['id'=>$id]
-            );
-        }else{
-            $query=$pdo->prepare(
-                "INSERT INTO student_attendance(
-                    tenant_id,branch_id,academic_year_id,
-                    student_id,attendance_date,status,
-                    check_in,check_out,late_minutes,
-                    remarks,source,marked_by
-                ) VALUES(
-                    :tenant_id,:branch_id,:academic_year_id,
-                    :student_id,:attendance_date,:status,
-                    :check_in,:check_out,:late_minutes,
-                    :remarks,:source,:marked_by
-                )
-                ON DUPLICATE KEY UPDATE
-                    branch_id=VALUES(branch_id),
-                    academic_year_id=VALUES(academic_year_id),
-                    status=VALUES(status),
-                    check_in=VALUES(check_in),
-                    check_out=VALUES(check_out),
-                    late_minutes=VALUES(late_minutes),
-                    remarks=VALUES(remarks),
-                    source=VALUES(source),
-                    marked_by=VALUES(marked_by)"
-            );
-
-            $query->execute($data);
-            $id=(int)$pdo->lastInsertId();
-
-            if($id===0){
-                $find=$pdo->prepare(
-                    "SELECT id
-                     FROM student_attendance
-                     WHERE student_id=:student_id
-                       AND attendance_date=:attendance_date
-                     LIMIT 1"
-                );
-                $find->execute([
-                    'student_id'=>$studentId,
-                    'attendance_date'=>$data[
-                        'attendance_date'
-                    ],
-                ]);
-                $id=(int)$find->fetchColumn();
-            }
-        }
-
-        logAttendance(
-            $pdo,
-            $scope,
-            $old?'update':'save',
-            $id,
-            $studentId,
-            $old,
-            $data
-        );
-
-        attendanceJson(
-            true,
-            $old
-                ?'Attendance updated successfully.'
-                :'Attendance saved successfully.',
-            ['id'=>$id]
-        );
-    }
-
-    if($action==='bulk_save'){
-        attendanceCsrf($input);
-
-        if(
-            !attendanceCan('edit')
-            &&!attendanceCan('add')
-            &&!attendanceCan('create')
-        ){
-            throw new RuntimeException(
-                'Permission denied.',
-                403
-            );
-        }
-
-        $entries=$input['entries']??[];
-        $yearId=(int)($input['academic_year_id']??0);
-        $classId=(int)($input['class_id']??0);
-        $sectionId=(int)($input['section_id']??0);
-        $attendanceDate=trim(
-            (string)($input['attendance_date']??'')
-        );
-
-        if(!is_array($entries)||$entries===[]){
-            throw new InvalidArgumentException(
-                'Load students before saving attendance.'
-            );
-        }
-
-        if(
-            $yearId<=0
-            ||$classId<=0
-            ||$sectionId<=0
-            ||$attendanceDate===''
-        ){
-            throw new InvalidArgumentException(
-                'Academic year, class, section and attendance date are required.'
-            );
-        }
-
-        $date=DateTimeImmutable::createFromFormat(
-            'Y-m-d',
-            $attendanceDate
-        );
-        $dateErrors=DateTimeImmutable::getLastErrors();
-        $hasDateErrors=is_array($dateErrors)
-            &&(
-                ($dateErrors['warning_count']??0)>0
-                ||($dateErrors['error_count']??0)>0
-            );
-
-        if(
-            !$date
-            ||$hasDateErrors
-            ||$date->format('Y-m-d')!==$attendanceDate
-        ){
-            throw new InvalidArgumentException(
-                'Please select a valid attendance date.'
-            );
-        }
-
-        if($scope['branch_id']<=0||$scope['user_id']<=0){
-            throw new InvalidArgumentException(
-                'Branch or user session was not found.'
-            );
-        }
-
-        $selectionCheck=$pdo->prepare(
-            "SELECT COUNT(*)
-             FROM classes c
-             INNER JOIN sections sec
-                ON sec.class_id=c.id
-               AND sec.tenant_id=c.tenant_id
-             WHERE c.id=:class_id
-               AND sec.id=:section_id
-               AND c.tenant_id=:tenant_id
-               AND c.academic_year_id=:academic_year_id
-               AND c.status='active'
-               AND sec.status='active'"
-        );
-
-        $selectionCheck->execute([
-            'class_id'=>$classId,
-            'section_id'=>$sectionId,
-            'tenant_id'=>$scope['tenant_id'],
-            'academic_year_id'=>$yearId,
-        ]);
-
-        if((int)$selectionCheck->fetchColumn()===0){
-            throw new InvalidArgumentException(
-                'Please select a valid class and section for the selected academic year.'
-            );
-        }
-
-        $existingQuery=$pdo->prepare(
-            "SELECT
-                a.student_id,
-                a.id,
-                a.status,
-                a.remarks
-             FROM student_attendance a
-             INNER JOIN student_enrollments e
-                ON e.student_id=a.student_id
-               AND e.academic_year_id=a.academic_year_id
-               AND e.tenant_id=a.tenant_id
-             WHERE a.tenant_id=:tenant_id
-               AND a.academic_year_id=:academic_year_id
-               AND a.attendance_date=:attendance_date
-               AND e.class_id=:class_id
-               AND e.section_id=:section_id"
-        );
-
-        $existingQuery->execute([
-            'tenant_id'=>$scope['tenant_id'],
-            'academic_year_id'=>$yearId,
-            'attendance_date'=>$attendanceDate,
-            'class_id'=>$classId,
-            'section_id'=>$sectionId,
-        ]);
-
-        $existingByStudent=[];
-
-        foreach(
-            $existingQuery->fetchAll(PDO::FETCH_ASSOC)
-            as $existing
-        ){
-            $existingByStudent[(int)$existing['student_id']]=$existing;
-        }
-
-        $studentCheck=$pdo->prepare(
-            "SELECT COUNT(*)
-             FROM students s
-             INNER JOIN student_enrollments e
-                ON e.student_id=s.id
-               AND e.tenant_id=s.tenant_id
-             WHERE s.id=:student_id
-               AND s.tenant_id=:tenant_id
-               AND (:branch_scope=0 OR s.branch_id=:branch_value)
-               AND s.status='active'
-               AND s.deleted_at IS NULL
-               AND e.academic_year_id=:academic_year_id
-               AND e.class_id=:class_id
-               AND e.section_id=:section_id
-               AND e.enrollment_status='active'"
-        );
-
-        $saveQuery=$pdo->prepare(
-            "INSERT INTO student_attendance(
-                tenant_id,branch_id,academic_year_id,
-                student_id,attendance_date,status,
-                check_in,check_out,late_minutes,
-                remarks,source,marked_by
-            ) VALUES(
-                :tenant_id,:branch_id,:academic_year_id,
-                :student_id,:attendance_date,:status,
-                NULL,NULL,0,
-                :remarks,'manual',:marked_by
-            )
-            ON DUPLICATE KEY UPDATE
-                branch_id=VALUES(branch_id),
-                academic_year_id=VALUES(academic_year_id),
-                status=VALUES(status),
-                check_in=NULL,
-                check_out=NULL,
-                late_minutes=0,
-                remarks=VALUES(remarks),
-                source='manual',
-                marked_by=VALUES(marked_by)"
-        );
-
-        $allowedStatuses=['present','absent','half_day','late','leave','on_duty','holiday'];
-        $savedCount=0;
-        $insertedCount=0;
-        $updatedCount=0;
-
-        $pdo->beginTransaction();
-
-        foreach($entries as $entry){
-            $studentId=(int)($entry['student_id']??0);
-
-            if($studentId<=0){
-                continue;
-            }
-
-            $studentCheck->execute([
-                'student_id'=>$studentId,
-                'tenant_id'=>$scope['tenant_id'],
-                'branch_scope'=>$scope['branch_id'],
-                'branch_value'=>$scope['branch_id'],
-                'academic_year_id'=>$yearId,
-                'class_id'=>$classId,
-                'section_id'=>$sectionId,
-            ]);
-
-            if((int)$studentCheck->fetchColumn()===0){
-                continue;
-            }
-
-            $status=strtolower(
-                trim((string)($entry['status']??'present'))
-            );
-
-            if(!in_array($status,$allowedStatuses,true)){
-                $status='present';
-            }
-
-            $remarks=mb_substr(
-                trim((string)($entry['remarks']??'')),
-                0,
-                255
-            );
-
-            $old=$existingByStudent[$studentId]??null;
-
-            $saveQuery->execute([
-                'tenant_id'=>$scope['tenant_id'],
-                'branch_id'=>$scope['branch_id'],
-                'academic_year_id'=>$yearId,
-                'student_id'=>$studentId,
-                'attendance_date'=>$attendanceDate,
-                'status'=>$status,
-                'remarks'=>$remarks!==''?$remarks:null,
-                'marked_by'=>$scope['user_id'],
-            ]);
-
-            $attendanceId=(int)$pdo->lastInsertId();
-
-            if($attendanceId<=0){
-                $attendanceId=(int)($old['id']??0);
-            }
-
-            if($old){
-                $updatedCount++;
-            }else{
-                $insertedCount++;
-            }
-
-            logAttendance(
-                $pdo,
-                $scope,
-                $old?'update':'save',
-                $attendanceId>0?$attendanceId:null,
-                $studentId,
-                $old,
-                [
-                    'academic_year_id'=>$yearId,
-                    'class_id'=>$classId,
-                    'section_id'=>$sectionId,
-                    'attendance_date'=>$attendanceDate,
-                    'status'=>$status,
-                    'remarks'=>$remarks,
-                ]
-            );
-
-            $savedCount++;
-        }
-
-        if($savedCount===0){
-            throw new InvalidArgumentException(
-                'No valid students were found for the selected class and section.'
-            );
-        }
-
-        $pdo->commit();
-
-        $wasUpdate=$updatedCount>0;
-
-        attendanceJson(
-            true,
-            $wasUpdate
-                ?'Attendance updated successfully.'
-                :'Attendance saved successfully.',
-            [
-                'count'=>$savedCount,
-                'inserted'=>$insertedCount,
-                'updated'=>$updatedCount,
-                'attendance_exists'=>true,
-            ]
-        );
-    }
-
-
-    attendanceJson(
-        false,
-        'Invalid attendance action.',
-        [],
-        400
-    );
-}catch(InvalidArgumentException $error){
-    if($pdo->inTransaction())$pdo->rollBack();
-
-    attendanceJson(
-        false,
-        $error->getMessage(),
-        [],
-        422
-    );
-}catch(RuntimeException $error){
-    if($pdo->inTransaction())$pdo->rollBack();
-
-    $status=(int)$error->getCode();
-
-    attendanceJson(
-        false,
-        $error->getMessage(),
-        [],
-        $status>=400&&$status<=599
-            ?$status
-            :403
-    );
-}catch(Throwable $error){
-    if($pdo->inTransaction())$pdo->rollBack();
-
-    error_log(
-        'attendance.php: '.$error->getMessage()
-    );
-
-    attendanceJson(
-        false,
-        'Attendance request failed: '
-        .$error->getMessage(),
-        [],
-        500
-    );
-}
-
-}
-
 require dirname(__DIR__) . '/includes/layout-start.php';
+
+/*
+ * Use the ERP's existing global common toast component.
+ *
+ * The project common-toast.php exposes:
+ *   showToast(type, message, title)
+ *
+ * No second toast implementation is created on this page.
+ */
+$commonToastFile =
+    dirname(__DIR__)
+    . '/includes/common-toast.php';
+
+if (is_file($commonToastFile)) {
+    require_once $commonToastFile;
+}
+
+unset($commonToastFile);
+
 
 if (session_status() !== PHP_SESSION_ACTIVE) {
     session_start();
@@ -2319,6 +869,7 @@ $csrfToken = $_SESSION['attendance_csrf_token'];
 }
 </style>
 
+<!-- Build: 2026-08-12-attendance-year-wise-class-management-filter-v5 -->
 <div class="att-page">
     <div class="page-heading">
         <div>
@@ -2442,11 +993,11 @@ $csrfToken = $_SESSION['attendance_csrf_token'];
 <div>
 <label class="form-label" for="bulkStudentSearch">Search Students</label>
 <input id="bulkStudentSearch" class="form-control" placeholder="Search name, admission number or roll number...">
-<div id="bulkSelectedCount" class="bulk-selected-count">0 students selected</div>
+<div id="bulkSelectedCount" class="bulk-selected-count">0 students selected · all others stay Present</div>
 </div>
 <label class="bulk-select-all"><input id="bulkSelectAll" class="bulk-check" type="checkbox"> Select All Visible</label>
 <div>
-<label class="form-label" for="bulkApplyStatus">Apply Status *</label>
+<label class="form-label" for="bulkApplyStatus">Apply Status to Selected *</label>
 <select id="bulkApplyStatus" class="form-select">
 <option value="present">Present</option>
 <option value="absent">Absent</option>
@@ -2582,7 +1133,121 @@ async function request(action,data={},method='GET'){
   'Attendance API file was not found.'
  );
 }
-function showMessage(text,success){const box=$('attendanceMessage');box.className='alert att-message show '+(success?'alert-success':'alert-danger');box.textContent=text}
+function showMessage(
+ text,
+ success=false,
+ title=''
+){
+ const message=
+  String(text||'').trim();
+
+ if(!message){
+  return;
+ }
+
+ const type=
+  success
+   ?'success'
+   :'error';
+
+ const toastTitle=
+  String(
+   title
+   ||(
+    success
+     ?'Success'
+     :'Action Failed'
+   )
+  );
+
+ /*
+  * Exact API from includes/common-toast.php.
+  *
+  * showToast is checked first because layout-start.php may provide
+  * a temporary pre-load queue before the toast JS finishes loading.
+  */
+ if(
+  typeof window.showToast
+  ==='function'
+ ){
+  window.showToast(
+   type,
+   message,
+   toastTitle
+  );
+
+  return;
+ }
+
+ /*
+  * Same common toast also exposes:
+  * SchoolToast.show(type, message, title)
+  */
+ if(
+  window.SchoolToast
+  &&typeof window.SchoolToast.show
+   ==='function'
+ ){
+  window.SchoolToast.show(
+   type,
+   message,
+   toastTitle
+  );
+
+  return;
+ }
+
+ /*
+  * Legacy compatibility only.
+  */
+ if(
+  typeof window.schoolToast
+  ==='function'
+ ){
+  window.schoolToast(
+   type,
+   message,
+   toastTitle
+  );
+
+  return;
+ }
+
+ /*
+  * Existing inline alert is retained only as a final fallback.
+  */
+ const box=
+  $('attendanceMessage');
+
+ if(!box){
+  return;
+ }
+
+ box.className=
+  'alert att-message show '
+  +(
+   success
+    ?'alert-success'
+    :'alert-danger'
+  );
+
+ box.textContent=
+  message;
+
+ window.clearTimeout(
+  box._attendanceTimer
+ );
+
+ box._attendanceTimer=
+  window.setTimeout(
+   ()=>{
+    box.className=
+     'alert att-message';
+   },
+   5000
+  );
+}
+
 function fillSelect(id,rows,valueKey,labelKey,keepFirst=false){const el=$(id);const first=keepFirst?(el.options[0]?.outerHTML||''):'';el.innerHTML=first+rows.map(r=>`<option value="${esc(r[valueKey])}">${esc(r[labelKey])}</option>`).join('')}
 function filters(){return{date:$('attendanceDate').value,search:$('searchFilter').value,academic_year_id:$('yearFilter').value,class_id:$('classFilter').value,section_id:$('sectionFilter').value,status:$('statusFilter').value}}
 function statusBadge(status){return `<span class="att-badge ${esc(status)}">${esc(status)}</span>`}
@@ -2701,10 +1366,18 @@ function openForm(row=null){
  $('attendanceId').value=row?.id||'';
  $('attendanceModalTitle').textContent=row?'Edit Attendance':'Mark Attendance';
  $('formDate').value=row?.attendance_date||$('attendanceDate').value;
- $('formYear').value=row?.academic_year_id||'';
- $('formClass').value=row?.class_id||'';
- $('formSection').value=row?.section_id||'';
- $('formStudent').value=row?.student_id||'';
+
+ const defaultYear=Number(
+  row?.academic_year_id
+  ||meta.current_academic_year_id
+  ||meta.academic_years?.[0]?.id
+  ||0
+ );
+ $('formYear').value=defaultYear?String(defaultYear):'';
+ refreshFormClasses(row?.class_id||'');
+ refreshFormSections(row?.section_id||'');
+ refreshFormStudents(row?.student_id||'');
+
  $('formStatus').value=row?.status||'present';
  $('formCheckIn').value=row?.check_in_time||'';
  $('formCheckOut').value=row?.check_out_time||'';
@@ -2712,30 +1385,104 @@ function openForm(row=null){
  $('formRemarks').value=row?.remarks||'';
  bootstrap.Modal.getOrCreateInstance($('attendanceModal')).show();
 }
-function bulkClassesForYear(yearId){
+function attendanceClassesForYear(yearId){
+ const normalized=String(yearId??'').trim();
  return (meta.classes||[]).filter(row=>
-  !yearId||Number(row.academic_year_id)===Number(yearId)
+  normalized===''||normalized==='all'
+   ||Number(row.academic_year_id)===Number(normalized)
  );
 }
-function bulkSectionsForClass(yearId,classId){
+function attendanceSectionsForClass(yearId,classId){
+ const normalizedYear=String(yearId??'').trim();
+ const normalizedClass=String(classId??'').trim();
  return (meta.sections||[]).filter(row=>
-  (!yearId||Number(row.academic_year_id)===Number(yearId))
-  &&(!classId||Number(row.class_id)===Number(classId))
+  (normalizedYear===''||normalizedYear==='all'
+   ||Number(row.academic_year_id)===Number(normalizedYear))
+  &&(normalizedClass===''||normalizedClass==='all'
+   ||Number(row.class_id)===Number(normalizedClass))
+ );
+}
+function attendanceStudentsForSelection(yearId,classId,sectionId){
+ const normalizedYear=String(yearId??'').trim();
+ const normalizedClass=String(classId??'').trim();
+ const normalizedSection=String(sectionId??'').trim();
+
+ return (students||[]).filter(row=>
+  (normalizedYear===''||normalizedYear==='all'
+   ||Number(row.academic_year_id)===Number(normalizedYear))
+  &&(normalizedClass===''||normalizedClass==='all'
+   ||Number(row.class_id)===Number(normalizedClass))
+  &&(normalizedSection===''||normalizedSection==='all'
+   ||Number(row.section_id)===Number(normalizedSection))
  );
 }
 function refreshBulkClasses(selectedValue=''){
- const yearId=Number($('bulkYear').value||0);
- const rows=bulkClassesForYear(yearId);
+ const yearId=$('bulkYear').value;
+ const rows=attendanceClassesForYear(yearId);
  fillSelect('bulkClass',rows,'id','class_name',true);
  $('bulkClass').value=String(selectedValue||'');
  refreshBulkSections();
 }
 function refreshBulkSections(selectedValue=''){
- const yearId=Number($('bulkYear').value||0);
- const classId=Number($('bulkClass').value||0);
- const rows=bulkSectionsForClass(yearId,classId);
+ const yearId=$('bulkYear').value;
+ const classId=$('bulkClass').value;
+ const rows=attendanceSectionsForClass(yearId,classId);
  fillSelect('bulkSection',rows,'id','section_name',true);
  $('bulkSection').value=String(selectedValue||'');
+}
+function refreshFilterClasses(selectedValue='all'){
+ const yearId=$('yearFilter').value;
+ const rows=attendanceClassesForYear(yearId);
+ fillSelect('classFilter',rows,'id','class_name',true);
+
+ const allowed=rows.some(row=>String(row.id)===String(selectedValue));
+ $('classFilter').value=allowed?String(selectedValue):'all';
+ refreshFilterSections();
+}
+function refreshFilterSections(selectedValue='all'){
+ const yearId=$('yearFilter').value;
+ const classId=$('classFilter').value;
+ const rows=attendanceSectionsForClass(yearId,classId);
+ fillSelect('sectionFilter',rows,'id','section_name',true);
+
+ const allowed=rows.some(row=>String(row.id)===String(selectedValue));
+ $('sectionFilter').value=allowed?String(selectedValue):'all';
+}
+function refreshFormClasses(selectedValue=''){
+ const yearId=$('formYear').value;
+ const rows=attendanceClassesForYear(yearId);
+ const el=$('formClass');
+ el.innerHTML='<option value="">Select Class</option>'
+  +rows.map(row=>`<option value="${esc(row.id)}">${esc(row.class_name)}</option>`).join('');
+
+ const allowed=rows.some(row=>String(row.id)===String(selectedValue));
+ el.value=allowed?String(selectedValue):'';
+ refreshFormSections();
+}
+function refreshFormSections(selectedValue=''){
+ const yearId=$('formYear').value;
+ const classId=$('formClass').value;
+ const rows=attendanceSectionsForClass(yearId,classId);
+ const el=$('formSection');
+ el.innerHTML='<option value="">Select Section</option>'
+  +rows.map(row=>`<option value="${esc(row.id)}">${esc(row.section_name)}</option>`).join('');
+
+ const allowed=rows.some(row=>String(row.id)===String(selectedValue));
+ el.value=allowed?String(selectedValue):'';
+ refreshFormStudents();
+}
+function refreshFormStudents(selectedValue=''){
+ const rows=attendanceStudentsForSelection(
+  $('formYear').value,
+  $('formClass').value,
+  $('formSection').value
+ );
+ const el=$('formStudent');
+ el.innerHTML='<option value="">Select Student</option>'
+  +rows.map(row=>`<option value="${esc(row.id)}">${esc(row.student_name)}</option>`).join('');
+
+ const allowed=rows.some(row=>String(row.id)===String(selectedValue));
+ el.value=allowed?String(selectedValue):'';
 }
 function setBulkStatus(messageText,type='info'){
  const box=$('bulkLoadStatus');
@@ -2764,7 +1511,7 @@ function resetBulkRegister(messageText='Select Academic Year, Class, Section and
  $('bulkSelectAll').indeterminate=false;
  $('bulkApplyStatus').value='present';
  $('bulkSelectedCount').textContent='0 students selected';
- $('bulkSaveBtn').innerHTML='<i data-lucide="save"></i> Update Selected';
+ $('bulkSaveBtn').innerHTML='<i data-lucide="save"></i> Save Attendance';
  clearBulkStatus();
  refreshLucideIcons();
 }
@@ -2782,6 +1529,50 @@ function bulkStatusLabel(status){
   on_duty:'On Duty',
   holiday:'Holiday'
  })[status]||status;
+}
+function setBulkRowStatus(row,status){
+ const normalized=
+  normalizedBulkStatus(status);
+
+ row.dataset.currentStatus=
+  normalized;
+
+ const badge=
+  row.querySelector('.att-badge');
+
+ if(badge){
+  badge.className=
+   `att-badge ${normalized}`;
+
+  badge.textContent=
+   bulkStatusLabel(normalized);
+ }
+
+ return normalized;
+}
+
+function applyStatusToSelectedRows(){
+ const selected=
+  selectedBulkRows();
+
+ if(!selected.length){
+  return;
+ }
+
+ const status=
+  normalizedBulkStatus(
+   $('bulkApplyStatus').value
+  );
+
+ selected.forEach(row=>{
+  setBulkRowStatus(
+   row,
+   status
+  );
+ });
+
+ updateBulkCounts();
+ updateBulkSelectionState();
 }
 function updateBulkCounts(){
  const rows=[...document.querySelectorAll('.bulk-row[data-student]')];
@@ -2820,7 +1611,7 @@ function updateBulkSelectionState(){
  const selected=selectedBulkRows();
 
  $('bulkSelectedCount').textContent=
-  `${selected.length.toLocaleString()} student${selected.length===1?'':'s'} selected`;
+  `${selected.length.toLocaleString()} student${selected.length===1?'':'s'} selected · all unselected students remain Present`;
 
  $('bulkSelectAll').checked=
   visible.length>0&&visibleChecked.length===visible.length;
@@ -2834,7 +1625,11 @@ function updateBulkSelectionState(){
   );
  });
 
- $('bulkSaveBtn').disabled=!bulkLoaded||selected.length===0;
+ $('bulkSaveBtn').disabled=
+  !bulkLoaded
+  ||document.querySelectorAll(
+   '.bulk-row[data-student]'
+  ).length===0;
 }
 function filterBulkStudents(){
  const query=$('bulkStudentSearch').value.trim().toLowerCase();
@@ -2874,8 +1669,33 @@ function renderBulkStudents(rows=[]){
  $('bulkSelectAll').checked=false;
  $('bulkSelectAll').indeterminate=false;
 
- document.querySelectorAll('.bulk-student-check').forEach(check=>{
-  check.addEventListener('change',updateBulkSelectionState);
+ document.querySelectorAll(
+  '.bulk-student-check'
+ ).forEach(check=>{
+  check.addEventListener(
+   'change',
+   ()=>{
+    const row=
+     check.closest(
+      '.bulk-row[data-student]'
+     );
+
+    if(
+     check.checked
+     &&row
+     &&$('bulkApplyStatus').value!=='present'
+    ){
+     setBulkRowStatus(
+      row,
+      $('bulkApplyStatus').value
+     );
+
+     updateBulkCounts();
+    }
+
+    updateBulkSelectionState();
+   }
+  );
  });
 
  updateBulkCounts();
@@ -2911,20 +1731,30 @@ async function loadBulkStudents(){
   const total=Number(result.data.counts?.total||0);
   $('bulkSaveBtn').disabled=total===0;
   $('bulkSaveBtn').innerHTML=bulkExisting
-   ?'<i data-lucide="save"></i> Update Selected'
-   :'<i data-lucide="save"></i> Update Selected';
+   ?'<i data-lucide="save"></i> Update Attendance'
+   :'<i data-lucide="save"></i> Save Attendance';
   $('bulkRegisterNote').textContent=bulkExisting
-   ?`Existing attendance loaded for ${total} student${total===1?'':'s'}. You can update it.`
-   :`${total} student${total===1?'':'s'} loaded. All students are Present by default.`;
+   ?`Existing attendance loaded for ${total} student${total===1?'':'s'}. Existing statuses are preserved; change only the students you need.`
+   :`${total} student${total===1?'':'s'} loaded. All students are Present by default. Select only exceptions such as Absent, Leave, Late or Half Day.`;
+
   setBulkStatus(
    bulkExisting
-    ?'Attendance already exists for this date. Existing values have been loaded.'
-    :'Students loaded successfully. Select students and apply a status.',
+    ?'Existing attendance values loaded. Select only the students whose status you want to change.'
+    :'All students are Present by default. Select students only when you need to change their status.',
    bulkExisting?'warning':'success'
   );
  }catch(error){
   resetBulkRegister();
-  setBulkStatus(error.message,'danger');
+  setBulkStatus(
+   error.message,
+   'danger'
+  );
+
+  showMessage(
+   error.message,
+   false,
+   'Attendance Error'
+  );
  }finally{
   $('bulkLoadBtn').disabled=false;
   $('bulkLoadBtn').innerHTML='<i data-lucide="users"></i> Load Students';
@@ -2949,14 +1779,13 @@ async function loadMeta(){
  students=meta.students||[];
 
  fillSelect('yearFilter',meta.academic_years||[],'id','year_name',true);
- fillSelect('classFilter',meta.classes||[],'id','class_name',true);
- fillSelect('sectionFilter',meta.sections||[],'id','section_name',true);
  fillSelect('statusFilter',(meta.statuses||[]).map(v=>({id:v,name:v})),'id','name',true);
+ refreshFilterClasses();
 
  fillSelect('formYear',meta.academic_years||[],'id','year_name');
- fillSelect('formClass',meta.classes||[],'id','class_name');
- fillSelect('formSection',meta.sections||[],'id','section_name',true);
- fillSelect('formStudent',students,'id','student_name');
+ const formDefaultYear=Number(meta.current_academic_year_id||meta.academic_years?.[0]?.id||0);
+ $('formYear').value=formDefaultYear?String(formDefaultYear):'';
+ refreshFormClasses();
 
  fillSelect('bulkYear',meta.academic_years||[],'id','year_name');
  const defaultYear=Number(meta.current_academic_year_id||meta.academic_years?.[0]?.id||0);
@@ -2979,8 +1808,24 @@ $('attendanceForm').onsubmit=async e=>{
  const student=$('formStudent'),year=$('formYear'),cls=$('formClass'),sec=$('formSection');
  try{
   const r=await request('save',{id:Number($('attendanceId').value||0),attendance_date:$('formDate').value,academic_year_id:Number(year.value),academic_year_name:year.options[year.selectedIndex]?.text||'',class_id:Number(cls.value),class_name:cls.options[cls.selectedIndex]?.text||'',section_id:Number(sec.value||0),section_name:sec.options[sec.selectedIndex]?.text||'',student_id:Number(student.value),student_name:student.options[student.selectedIndex]?.text||'',status:$('formStatus').value,check_in_time:$('formCheckIn').value,check_out_time:$('formCheckOut').value,source:$('formSource').value,remarks:$('formRemarks').value},'POST');
-  bootstrap.Modal.getInstance($('attendanceModal'))?.hide();showMessage(r.message,true);await load();
- }catch(err){showMessage(err.message,false)}
+  bootstrap.Modal.getInstance(
+   $('attendanceModal')
+  )?.hide();
+
+  showMessage(
+   r.message,
+   true,
+   'Attendance Saved'
+  );
+
+  await load();
+ }catch(err){
+  showMessage(
+   err.message,
+   false,
+   'Attendance Error'
+  );
+ }
 };
 $('bulkForm').onsubmit=async e=>{
  e.preventDefault();
@@ -2990,17 +1835,35 @@ $('bulkForm').onsubmit=async e=>{
   return;
  }
 
- const selectedRows=selectedBulkRows();
- const appliedStatus=normalizedBulkStatus($('bulkApplyStatus').value);
+ const allRows=[
+  ...document.querySelectorAll(
+   '.bulk-row[data-student]'
+  )
+ ];
 
- const entries=selectedRows.map(row=>({
-  student_id:Number(row.dataset.student),
-  status:appliedStatus,
-  remarks:row.querySelector('.bulk-remark')?.value||''
- }));
+ const entries=
+  allRows.map(row=>({
+   student_id:
+    Number(
+     row.dataset.student
+    ),
+   status:
+    normalizedBulkStatus(
+     row.dataset.currentStatus
+     ||'present'
+    ),
+   remarks:
+    row.querySelector(
+     '.bulk-remark'
+    )?.value
+    ||''
+  }));
 
  if(entries.length===0){
-  setBulkStatus('Select at least one student before updating attendance.','warning');
+  setBulkStatus(
+   'No students are loaded for attendance.',
+   'warning'
+  );
   return;
  }
 
@@ -3023,31 +1886,41 @@ $('bulkForm').onsubmit=async e=>{
 
   bulkExisting=true;
 
-  selectedRows.forEach(row=>{
-   row.dataset.currentStatus=appliedStatus;
-   const badge=row.querySelector('.att-badge');
-
-   if(badge){
-    badge.className=`att-badge ${appliedStatus}`;
-    badge.textContent=bulkStatusLabel(appliedStatus);
-   }
-
-   const checkbox=row.querySelector('.bulk-student-check');
-   if(checkbox)checkbox.checked=false;
+  document.querySelectorAll(
+   '.bulk-student-check'
+  ).forEach(checkbox=>{
+   checkbox.checked=false;
   });
 
   updateBulkCounts();
   updateBulkSelectionState();
-  showMessage(result.message,true);
+
+  showMessage(
+   result.message,
+   true,
+   'Attendance Saved'
+  );
+
   setBulkStatus(
-   `${result.message} ${entries.length} selected student${entries.length===1?'':'s'} updated as ${bulkStatusLabel(appliedStatus)}.`,
+   `${result.message} ${entries.length} student${entries.length===1?'':'s'} saved. Unchanged students remain Present.`,
    'success'
   );
-  $('bulkSaveBtn').innerHTML='<i data-lucide="save"></i> Update Selected';
+
+  $('bulkSaveBtn').innerHTML=
+   '<i data-lucide="save"></i> Update Attendance';
+
   await load();
  }catch(error){
-  setBulkStatus(error.message,'danger');
-  showMessage(error.message,false);
+  setBulkStatus(
+   error.message,
+   'danger'
+  );
+
+  showMessage(
+   error.message,
+   false,
+   'Attendance Error'
+  );
  }finally{
   saveButton.disabled=false;
   refreshLucideIcons();
@@ -3064,11 +1937,18 @@ $('bulkSelectAll').addEventListener('change',()=>{
  });
  updateBulkSelectionState();
 });
-$('bulkApplyStatus').addEventListener('change',updateBulkSelectionState);
+$('bulkApplyStatus').addEventListener(
+ 'change',
+ ()=>{
+  applyStatusToSelectedRows();
+ }
+);
 $('filterBtn').onclick=()=>$('attendanceFilters').classList.toggle('show');
 $('resetFiltersBtn').onclick=()=>{
  $('searchFilter').value='';
- ['yearFilter','classFilter','sectionFilter','statusFilter'].forEach(id=>$(id).value='all');
+ $('yearFilter').value='all';
+ $('statusFilter').value='all';
+ refreshFilterClasses();
  load();
 };
 $('bulkYear').onchange=()=>{
@@ -3081,11 +1961,45 @@ $('bulkClass').onchange=()=>{
 };
 $('bulkSection').onchange=()=>resetBulkRegister();
 $('bulkDate').onchange=()=>resetBulkRegister();
-['attendanceDate','yearFilter','classFilter','sectionFilter','statusFilter'].forEach(id=>$(id).addEventListener('change',load));
+
+$('yearFilter').addEventListener('change',()=>{
+ refreshFilterClasses();
+ load();
+});
+$('classFilter').addEventListener('change',()=>{
+ refreshFilterSections();
+ load();
+});
+$('sectionFilter').addEventListener('change',load);
+$('statusFilter').addEventListener('change',load);
+$('attendanceDate').addEventListener('change',load);
+
+$('formYear').addEventListener('change',()=>{
+ refreshFormClasses();
+});
+$('formClass').addEventListener('change',()=>{
+ refreshFormSections();
+});
+$('formSection').addEventListener('change',()=>{
+ refreshFormStudents();
+});
+
 $('searchFilter').addEventListener('input',load);
 $('attendanceDate').value=new Date().toISOString().slice(0,10);
 $('bulkDate').value=$('attendanceDate').value;
-(async()=>{try{await loadMeta();await load();window.lucide?.createIcons()}catch(e){showMessage(e.message,false)}})();
+(async()=>{
+ try{
+  await loadMeta();
+  await load();
+  window.lucide?.createIcons();
+ }catch(e){
+  showMessage(
+   e.message,
+   false,
+   'Attendance Error'
+  );
+ }
+})();
 })();
 </script>
 <?php require dirname(__DIR__) . '/includes/layout-end.php'; ?>

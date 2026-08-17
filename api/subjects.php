@@ -1,15 +1,14 @@
 <?php
 declare(strict_types=1);
 
+define('SCHOOL_API_PAGE_KEY','subjects');
+
 ob_start();
 ini_set('display_errors','0');
 
-$originalScriptName=(string)($_SERVER['SCRIPT_NAME']??'');
-$_SERVER['SCRIPT_NAME']='/login.php';
 require_once dirname(__DIR__).'/includes/bootstrap.php';
-$_SERVER['SCRIPT_NAME']=$originalScriptName;
 
-/* Build: 2026-08-10-subjects-classwise-reference-layout-v4 */
+/* Build: 2026-08-15-subject-branch-context-v7 */
 
 set_error_handler(
     static function(int $severity,string $message,string $file,int $line): bool {
@@ -113,6 +112,138 @@ function subjectsIndexExists(PDO $pdo,string $table,string $index): bool
     return (int)$s->fetchColumn()>0;
 }
 
+
+function subjectsResolveSchoolScope(PDO $pdo): array
+{
+    if(session_status()!==PHP_SESSION_ACTIVE){
+        session_start();
+    }
+
+    $user=function_exists('current_user')?current_user():[];
+    $user=is_array($user)?$user:[];
+
+    $tenantId=(int)(
+        $user['tenant_id']
+        ??$user['school_id']
+        ??$_SESSION['tenant_id']
+        ??$_SESSION['school_id']
+        ??$_SESSION['tenant']['id']
+        ??0
+    );
+
+    $branchId=(int)(
+        $user['branch_id']
+        ??$user['default_branch_id']
+        ??$_SESSION['branch_id']
+        ??$_SESSION['default_branch_id']
+        ??0
+    );
+
+    $userId=(int)(
+        $user['id']
+        ??$user['user_id']
+        ??$_SESSION['user_id']
+        ??0
+    );
+
+    if($tenantId<=0){
+        throw new RuntimeException(
+            'School tenant session was not found. Sign out and sign in again.',
+            401
+        );
+    }
+
+    /*
+     * Some older School sessions contain the School ID but not branch_id.
+     * Resolve the logged user's default branch first.
+     */
+    if(
+        $branchId<=0
+        &&$userId>0
+        &&subjectsTableExists($pdo,'users')
+        &&subjectsColumnExists($pdo,'users','default_branch_id')
+    ){
+        $s=$pdo->prepare(
+            "SELECT default_branch_id
+             FROM users
+             WHERE id=:user_id
+               AND tenant_id=:tenant_id
+               AND deleted_at IS NULL
+             LIMIT 1"
+        );
+        $s->execute([
+            'user_id'=>$userId,
+            'tenant_id'=>$tenantId,
+        ]);
+        $branchId=(int)$s->fetchColumn();
+    }
+
+    /*
+     * School-level administrator accounts may have no explicit default branch.
+     * In that case use the active main branch for the same school only.
+     */
+    if($branchId<=0&&subjectsTableExists($pdo,'branches')){
+        $s=$pdo->prepare(
+            "SELECT id
+             FROM branches
+             WHERE tenant_id=:tenant_id
+               AND status='active'
+             ORDER BY is_main DESC,id ASC
+             LIMIT 1"
+        );
+        $s->execute(['tenant_id'=>$tenantId]);
+        $branchId=(int)$s->fetchColumn();
+    }
+
+    if($branchId<=0){
+        throw new RuntimeException(
+            'Active School and Branch context is required. Select or assign an active branch to this School Admin.',
+            422
+        );
+    }
+
+    if(subjectsTableExists($pdo,'branches')){
+        $s=$pdo->prepare(
+            "SELECT COUNT(*)
+             FROM branches
+             WHERE id=:branch_id
+               AND tenant_id=:tenant_id
+               AND status='active'"
+        );
+        $s->execute([
+            'branch_id'=>$branchId,
+            'tenant_id'=>$tenantId,
+        ]);
+
+        if((int)$s->fetchColumn()<=0){
+            throw new RuntimeException(
+                'The active Branch does not belong to this School.',
+                403
+            );
+        }
+    }
+
+    /*
+     * Your DB triggers read these connection variables. Set them on this
+     * exact PDO connection before any INSERT/UPDATE/DELETE.
+     */
+    $s=$pdo->prepare(
+        "SET @schoolerp_tenant_id=:tenant_id,
+             @schoolerp_branch_id=:branch_id"
+    );
+    $s->execute([
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+    ]);
+
+    return [
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+        'user_id'=>$userId,
+        'user'=>$user,
+    ];
+}
+
 function subjectsLength(string $value): int
 {
     return function_exists('mb_strlen')
@@ -126,6 +257,7 @@ function subjectsEnsureSchema(PDO $pdo): void
         "CREATE TABLE IF NOT EXISTS school_subjects (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             tenant_id BIGINT UNSIGNED NOT NULL,
+            branch_id BIGINT UNSIGNED NOT NULL,
             academic_year_id BIGINT UNSIGNED NOT NULL,
             class_id BIGINT UNSIGNED NULL,
             class_name VARCHAR(150) NULL,
@@ -160,6 +292,7 @@ function subjectsEnsureSchema(PDO $pdo): void
     );
 
     $columns=[
+        'branch_id'=>"BIGINT UNSIGNED NULL AFTER tenant_id",
         'class_id'=>"BIGINT UNSIGNED NULL AFTER academic_year_id",
         'class_name'=>"VARCHAR(150) NULL AFTER class_id",
         'book_name'=>"VARCHAR(200) NOT NULL DEFAULT '' AFTER subject_code",
@@ -200,6 +333,7 @@ function subjectsEnsureSchema(PDO $pdo): void
         "CREATE TABLE IF NOT EXISTS subject_class_assignments (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             tenant_id BIGINT UNSIGNED NOT NULL,
+            branch_id BIGINT UNSIGNED NOT NULL,
             subject_id BIGINT UNSIGNED NOT NULL,
             class_id BIGINT UNSIGNED NOT NULL,
             class_name VARCHAR(150) NOT NULL,
@@ -218,6 +352,16 @@ function subjectsEnsureSchema(PDO $pdo): void
           DEFAULT CHARSET=utf8mb4
           COLLATE=utf8mb4_unicode_ci"
     );
+
+    if(
+        subjectsTableExists($pdo,'subject_class_assignments')
+        &&!subjectsColumnExists($pdo,'subject_class_assignments','branch_id')
+    ){
+        $pdo->exec(
+            "ALTER TABLE subject_class_assignments
+             ADD COLUMN branch_id BIGINT UNSIGNED NULL AFTER tenant_id"
+        );
+    }
 
     if(
         subjectsTableExists($pdo,'subject_class_assignments')
@@ -243,14 +387,120 @@ function subjectsEnsureSchema(PDO $pdo): void
     }
 }
 
+function subjectsNormalName(string $value): string
+{
+    $value=trim(
+        function_exists('mb_strtolower')
+            ?mb_strtolower($value,'UTF-8')
+            :strtolower($value)
+    );
+    return preg_replace('/\s+/u',' ',$value)??$value;
+}
+
+/**
+ * Return one effective Class Management row per Academic Year + Class Name.
+ * Subject Management is class-wise, not section-wise, so A/General/B rows
+ * must not become duplicate class tabs. General is preferred when present.
+ */
+function subjectsEffectiveClasses(PDO $pdo,int $tenantId,int $branchId): array
+{
+    if(
+        $tenantId<=0
+        ||$branchId<=0
+        ||!subjectsTableExists($pdo,'class_management_classes')
+    ){
+        return [];
+    }
+
+    $hasCode=subjectsColumnExists($pdo,'class_management_classes','class_code');
+    $hasYear=subjectsColumnExists($pdo,'class_management_classes','academic_year_id');
+    $hasStatus=subjectsColumnExists($pdo,'class_management_classes','status');
+    $hasOrder=subjectsColumnExists($pdo,'class_management_classes','display_order');
+    $hasSection=subjectsColumnExists($pdo,'class_management_classes','section_name');
+    $hasBranch=subjectsColumnExists($pdo,'class_management_classes','branch_id');
+
+    $codeSql=$hasCode?"COALESCE(class_code,'')":"''";
+    $yearSql=$hasYear?'academic_year_id':'0';
+    $statusSql=$hasStatus?"COALESCE(status,'active')":"'active'";
+    $orderSql=$hasOrder?'display_order':'0';
+    $sectionSql=$hasSection?"COALESCE(section_name,'')":"''";
+
+    $sql=
+        "SELECT id,class_name,
+                {$codeSql} AS class_code,
+                {$yearSql} AS academic_year_id,
+                {$statusSql} AS status,
+                {$orderSql} AS display_order,
+                {$sectionSql} AS section_name
+         FROM class_management_classes
+         WHERE tenant_id=:tenant_id";
+
+    $params=['tenant_id'=>$tenantId];
+
+    if($hasBranch){
+        $sql.=" AND branch_id=:branch_id";
+        $params['branch_id']=$branchId;
+    }
+
+    if($hasStatus){
+        $sql.=" AND COALESCE(status,'active')<>'archived'";
+    }
+
+    $sql.="
+         ORDER BY {$yearSql},
+                  CASE WHEN LOWER(TRIM({$sectionSql}))='general' THEN 0 ELSE 1 END,
+                  {$orderSql},class_name,id";
+
+    $s=$pdo->prepare($sql);
+    $s->execute($params);
+    $rows=$s->fetchAll(PDO::FETCH_ASSOC);
+
+    $effective=[];
+    foreach($rows as $row){
+        $yearId=(int)($row['academic_year_id']??0);
+        $name=trim((string)($row['class_name']??''));
+        if($name==='')continue;
+
+        $key=$yearId.'|'.subjectsNormalName($name);
+        if(isset($effective[$key]))continue;
+
+        $row['id']=(int)$row['id'];
+        $row['academic_year_id']=$yearId;
+        $row['display_order']=(int)($row['display_order']??0);
+        $effective[$key]=$row;
+    }
+
+    return array_values($effective);
+}
+
+function subjectsEffectiveClassMaps(PDO $pdo,int $tenantId,int $branchId): array
+{
+    $byKey=[];
+    $byId=[];
+
+    foreach(subjectsEffectiveClasses($pdo,$tenantId,$branchId) as $row){
+        $key=(int)$row['academic_year_id'].'|'.subjectsNormalName((string)$row['class_name']);
+        $byKey[$key]=$row;
+        $byId[(int)$row['id']]=$row;
+    }
+
+    return ['by_key'=>$byKey,'by_id'=>$byId];
+}
+
 final class SubjectsManagementModel
 {
     public function __construct(private PDO $pdo) {}
 
-    public function listSubjects(int $tenantId,array $filters=[]): array
+    public function listSubjects(int $tenantId,int $branchId,array $filters=[]): array
     {
-        $where=['s.tenant_id=:tenant_id'];
-        $params=['tenant_id'=>$tenantId];
+        $where=[
+            's.tenant_id=:tenant_id',
+            's.branch_id=:branch_id',
+        ];
+        $params=[
+            'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
+        ];
 
         $yearId=(int)($filters['academic_year_id']??0);
         $classId=(int)($filters['class_id']??0);
@@ -260,20 +510,30 @@ final class SubjectsManagementModel
             $params['academic_year_id']=$yearId;
         }
 
+        /*
+         * Existing subject rows may contain an OLD class_management_classes.id
+         * after a class was deleted/re-created. Resolve the selected current
+         * class by Year + Class Name as well as by its current ID.
+         */
         if($classId>0){
-            $where[]='s.class_id=:class_id';
-            $params['class_id']=$classId;
+            $selected=$this->schoolClass($tenantId,$branchId,$classId,$yearId);
+            if($selected){
+                $where[]="(s.class_id=:class_id OR LOWER(TRIM(COALESCE(s.class_name,'')))=LOWER(TRIM(:filter_class_name)))";
+                $params['class_id']=$classId;
+                $params['filter_class_name']=(string)$selected['class_name'];
+            }else{
+                $where[]='s.class_id=:class_id';
+                $params['class_id']=$classId;
+            }
         }
 
         $status=strtolower(trim((string)($filters['status']??'')));
-
         if($status!==''&&$status!=='all'){
             $where[]='s.status=:status';
             $params['status']=$status;
         }
 
         $search=trim((string)($filters['search']??''));
-
         if($search!==''){
             $where[]=
                 "(s.subject_name LIKE :search_subject
@@ -290,64 +550,81 @@ final class SubjectsManagementModel
             $params['search_department']=$like;
         }
 
-        $hasClassCode=subjectsColumnExists(
-            $this->pdo,
-            'class_management_classes',
-            'class_code'
-        );
-
-        $classCodeSql=$hasClassCode
-            ?"COALESCE(cmc.class_code,'')"
-            :"''";
-
         $sql=
-            "SELECT
-                s.*,
-                ay.year_name AS academic_year_name,
-                COALESCE(NULLIF(s.class_name,''),cmc.class_name)
-                    AS resolved_class_name,
-                {$classCodeSql} AS class_code
+            "SELECT s.*,ay.year_name AS academic_year_name
              FROM school_subjects s
              LEFT JOIN academic_years ay
                 ON ay.id=s.academic_year_id
                AND ay.tenant_id=s.tenant_id
-             LEFT JOIN class_management_classes cmc
-                ON cmc.id=s.class_id
-               AND cmc.tenant_id=s.tenant_id
              WHERE ".implode(' AND ',$where)."
-             ORDER BY
-                cmc.class_name,
-                s.display_order,
-                s.subject_name,
-                s.id";
+             ORDER BY s.academic_year_id,s.display_order,s.subject_name,s.id";
 
         $s=$this->pdo->prepare($sql);
         $s->execute($params);
         $rows=$s->fetchAll(PDO::FETCH_ASSOC);
 
+        $maps=subjectsEffectiveClassMaps($this->pdo,$tenantId,$branchId);
+        $byKey=$maps['by_key'];
+        $byId=$maps['by_id'];
+
         foreach($rows as &$row){
-            $row['class_name']=
-                $row['resolved_class_name']
-                ??$row['class_name']
-                ??'';
+            $storedId=(int)($row['class_id']??0);
+            $row['stored_class_id']=$storedId;
+            $subjectYearId=(int)($row['academic_year_id']??0);
+            $storedName=trim((string)($row['class_name']??''));
+
+            $resolved=null;
+
+            /* Exact current ID first. */
+            if($storedId>0&&isset($byId[$storedId])){
+                $candidate=$byId[$storedId];
+                if((int)$candidate['academic_year_id']===$subjectYearId){
+                    $resolved=$candidate;
+                }
+            }
+
+            /* Stale/missing ID: recover by the saved Year + Class Name. */
+            if(!$resolved&&$storedName!==''){
+                $key=$subjectYearId.'|'.subjectsNormalName($storedName);
+                $resolved=$byKey[$key]??null;
+            }
+
+            if($resolved){
+                $row['class_id']=(int)$resolved['id'];
+                $row['class_name']=(string)$resolved['class_name'];
+                $row['class_code']=(string)($resolved['class_code']??'');
+                $row['class_resolution']=$storedId===(int)$resolved['id']
+                    ?'current_id'
+                    :'matched_by_year_and_name';
+                $row['is_unassigned']=0;
+            }else{
+                /* Never hide legacy/orphan rows. Frontend shows Unassigned. */
+                $row['class_id']=0;
+                $row['class_code']='';
+                $row['class_name']=$storedName!==''?$storedName:'Unassigned';
+                $row['class_resolution']='unassigned_or_removed_class';
+                $row['is_unassigned']=1;
+            }
         }
         unset($row);
 
         return $rows;
     }
 
-    public function findSubject(int $tenantId,int $id): ?array
+    public function findSubject(int $tenantId,int $branchId,int $id): ?array
     {
         $s=$this->pdo->prepare(
             "SELECT *
              FROM school_subjects
              WHERE id=:id
                AND tenant_id=:tenant_id
+               AND branch_id=:branch_id
              LIMIT 1"
         );
         $s->execute([
             'id'=>$id,
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
         ]);
         return $s->fetch(PDO::FETCH_ASSOC)?:null;
     }
@@ -368,7 +645,7 @@ final class SubjectsManagementModel
         return $s->fetch(PDO::FETCH_ASSOC)?:null;
     }
 
-    public function schoolClass(int $tenantId,int $classId,int $yearId): ?array
+    public function schoolClass(int $tenantId,int $branchId,int $classId,int $yearId): ?array
     {
         if(!subjectsTableExists($this->pdo,'class_management_classes')){
             return null;
@@ -384,6 +661,12 @@ final class SubjectsManagementModel
             $this->pdo,
             'class_management_classes',
             'class_code'
+        );
+
+        $hasBranch=subjectsColumnExists(
+            $this->pdo,
+            'class_management_classes',
+            'branch_id'
         );
 
         $codeSql=$hasCode?"COALESCE(class_code,'')":"''";
@@ -402,6 +685,11 @@ final class SubjectsManagementModel
             'id'=>$classId,
         ];
 
+        if($hasBranch){
+            $sql.=" AND branch_id=:branch_id";
+            $params['branch_id']=$branchId;
+        }
+
         if($hasYear&&$yearId>0){
             $sql.=" AND academic_year_id=:academic_year_id";
             $params['academic_year_id']=$yearId;
@@ -414,27 +702,45 @@ final class SubjectsManagementModel
         return $s->fetch(PDO::FETCH_ASSOC)?:null;
     }
 
+    private function currentClassName(int $tenantId,int $branchId,int $yearId,int $classId): string
+    {
+        $class=$this->schoolClass($tenantId,$branchId,$classId,$yearId);
+        return trim((string)($class['class_name']??''));
+    }
+
     public function duplicateNameExists(
         int $tenantId,
+        int $branchId,
         int $yearId,
         int $classId,
         string $name,
         int $excludeId=0
     ): bool {
+        $className=$this->currentClassName($tenantId,$branchId,$yearId,$classId);
+
         $sql=
             "SELECT id
              FROM school_subjects
              WHERE tenant_id=:tenant_id
+               AND branch_id=:branch_id
                AND academic_year_id=:academic_year_id
-               AND class_id=:class_id
                AND LOWER(TRIM(subject_name))=LOWER(TRIM(:subject_name))";
 
         $params=[
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
             'academic_year_id'=>$yearId,
-            'class_id'=>$classId,
             'subject_name'=>$name,
         ];
+
+        if($className!==''){
+            $sql.=" AND (class_id=:class_id OR LOWER(TRIM(COALESCE(class_name,'')))=LOWER(TRIM(:class_name)))";
+            $params['class_id']=$classId;
+            $params['class_name']=$className;
+        }else{
+            $sql.=' AND class_id=:class_id';
+            $params['class_id']=$classId;
+        }
 
         if($excludeId>0){
             $sql.=" AND id<>:exclude_id";
@@ -448,25 +754,37 @@ final class SubjectsManagementModel
 
     public function duplicateCodeExists(
         int $tenantId,
+        int $branchId,
         int $yearId,
         int $classId,
         string $code,
         int $excludeId=0
     ): bool {
+        $className=$this->currentClassName($tenantId,$branchId,$yearId,$classId);
+
         $sql=
             "SELECT id
              FROM school_subjects
              WHERE tenant_id=:tenant_id
+               AND branch_id=:branch_id
                AND academic_year_id=:academic_year_id
-               AND class_id=:class_id
                AND UPPER(TRIM(subject_code))=UPPER(TRIM(:subject_code))";
 
         $params=[
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
             'academic_year_id'=>$yearId,
-            'class_id'=>$classId,
             'subject_code'=>$code,
         ];
+
+        if($className!==''){
+            $sql.=" AND (class_id=:class_id OR LOWER(TRIM(COALESCE(class_name,'')))=LOWER(TRIM(:class_name)))";
+            $params['class_id']=$classId;
+            $params['class_name']=$className;
+        }else{
+            $sql.=' AND class_id=:class_id';
+            $params['class_id']=$classId;
+        }
 
         if($excludeId>0){
             $sql.=" AND id<>:exclude_id";
@@ -478,10 +796,11 @@ final class SubjectsManagementModel
         return (bool)$s->fetchColumn();
     }
 
-    public function save(int $tenantId,int $userId,int $id,array $data): int
+    public function save(int $tenantId,int $branchId,int $userId,int $id,array $data): int
     {
         $params=[
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
             'academic_year_id'=>$data['academic_year_id'],
             'class_id'=>$data['class_id'],
             'class_name'=>$data['class_name'],
@@ -523,7 +842,8 @@ final class SubjectsManagementModel
                      updated_by=:updated_by,
                      updated_at=CURRENT_TIMESTAMP
                  WHERE id=:id
-                   AND tenant_id=:tenant_id"
+                   AND tenant_id=:tenant_id
+                   AND branch_id=:branch_id"
             );
 
             $s->execute($params);
@@ -535,6 +855,7 @@ final class SubjectsManagementModel
         $s=$this->pdo->prepare(
             "INSERT INTO school_subjects(
                 tenant_id,
+                branch_id,
                 academic_year_id,
                 class_id,
                 class_name,
@@ -554,6 +875,7 @@ final class SubjectsManagementModel
                 created_by
              ) VALUES(
                 :tenant_id,
+                :branch_id,
                 :academic_year_id,
                 :class_id,
                 :class_name,
@@ -580,6 +902,7 @@ final class SubjectsManagementModel
 
     public function syncClassAssignment(
         int $tenantId,
+        int $branchId,
         int $userId,
         int $subjectId,
         array $data
@@ -591,6 +914,7 @@ final class SubjectsManagementModel
         $deleteSql=
             "DELETE FROM subject_class_assignments
              WHERE tenant_id=:tenant_id
+               AND branch_id=:branch_id
                AND subject_id=:subject_id";
 
         if(subjectsColumnExists(
@@ -604,13 +928,15 @@ final class SubjectsManagementModel
         $delete=$this->pdo->prepare($deleteSql);
         $delete->execute([
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
             'subject_id'=>$subjectId,
         ]);
 
-        $columns=['tenant_id','subject_id','class_id'];
-        $values=[':tenant_id',':subject_id',':class_id'];
+        $columns=['tenant_id','branch_id','subject_id','class_id'];
+        $values=[':tenant_id',':branch_id',':subject_id',':class_id'];
         $params=[
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
             'subject_id'=>$subjectId,
             'class_id'=>$data['class_id'],
         ];
@@ -658,7 +984,7 @@ final class SubjectsManagementModel
         $s->execute($params);
     }
 
-    public function delete(int $tenantId,int $id): void
+    public function delete(int $tenantId,int $branchId,int $id): void
     {
         foreach(
             [
@@ -670,32 +996,41 @@ final class SubjectsManagementModel
                 continue;
             }
 
-            $s=$this->pdo->prepare(
+            $sql=
                 "DELETE FROM {$table}
                  WHERE tenant_id=:tenant_id
-                   AND subject_id=:subject_id"
-            );
-            $s->execute([
+                   AND subject_id=:subject_id";
+
+            $params=[
                 'tenant_id'=>$tenantId,
                 'subject_id'=>$id,
-            ]);
+            ];
+
+            if(subjectsColumnExists($this->pdo,$table,'branch_id')){
+                $sql.=" AND branch_id=:branch_id";
+                $params['branch_id']=$branchId;
+            }
+
+            $s=$this->pdo->prepare($sql);
+            $s->execute($params);
         }
 
         $s=$this->pdo->prepare(
             "DELETE FROM school_subjects
              WHERE id=:id
-               AND tenant_id=:tenant_id"
+               AND tenant_id=:tenant_id
+               AND branch_id=:branch_id"
         );
         $s->execute([
             'id'=>$id,
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
         ]);
     }
 
-    public function meta(int $tenantId): array
+    public function meta(int $tenantId,int $branchId): array
     {
         $academicYears=[];
-        $classes=[];
 
         if(subjectsTableExists($this->pdo,'academic_years')){
             try{
@@ -719,56 +1054,13 @@ final class SubjectsManagementModel
             }
         }
 
-        if(subjectsTableExists($this->pdo,'class_management_classes')){
-            $hasCode=subjectsColumnExists(
-                $this->pdo,
-                'class_management_classes',
-                'class_code'
-            );
-
-            $hasYear=subjectsColumnExists(
-                $this->pdo,
-                'class_management_classes',
-                'academic_year_id'
-            );
-
-            $hasStatus=subjectsColumnExists(
-                $this->pdo,
-                'class_management_classes',
-                'status'
-            );
-
-            $hasDisplayOrder=subjectsColumnExists(
-                $this->pdo,
-                'class_management_classes',
-                'display_order'
-            );
-
-            $codeSql=$hasCode?"COALESCE(class_code,'')":"''";
-            $yearSql=$hasYear?'academic_year_id':'0';
-            $statusWhere=$hasStatus
-                ?"AND COALESCE(status,'active')<>'archived'"
-                :'';
-            $orderSql=$hasDisplayOrder?'display_order,':'';
-
-            $s=$this->pdo->prepare(
-                "SELECT id,class_name,
-                        {$codeSql} AS class_code,
-                        {$yearSql} AS academic_year_id
-                 FROM class_management_classes
-                 WHERE tenant_id=:tenant_id
-                   {$statusWhere}
-                 ORDER BY {$orderSql} class_name,id"
-            );
-
-            $s->execute(['tenant_id'=>$tenantId]);
-            $classes=$s->fetchAll(PDO::FETCH_ASSOC);
-        }
+        /* One class tab per class name/year; section rows are deduplicated. */
+        $classes=subjectsEffectiveClasses($this->pdo,$tenantId,$branchId);
 
         return [
             'academic_years'=>$academicYears,
             'classes'=>$classes,
-            'teachers'=>$this->teachers($tenantId),
+            'teachers'=>$this->teachers($tenantId,$branchId),
             'subject_types'=>[
                 'core',
                 'elective',
@@ -779,7 +1071,7 @@ final class SubjectsManagementModel
         ];
     }
 
-    private function teachers(int $tenantId): array
+    private function teachers(int $tenantId,int $branchId): array
     {
         if(!subjectsTableExists($this->pdo,'users')){
             return [];
@@ -812,6 +1104,11 @@ final class SubjectsManagementModel
             $where[]="status='active'";
         }
 
+        if(subjectsColumnExists($this->pdo,'users','default_branch_id')){
+            $where[]='default_branch_id=:branch_id';
+            $params['branch_id']=$branchId;
+        }
+
         $sql=
             "SELECT id,{$nameExpression} AS teacher_name
              FROM users"
@@ -827,37 +1124,76 @@ final class SubjectsManagementModel
 final class SubjectsManagementController
 {
     private SubjectsManagementModel $model;
+    private ?array $requestScope=null;
 
     public function __construct(private PDO $pdo,private array $user)
     {
         $this->model=new SubjectsManagementModel($pdo);
     }
 
+    private function requestScope(): array
+    {
+        if($this->requestScope===null){
+            $this->requestScope=subjectsResolveSchoolScope($this->pdo);
+        }
+
+        return $this->requestScope;
+    }
+
     public function tenantId(): int
     {
-        return (int)(
-            $this->user['tenant_id']
-            ??$this->user['school_id']
-            ??$_SESSION['tenant_id']
-            ??$_SESSION['school_id']
-            ??$_SESSION['tenant']['id']
-            ??0
-        );
+        return (int)($this->requestScope()['tenant_id']??0);
+    }
+
+    public function branchId(): int
+    {
+        return (int)($this->requestScope()['branch_id']??0);
     }
 
     public function userId(): int
     {
-        return (int)(
-            $this->user['id']
-            ??$this->user['user_id']
-            ??$_SESSION['user_id']
-            ??0
+        return (int)($this->requestScope()['user_id']??0);
+    }
+
+    private function platformFullAccess(): bool
+    {
+        if(function_exists('is_super_admin')){
+            try{
+                if((bool)is_super_admin())return true;
+            }catch(Throwable){
+            }
+        }
+
+        $roleText=strtolower(trim((string)(
+            $this->user['role_key']
+            ??$this->user['role_name']
+            ??$this->user['role']
+            ??$this->user['user_type']
+            ??$_SESSION['role_key']
+            ??$_SESSION['role_name']
+            ??$_SESSION['role']
+            ??''
+        )));
+
+        $roleKey=preg_replace('/[^a-z0-9]+/','_',$roleText)??'';
+
+        return in_array(
+            trim($roleKey,'_'),
+            [
+                'platform_owner',
+                'platformowner',
+                'platform_admin',
+                'platformadministrator',
+                'super_admin',
+                'superadministrator',
+            ],
+            true
         );
     }
 
     public function can(string $action): bool
     {
-        if(function_exists('is_super_admin')&&is_super_admin()){
+        if($this->platformFullAccess()){
             return true;
         }
 
@@ -919,7 +1255,7 @@ final class SubjectsManagementController
             );
         }
 
-        return $this->model->meta($this->requireTenant());
+        return $this->model->meta($this->requireTenant(),$this->branchId());
     }
 
     public function list(array $filters): array
@@ -933,6 +1269,7 @@ final class SubjectsManagementController
 
         return $this->model->listSubjects(
             $this->requireTenant(),
+            $this->branchId(),
             $filters
         );
     }
@@ -952,10 +1289,12 @@ final class SubjectsManagementController
         }
 
         $tenantId=$this->requireTenant();
-        $data=$this->validate($tenantId,$input);
+        $branchId=$this->branchId();
+        $data=$this->validate($tenantId,$branchId,$input);
 
         if($this->model->duplicateNameExists(
             $tenantId,
+            $branchId,
             $data['academic_year_id'],
             $data['class_id'],
             $data['subject_name'],
@@ -968,6 +1307,7 @@ final class SubjectsManagementController
 
         if($this->model->duplicateCodeExists(
             $tenantId,
+            $branchId,
             $data['academic_year_id'],
             $data['class_id'],
             $data['subject_code'],
@@ -983,6 +1323,7 @@ final class SubjectsManagementController
         try{
             $savedId=$this->model->save(
                 $tenantId,
+                $branchId,
                 $this->userId(),
                 $id,
                 $data
@@ -990,6 +1331,7 @@ final class SubjectsManagementController
 
             $this->model->syncClassAssignment(
                 $tenantId,
+                $branchId,
                 $this->userId(),
                 $savedId,
                 $data
@@ -1005,6 +1347,135 @@ final class SubjectsManagementController
         }
     }
 
+    public function importRows(array $rows): array
+    {
+        if(!$this->can('import')){
+            throw new RuntimeException('You do not have permission to import subjects.',403);
+        }
+
+        $tenantId=$this->requireTenant();
+        $branchId=$this->branchId();
+
+        if(count($rows)>2000){
+            throw new InvalidArgumentException('A maximum of 2,000 subject rows can be imported at one time.');
+        }
+
+        $meta=$this->model->meta($tenantId,$branchId);
+
+        $yearMap=[];
+        foreach(($meta['academic_years']??[]) as $year){
+            $name=strtolower(trim((string)($year['year_name']??'')));
+            if($name!=='')$yearMap[$name]=(int)$year['id'];
+        }
+
+        $classMap=[];
+        foreach(($meta['classes']??[]) as $class){
+            $className=strtolower(trim((string)($class['class_name']??'')));
+            if($className==='')continue;
+
+            $classYearId=(int)($class['academic_year_id']??0);
+            $classMap[$classYearId.'|'.$className]=(int)$class['id'];
+
+            if($classYearId<=0){
+                $classMap['0|'.$className]=(int)$class['id'];
+            }
+        }
+
+        $imported=0;
+        $skipped=0;
+        $failed=0;
+        $errors=[];
+
+        foreach($rows as $index=>$row){
+            $rowNumber=$index+2;
+
+            try{
+                $yearName=trim((string)($row['academic_year']??''));
+                $className=trim((string)($row['class']??''));
+                $subjectName=trim((string)($row['subject_name']??''));
+                $subjectCode=strtoupper(trim((string)($row['subject_code']??'')));
+
+                if($yearName===''||$className===''||$subjectName===''||$subjectCode===''){
+                    throw new InvalidArgumentException('Required value missing.');
+                }
+
+                $yearId=$yearMap[strtolower($yearName)]??0;
+                if($yearId<=0){
+                    throw new InvalidArgumentException('Academic Year "'.$yearName.'" was not found.');
+                }
+
+                $normalizedClass=strtolower($className);
+                $classId=
+                    $classMap[$yearId.'|'.$normalizedClass]
+                    ??$classMap['0|'.$normalizedClass]
+                    ??0;
+
+                if($classId<=0){
+                    throw new InvalidArgumentException('Class "'.$className.'" was not found in '.$yearName.'.');
+                }
+
+                $payload=[
+                    'academic_year_id'=>$yearId,
+                    'class_id'=>$classId,
+                    'subject_name'=>$subjectName,
+                    'subject_code'=>$subjectCode,
+                    'book_name'=>trim((string)($row['book_name']??'')),
+                    'subject_type'=>strtolower(trim((string)($row['subject_type']??'core'))),
+                    'department_name'=>trim((string)($row['department']??'')),
+                    'subject_group'=>trim((string)($row['subject_group']??'')),
+                    'maximum_marks'=>(int)($row['maximum_marks']??100),
+                    'pass_marks'=>(int)($row['pass_marks']??35),
+                    'subject_teacher_user_id'=>0,
+                    'subject_teacher_name'=>trim((string)($row['subject_teacher']??'')),
+                    'status'=>strtolower(trim((string)($row['status']??'active'))),
+                    'description'=>trim((string)($row['description']??'')),
+                ];
+
+                $data=$this->validate($tenantId,$branchId,$payload);
+
+                if(
+                    $this->model->duplicateNameExists(
+                        $tenantId,$branchId,$data['academic_year_id'],$data['class_id'],$data['subject_name']
+                    )
+                    ||$this->model->duplicateCodeExists(
+                        $tenantId,$branchId,$data['academic_year_id'],$data['class_id'],$data['subject_code']
+                    )
+                ){
+                    $skipped++;
+                    if(count($errors)<50){
+                        $errors[]='Row '.$rowNumber.': duplicate Subject Name or Subject Code for this Class + Academic Year; skipped.';
+                    }
+                    continue;
+                }
+
+                $this->pdo->beginTransaction();
+
+                try{
+                    $savedId=$this->model->save($tenantId,$branchId,$this->userId(),0,$data);
+                    $this->model->syncClassAssignment($tenantId,$branchId,$this->userId(),$savedId,$data);
+                    $this->pdo->commit();
+                    $imported++;
+                }catch(Throwable $exception){
+                    if($this->pdo->inTransaction())$this->pdo->rollBack();
+                    throw $exception;
+                }
+            }catch(Throwable $exception){
+                if($this->pdo->inTransaction())$this->pdo->rollBack();
+                $failed++;
+                if(count($errors)<50){
+                    $errors[]='Row '.$rowNumber.': '.$exception->getMessage();
+                }
+            }
+        }
+
+        return [
+            'imported'=>$imported,
+            'skipped'=>$skipped,
+            'failed'=>$failed,
+            'errors'=>$errors,
+        ];
+    }
+
     public function delete(int $id): void
     {
         if(!$this->can('delete')){
@@ -1015,15 +1486,16 @@ final class SubjectsManagementController
         }
 
         $tenantId=$this->requireTenant();
+        $branchId=$this->branchId();
 
-        if(!$this->model->findSubject($tenantId,$id)){
+        if(!$this->model->findSubject($tenantId,$branchId,$id)){
             throw new RuntimeException('Subject not found.',404);
         }
 
         $this->pdo->beginTransaction();
 
         try{
-            $this->model->delete($tenantId,$id);
+            $this->model->delete($tenantId,$branchId,$id);
             $this->pdo->commit();
         }catch(Throwable $exception){
             if($this->pdo->inTransaction()){
@@ -1033,7 +1505,7 @@ final class SubjectsManagementController
         }
     }
 
-    private function validate(int $tenantId,array $input): array
+    private function validate(int $tenantId,int $branchId,array $input): array
     {
         $yearId=(int)($input['academic_year_id']??0);
         $classId=(int)($input['class_id']??0);
@@ -1069,7 +1541,7 @@ final class SubjectsManagementController
             throw new InvalidArgumentException('Select a Class.');
         }
 
-        $class=$this->model->schoolClass($tenantId,$classId,$yearId);
+        $class=$this->model->schoolClass($tenantId,$branchId,$classId,$yearId);
 
         if(!$class){
             throw new InvalidArgumentException(
@@ -1127,6 +1599,396 @@ final class SubjectsManagementController
         ];
     }
 }
+
+
+function subjectsNormalizeHeader(string $value): string
+{
+    $value=strtolower(trim($value));
+    $value=preg_replace('/[^a-z0-9]+/','_',$value)??'';
+    $value=trim($value,'_');
+
+    $aliases=[
+        'academic_year'=>'academic_year',
+        'academic_year_name'=>'academic_year',
+        'year'=>'academic_year',
+        'class'=>'class',
+        'class_name'=>'class',
+        'subject'=>'subject_name',
+        'subject_name'=>'subject_name',
+        'book'=>'book_name',
+        'book_name'=>'book_name',
+        'subject_code'=>'subject_code',
+        'code'=>'subject_code',
+        'status'=>'status',
+        'subject_type'=>'subject_type',
+        'type'=>'subject_type',
+        'department'=>'department',
+        'department_name'=>'department',
+        'subject_group'=>'subject_group',
+        'group'=>'subject_group',
+        'maximum_marks'=>'maximum_marks',
+        'max_marks'=>'maximum_marks',
+        'pass_marks'=>'pass_marks',
+        'subject_teacher'=>'subject_teacher',
+        'teacher'=>'subject_teacher',
+        'description'=>'description',
+        'remarks'=>'description',
+    ];
+
+    return $aliases[$value]??$value;
+}
+
+function subjectsRowsFromMatrix(array $matrix): array
+{
+    if(!$matrix){
+        throw new InvalidArgumentException('The import file is empty.');
+    }
+
+    $rawHeaders=array_shift($matrix);
+    $headers=[];
+
+    foreach($rawHeaders as $header){
+        $headers[]=subjectsNormalizeHeader((string)$header);
+    }
+
+    foreach(['academic_year','class','subject_name','subject_code'] as $required){
+        if(!in_array($required,$headers,true)){
+            throw new InvalidArgumentException(
+                'Missing required column: '.str_replace('_',' ',$required).'.'
+            );
+        }
+    }
+
+    $rows=[];
+
+    foreach($matrix as $rawRow){
+        $hasValue=false;
+        foreach($rawRow as $cell){
+            if(trim((string)$cell)!==''){
+                $hasValue=true;
+                break;
+            }
+        }
+        if(!$hasValue)continue;
+
+        $row=[];
+        foreach($headers as $index=>$header){
+            if($header==='')continue;
+            $row[$header]=trim((string)($rawRow[$index]??''));
+        }
+        $rows[]=$row;
+    }
+
+    if(!$rows){
+        throw new InvalidArgumentException('No subject data rows were found in the import file.');
+    }
+
+    return $rows;
+}
+
+function subjectsReadCsvFile(string $path): array
+{
+    $handle=fopen($path,'rb');
+    if(!$handle){
+        throw new RuntimeException('Unable to open the CSV import file.',500);
+    }
+
+    $matrix=[];
+    $rowNumber=0;
+
+    while(($row=fgetcsv($handle,0,',','"','\\'))!==false){
+        $rowNumber++;
+        if($rowNumber===1&&isset($row[0])){
+            $row[0]=preg_replace('/^\xEF\xBB\xBF/','',(string)$row[0])??(string)$row[0];
+        }
+        $matrix[]=$row;
+    }
+
+    fclose($handle);
+    return subjectsRowsFromMatrix($matrix);
+}
+
+function subjectsXlsxColumnIndex(string $reference): int
+{
+    if(!preg_match('/^([A-Z]+)/i',$reference,$match))return 0;
+
+    $index=0;
+    foreach(str_split(strtoupper($match[1])) as $letter){
+        $index=$index*26+(ord($letter)-64);
+    }
+    return max(0,$index-1);
+}
+
+function subjectsReadXlsxFile(string $path): array
+{
+    if(!class_exists('ZipArchive')){
+        throw new RuntimeException('XLSX import requires the PHP ZIP extension (ZipArchive).',500);
+    }
+
+    $zip=new ZipArchive();
+    if($zip->open($path)!==true){
+        throw new InvalidArgumentException('The XLSX file could not be opened.');
+    }
+
+    try{
+        $shared=[];
+        $sharedXml=$zip->getFromName('xl/sharedStrings.xml');
+
+        if($sharedXml!==false){
+            $xml=simplexml_load_string($sharedXml);
+            if($xml!==false){
+                foreach($xml->si as $item){
+                    $value='';
+                    if(isset($item->t)){
+                        $value=(string)$item->t;
+                    }elseif(isset($item->r)){
+                        foreach($item->r as $run)$value.=(string)$run->t;
+                    }
+                    $shared[]=$value;
+                }
+            }
+        }
+
+        $sheetXml=$zip->getFromName('xl/worksheets/sheet1.xml');
+        if($sheetXml===false){
+            throw new InvalidArgumentException('The XLSX file does not contain worksheet 1.');
+        }
+
+        $xml=simplexml_load_string($sheetXml);
+        if($xml===false){
+            throw new InvalidArgumentException('The XLSX worksheet is invalid.');
+        }
+
+        $matrix=[];
+
+        foreach($xml->sheetData->row as $row){
+            $values=[];
+            $maxIndex=-1;
+
+            foreach($row->c as $cell){
+                $columnIndex=subjectsXlsxColumnIndex((string)$cell['r']);
+                $type=(string)$cell['t'];
+                $value='';
+
+                if($type==='inlineStr'){
+                    if(isset($cell->is->t)){
+                        $value=(string)$cell->is->t;
+                    }elseif(isset($cell->is->r)){
+                        foreach($cell->is->r as $run)$value.=(string)$run->t;
+                    }
+                }else{
+                    $raw=isset($cell->v)?(string)$cell->v:'';
+                    $value=$type==='s'?($shared[(int)$raw]??''):$raw;
+                }
+
+                $values[$columnIndex]=$value;
+                $maxIndex=max($maxIndex,$columnIndex);
+            }
+
+            $normalized=[];
+            for($i=0;$i<=$maxIndex;$i++)$normalized[]=$values[$i]??'';
+            $matrix[]=$normalized;
+        }
+
+        return subjectsRowsFromMatrix($matrix);
+    }finally{
+        $zip->close();
+    }
+}
+
+function subjectsParseImportFile(array $file): array
+{
+    $error=(int)($file['error']??UPLOAD_ERR_NO_FILE);
+
+    if($error!==UPLOAD_ERR_OK){
+        throw new InvalidArgumentException(
+            match($error){
+                UPLOAD_ERR_INI_SIZE,UPLOAD_ERR_FORM_SIZE=>'The import file is too large.',
+                UPLOAD_ERR_NO_FILE=>'Choose a CSV or XLSX file.',
+                default=>'The import file upload failed.',
+            }
+        );
+    }
+
+    $name=(string)($file['name']??'');
+    $tmp=(string)($file['tmp_name']??'');
+
+    if($tmp===''||!is_uploaded_file($tmp)){
+        throw new InvalidArgumentException('The uploaded import file is invalid.');
+    }
+
+    $extension=strtolower(pathinfo($name,PATHINFO_EXTENSION));
+
+    if(!in_array($extension,['csv','xlsx'],true)){
+        throw new InvalidArgumentException('Only CSV and XLSX files are supported.');
+    }
+
+    if((int)($file['size']??0)>10*1024*1024){
+        throw new InvalidArgumentException('The import file must be 10 MB or smaller.');
+    }
+
+    return $extension==='csv'
+        ?subjectsReadCsvFile($tmp)
+        :subjectsReadXlsxFile($tmp);
+}
+
+function subjectsXmlEscape(string $value): string
+{
+    return htmlspecialchars($value,ENT_XML1|ENT_QUOTES,'UTF-8');
+}
+
+function subjectsXlsxColumnName(int $index): string
+{
+    $name='';
+    $index++;
+    while($index>0){
+        $index--;
+        $name=chr(65+($index%26)).$name;
+        $index=intdiv($index,26);
+    }
+    return $name;
+}
+
+function subjectsDownloadTemplate(
+    SubjectsManagementController $controller,
+    string $format
+): never {
+    if(!$controller->can('import')){
+        throw new RuntimeException(
+            'You do not have permission to download the Subject import template.',
+            403
+        );
+    }
+
+    $meta=$controller->meta();
+    $years=$meta['academic_years']??[];
+    $classes=$meta['classes']??[];
+
+    $yearName=(string)($years[0]['year_name']??'2026-2027');
+    $yearId=(int)($years[0]['id']??0);
+
+    foreach($years as $year){
+        if((int)($year['is_current']??0)===1){
+            $yearName=(string)$year['year_name'];
+            $yearId=(int)$year['id'];
+            break;
+        }
+    }
+
+    $className='Class 1';
+    foreach($classes as $class){
+        $classYearId=(int)($class['academic_year_id']??0);
+        if($yearId<=0||$classYearId<=0||$classYearId===$yearId){
+            $className=(string)($class['class_name']??'Class 1');
+            break;
+        }
+    }
+
+    $headers=[
+        'Academic Year','Class','Subject Name','Book Name','Subject Code','Status',
+        'Subject Type','Department','Subject Group','Maximum Marks','Pass Marks',
+        'Subject Teacher','Description',
+    ];
+
+    $sample=[
+        $yearName,$className,'Mathematics','Mathematics Textbook','MAT-01','active',
+        'core','Mathematics','Core','100','35','',
+        'Sample subject row - replace with your data.',
+    ];
+
+    while(ob_get_level()>0)ob_end_clean();
+
+    if($format==='csv'){
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="subject-import-template.csv"');
+        $out=fopen('php://output','wb');
+        fwrite($out,"\xEF\xBB\xBF");
+        fputcsv($out,$headers,',','"','\\');
+        fputcsv($out,$sample,',','"','\\');
+        fclose($out);
+        exit;
+    }
+
+    if($format!=='xlsx'){
+        throw new InvalidArgumentException('Template format must be csv or xlsx.');
+    }
+
+    if(!class_exists('ZipArchive')){
+        throw new RuntimeException('XLSX template download requires the PHP ZIP extension (ZipArchive).',500);
+    }
+
+    $tmp=tempnam(sys_get_temp_dir(),'subject_template_');
+    if($tmp===false){
+        throw new RuntimeException('Unable to create the XLSX template.',500);
+    }
+
+    $zip=new ZipArchive();
+    if($zip->open($tmp,ZipArchive::CREATE|ZipArchive::OVERWRITE)!==true){
+        @unlink($tmp);
+        throw new RuntimeException('Unable to build the XLSX template.',500);
+    }
+
+    $contentTypes='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        .'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        .'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        .'<Default Extension="xml" ContentType="application/xml"/>'
+        .'<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        .'<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        .'</Types>';
+
+    $rels='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        .'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        .'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        .'</Relationships>';
+
+    $workbook='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        .'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        .'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        .'<sheets><sheet name="Subjects Import" sheetId="1" r:id="rId1"/></sheets></workbook>';
+
+    $workbookRels='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        .'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        .'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        .'</Relationships>';
+
+    $row1='';
+    foreach($headers as $i=>$value){
+        $ref=subjectsXlsxColumnName($i).'1';
+        $row1.='<c r="'.$ref.'" t="inlineStr"><is><t>'.subjectsXmlEscape($value).'</t></is></c>';
+    }
+
+    $row2='';
+    foreach($sample as $i=>$value){
+        $ref=subjectsXlsxColumnName($i).'2';
+        $row2.='<c r="'.$ref.'" t="inlineStr"><is><t xml:space="preserve">'
+            .subjectsXmlEscape((string)$value)
+            .'</t></is></c>';
+    }
+
+    $last=subjectsXlsxColumnName(count($headers)-1);
+
+    $sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        .'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        .'<dimension ref="A1:'.$last.'2"/>'
+        .'<sheetData><row r="1">'.$row1.'</row><row r="2">'.$row2.'</row></sheetData>'
+        .'<autoFilter ref="A1:'.$last.'2"/>'
+        .'</worksheet>';
+
+    $zip->addFromString('[Content_Types].xml',$contentTypes);
+    $zip->addFromString('_rels/.rels',$rels);
+    $zip->addFromString('xl/workbook.xml',$workbook);
+    $zip->addFromString('xl/_rels/workbook.xml.rels',$workbookRels);
+    $zip->addFromString('xl/worksheets/sheet1.xml',$sheet);
+    $zip->close();
+
+    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    header('Content-Disposition: attachment; filename="subject-import-template.xlsx"');
+    header('Content-Length: '.filesize($tmp));
+    readfile($tmp);
+    @unlink($tmp);
+    exit;
+}
+
 
 function subjectsExport(
     SubjectsManagementController $controller,
@@ -1225,6 +2087,7 @@ if(!isset($pdo)||!$pdo instanceof PDO){
 }
 
 try{
+    $requestScope=subjectsResolveSchoolScope($pdo);
     subjectsEnsureSchema($pdo);
 }catch(Throwable $exception){
     error_log('subjects-schema: '.$exception->getMessage());
@@ -1238,7 +2101,7 @@ try{
             ?'Subjects database setup failed: '.$exception->getMessage()
             :'Unable to prepare Subjects database tables.',
         [
-            'build'=>'2026-08-10-subjects-classwise-reference-layout-v4',
+            'build'=>'2026-08-15-subject-branch-context-v7',
         ],
         500
     );
@@ -1251,6 +2114,13 @@ $input=subjectsInput();
 $action=strtolower(trim((string)($input['action']??$_GET['action']??'')));
 
 try{
+    if($action==='template'){
+        subjectsDownloadTemplate(
+            $controller,
+            strtolower(trim((string)($_GET['format']??'xlsx')))
+        );
+    }
+
     if($action==='export'){
         subjectsExport(
             $controller,
@@ -1276,8 +2146,9 @@ try{
                     'print'=>$controller->can('print'),
                     'pdf'=>$controller->can('pdf'),
                     'export'=>$controller->can('export'),
+                    'import'=>$controller->can('import'),
                 ],
-                'build'=>'2026-08-10-subjects-classwise-reference-layout-v4',
+                'build'=>'2026-08-15-subject-branch-context-v7',
             ]
         );
     }
@@ -1293,6 +2164,17 @@ try{
     }
 
     subjectsCsrf($input);
+
+    if($action==='import'){
+        if(!$controller->can('import')){
+            throw new RuntimeException('You do not have permission to import subjects.',403);
+        }
+
+        $rows=subjectsParseImportFile($_FILES['import_file']??[]);
+        $result=$controller->importRows($rows);
+
+        subjectsJson(true,'Subject import completed.',$result);
+    }
 
     if($action==='save'){
         $result=$controller->save($input);
@@ -1335,7 +2217,7 @@ try{
             ?'Subject request failed: '.$exception->getMessage()
             :'Unable to complete the subject request.',
         [
-            'build'=>'2026-08-10-subjects-classwise-reference-layout-v4',
+            'build'=>'2026-08-15-subject-branch-context-v7',
         ],
         500
     );

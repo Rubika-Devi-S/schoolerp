@@ -10,6 +10,10 @@ if (!defined('SCHOOL_API_PAGE_KEY')) {
 }
 
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
+$staffCommonFile = dirname(__DIR__) . '/includes/common.php';
+if (is_file($staffCommonFile)) {
+    require_once $staffCommonFile;
+}
 
 function smOut(bool $success, string $message = '', array $data = [], int $status = 200): never
 {

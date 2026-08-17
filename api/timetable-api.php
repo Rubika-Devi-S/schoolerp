@@ -7,43 +7,200 @@ declare(strict_types=1);
  * the `timetable` page key, so the common API permission guard can resolve
  * View/Create/Edit/Delete and the other allowed actions correctly.
  */
-define('SCHOOL_API_PAGE_KEY', 'timetable');
-define('SCHOOL_API_REQUEST', true);
+
+/* Build: 2026-08-10-timetable-default-year-branch-v14 */
 
 ob_start();
 ini_set('display_errors', '0');
 error_reporting(E_ALL);
+$originalScriptName =
+    (string)($_SERVER['SCRIPT_NAME'] ?? '');
+
+$_SERVER['SCRIPT_NAME'] = '/login.php';
+
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
+
+$_SERVER['SCRIPT_NAME'] =
+    $originalScriptName;
+
+$generalSettingsRuntime=dirname(__DIR__).'/includes/general-settings-runtime.php';
+if(is_file($generalSettingsRuntime)){require_once $generalSettingsRuntime;}
 
 function tt_user(): array { $u=function_exists('current_user')?current_user():[]; return is_array($u)?$u:[]; }
 function tt_scope(): array { $u=tt_user(); return ['tenant_id'=>(int)($u['tenant_id']??$u['school_id']??$_SESSION['tenant_id']??$_SESSION['school_id']??0),'branch_id'=>(int)($u['branch_id']??$_SESSION['branch_id']??0),'user_id'=>(int)($u['id']??$u['user_id']??$_SESSION['user_id']??0)]; }
 function tt_json(bool $ok,string $message='',array $data=[],int $status=200): never { while(ob_get_level()>0)ob_end_clean(); http_response_code($status); header('Content-Type: application/json; charset=utf-8'); header('Cache-Control: no-store'); echo json_encode(['success'=>$ok,'message'=>$message,'data'=>$data],JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES); exit; }
 function tt_input(): array { $j=json_decode((string)file_get_contents('php://input'),true); return is_array($j)?$j:$_POST; }
 function tt_csrf(array $in): void { $t=(string)($in['csrf_token']??''); $ok=function_exists('csrf_is_valid')?csrf_is_valid($t):(isset($_SESSION['csrf_token'])&&hash_equals((string)$_SESSION['csrf_token'],$t)); if(!$ok)tt_json(false,'Invalid or expired CSRF token.',[],419); }
+function tt_platform_full_access(): bool
+{
+    if(function_exists('is_super_admin')){
+        try{
+            if((bool)is_super_admin()){
+                return true;
+            }
+        }catch(Throwable){
+        }
+    }
+
+    $user=tt_user();
+
+    $roleText=strtolower(trim((string)(
+        $user['role_key']
+        ??$user['role_name']
+        ??$user['role']
+        ??$user['user_type']
+        ??$_SESSION['role_key']
+        ??$_SESSION['role_name']
+        ??$_SESSION['role']
+        ??''
+    )));
+
+    $roleKey=preg_replace(
+        '/[^a-z0-9]+/',
+        '_',
+        $roleText
+    )??'';
+
+    return in_array(
+        trim($roleKey,'_'),
+        [
+            'platform_owner',
+            'platformowner',
+            'platform_admin',
+            'platformadministrator',
+            'super_admin',
+            'superadministrator',
+        ],
+        true
+    );
+}
+
 function tt_can(string $action): bool
 {
-    $action = strtolower(trim($action));
-    if ($action === 'add') {
-        $action = 'create';
-    }
+    $action = strtolower(
+        trim($action)
+    );
 
-    if (function_exists('school_effective_permission')) {
-        return school_effective_permission('timetable', $action);
-    }
-
-    if (function_exists('is_super_admin') && is_super_admin()) {
+    /*
+     * Full platform roles always win.
+     */
+    if (tt_platform_full_access()) {
         return true;
     }
 
+    /*
+     * Common Sidebar Permission aliases.
+     * Some installations save Add, while others save Create.
+     */
+    $actions = match ($action) {
+        'add', 'create' => ['create', 'add'],
+        default => [$action],
+    };
+
+    if (
+        function_exists(
+            'school_effective_permission'
+        )
+    ) {
+        foreach ($actions as $permissionAction) {
+            if (
+                (bool)school_effective_permission(
+                    'timetable',
+                    $permissionAction
+                )
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     if (function_exists('has_permission')) {
-        return has_permission('timetable', $action)
-            || ($action === 'create' && has_permission('timetable', 'add'));
+        foreach ($actions as $permissionAction) {
+            if (
+                has_permission(
+                    'timetable',
+                    $permissionAction
+                )
+            ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     return false;
 }
 function tt_table(PDO $pdo,string $t): bool { $s=$pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=:t"); $s->execute(['t'=>$t]); return (int)$s->fetchColumn()>0; }
 function tt_col(PDO $pdo,string $t,string $c): bool { $s=$pdo->prepare("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=:t AND column_name=:c"); $s->execute(['t'=>$t,'c'=>$c]); return (int)$s->fetchColumn()>0; }
+
+function tt_branch_main_expression(PDO $pdo): string
+{
+    if(tt_col($pdo,'branches','is_main')){
+        return 'COALESCE(is_main,0)';
+    }
+
+    if(tt_col($pdo,'branches','is_default')){
+        return 'COALESCE(is_default,0)';
+    }
+
+    if(tt_col($pdo,'branches','is_head')){
+        return 'COALESCE(is_head,0)';
+    }
+
+    if(tt_col($pdo,'branches','branch_type')){
+        return "CASE
+            WHEN LOWER(COALESCE(branch_type,'')) IN (
+                'main',
+                'head',
+                'head office',
+                'head_office',
+                'default'
+            )
+            THEN 1
+            ELSE 0
+        END";
+    }
+
+    return '0';
+}
+
+function tt_enabled_shift_rows(PDO $pdo,array $scope): array
+{
+    $tenantId=(int)($scope['tenant_id']??0);
+    if($tenantId<=0 || !function_exists('school_settings_enabled_shifts')){
+        return [];
+    }
+    $rows=school_settings_enabled_shifts($pdo,$tenantId);
+    if(!is_array($rows)){
+        return [];
+    }
+    return array_values(array_filter($rows,static function($row): bool {
+        return is_array($row) && trim((string)($row['shift_name']??''))!=='';
+    }));
+}
+
+function tt_enabled_shift_names(PDO $pdo,array $scope): array
+{
+    return array_values(array_map(static function(array $row): string {
+        return trim((string)$row['shift_name']);
+    },tt_enabled_shift_rows($pdo,$scope)));
+}
+
+function tt_require_enabled_shift(PDO $pdo,array $scope,string $shift): string
+{
+    $shift=trim($shift);
+    if($shift===''){
+        throw new InvalidArgumentException('Select a Shift configured in General Settings.');
+    }
+    if(!in_array($shift,tt_enabled_shift_names($pdo,$scope),true)){
+        throw new InvalidArgumentException('Selected Shift is not enabled in General Settings.');
+    }
+    return $shift;
+}
+
 function tt_schema(PDO $pdo): void {
 $pdo->exec("CREATE TABLE IF NOT EXISTS timetable_periods(id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,tenant_id BIGINT UNSIGNED NOT NULL,branch_id BIGINT UNSIGNED NULL,academic_year_id BIGINT UNSIGNED NOT NULL,shift_name VARCHAR(50) NOT NULL DEFAULT 'General',period_name VARCHAR(80) NOT NULL,period_code VARCHAR(30) NOT NULL,start_time TIME NOT NULL,end_time TIME NOT NULL,is_break TINYINT(1) NOT NULL DEFAULT 0,display_order INT NOT NULL DEFAULT 0,status ENUM('active','inactive') NOT NULL DEFAULT 'active',created_by BIGINT UNSIGNED NULL,updated_by BIGINT UNSIGNED NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,UNIQUE KEY uq_tt_period(tenant_id,branch_id,academic_year_id,shift_name,period_code)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 $pdo->exec("CREATE TABLE IF NOT EXISTS timetable_subject_assignments(id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,tenant_id BIGINT UNSIGNED NOT NULL,branch_id BIGINT UNSIGNED NULL,academic_year_id BIGINT UNSIGNED NOT NULL,class_id BIGINT UNSIGNED NOT NULL,class_name VARCHAR(150) NOT NULL,section_id BIGINT UNSIGNED NULL,section_name VARCHAR(100) NULL,subject_id BIGINT UNSIGNED NOT NULL,subject_name VARCHAR(150) NOT NULL,teacher_user_id BIGINT UNSIGNED NULL,teacher_name VARCHAR(150) NULL,periods_per_week INT UNSIGNED NOT NULL DEFAULT 1,status ENUM('active','inactive') NOT NULL DEFAULT 'active',created_by BIGINT UNSIGNED NULL,updated_by BIGINT UNSIGNED NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,UNIQUE KEY uq_tt_assign(tenant_id,branch_id,academic_year_id,class_id,section_id,subject_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
@@ -59,11 +216,207 @@ $classes=[]; if(tt_table($pdo,'class_management_classes')){$q=$pdo->prepare("SEL
 $sections=[]; if(tt_table($pdo,'school_sections')){$q=$pdo->prepare("SELECT id,class_id,class_name_snapshot,section_name,academic_year_id FROM school_sections WHERE tenant_id=:t AND status<>'archived' ORDER BY class_name_snapshot,section_name");$q->execute(['t'=>$s['tenant_id']]);$sections=$q->fetchAll(PDO::FETCH_ASSOC);}
 $subjects=[]; if(tt_table($pdo,'school_subjects')){$q=$pdo->prepare("SELECT id,subject_name,subject_code,academic_year_id FROM school_subjects WHERE tenant_id=:t AND status<>'archived' ORDER BY subject_name");$q->execute(['t'=>$s['tenant_id']]);$subjects=$q->fetchAll(PDO::FETCH_ASSOC);}
 $teachers=[]; if(tt_table($pdo,'users')){$names=[];foreach(['display_name','full_name','name','username','email'] as $c)if(tt_col($pdo,'users',$c))$names[]="NULLIF($c,'')";$name=$names?'COALESCE('.implode(',',$names).",CONCAT('User #',id))":"CONCAT('User #',id)";$where=[];$p=[];if(tt_col($pdo,'users','tenant_id')){$where[]='tenant_id=:t';$p['t']=$s['tenant_id'];}if(tt_col($pdo,'users','status'))$where[]="status='active'";$sql="SELECT id,$name teacher_name FROM users".($where?' WHERE '.implode(' AND ',$where):'').' ORDER BY teacher_name';$q=$pdo->prepare($sql);$q->execute($p);$teachers=$q->fetchAll(PDO::FETCH_ASSOC);}
-$branches=[];if(tt_table($pdo,'branches')){try{$q=$pdo->prepare("SELECT id,branch_name FROM branches WHERE tenant_id=:t AND status='active' ORDER BY branch_name");$q->execute(['t'=>$s['tenant_id']]);$branches=$q->fetchAll(PDO::FETCH_ASSOC);}catch(Throwable){}}
+$branches=[];
+if(tt_table($pdo,'branches')){
+    try{
+        $mainExpression=tt_branch_main_expression($pdo);
+
+        $statusWhere=tt_col($pdo,'branches','status')
+            ?" AND status='active'"
+            :'';
+
+        $q=$pdo->prepare(
+            "SELECT
+                id,
+                branch_name,
+                {$mainExpression} AS is_main
+             FROM branches
+             WHERE tenant_id=:t
+             {$statusWhere}
+             ORDER BY is_main DESC, branch_name, id"
+        );
+
+        $q->execute([
+            't'=>$s['tenant_id'],
+        ]);
+
+        $branches=$q->fetchAll(
+            PDO::FETCH_ASSOC
+        );
+    }catch(Throwable){
+        $branches=[];
+    }
+}
 $rooms=[['id'=>1,'room_name'=>'Room 101'],['id'=>2,'room_name'=>'Room 102'],['id'=>3,'room_name'=>'Science Lab'],['id'=>4,'room_name'=>'Computer Lab']];
 $q=$pdo->prepare("SELECT * FROM timetable_periods WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) ORDER BY display_order,start_time");$q->execute(['t'=>$s['tenant_id'],'b'=>$s['branch_id']]);$periods=$q->fetchAll(PDO::FETCH_ASSOC);
-return ['academic_years'=>$years,'classes'=>$classes,'sections'=>$sections,'subjects'=>$subjects,'teachers'=>$teachers,'branches'=>$branches,'rooms'=>$rooms,'periods'=>$periods,'shifts'=>['General','Morning','Afternoon','Evening'],'days'=>['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],'statuses'=>['draft','pending','approved','rejected','archived']];
+$shiftSettings=tt_enabled_shift_rows($pdo,$s);
+$shiftNames=array_values(
+    array_map(
+        static function(array $row): string {
+            return trim(
+                (string)$row['shift_name']
+            );
+        },
+        $shiftSettings
+    )
+);
+
+$currentAcademicYearId=0;
+
+foreach($years as $year){
+    if((int)($year['is_current']??0)===1){
+        $currentAcademicYearId=
+            (int)$year['id'];
+        break;
+    }
 }
+
+if(
+    $currentAcademicYearId<=0
+    &&!empty($years)
+){
+    $currentAcademicYearId=
+        (int)$years[0]['id'];
+}
+
+$defaultBranchId=0;
+$scopeBranchId=(int)($s['branch_id']??0);
+
+if($scopeBranchId>0){
+    foreach($branches as $branch){
+        if(
+            (int)$branch['id']
+            ===$scopeBranchId
+        ){
+            $defaultBranchId=
+                $scopeBranchId;
+            break;
+        }
+    }
+}
+
+if($defaultBranchId<=0){
+    foreach($branches as $branch){
+        if(
+            (int)($branch['is_main']??0)
+            ===1
+        ){
+            $defaultBranchId=
+                (int)$branch['id'];
+            break;
+        }
+    }
+}
+
+if(
+    $defaultBranchId<=0
+    &&!empty($branches)
+){
+    $defaultBranchId=
+        (int)$branches[0]['id'];
+}
+
+return [
+    'academic_years'=>$years,
+    'classes'=>$classes,
+    'sections'=>$sections,
+    'subjects'=>$subjects,
+    'teachers'=>$teachers,
+    'branches'=>$branches,
+    'rooms'=>$rooms,
+    'periods'=>$periods,
+    'shifts'=>$shiftNames,
+    'shift_settings'=>$shiftSettings,
+    'defaults'=>[
+        'academic_year_id'=>
+            $currentAcademicYearId,
+        'branch_id'=>
+            $defaultBranchId,
+    ],
+    'days'=>[
+        'Monday',
+        'Tuesday',
+        'Wednesday',
+        'Thursday',
+        'Friday',
+        'Saturday',
+        'Sunday'
+    ],
+    'statuses'=>[
+        'draft',
+        'pending',
+        'approved',
+        'rejected',
+        'archived'
+    ]
+];
+}
+
+function tt_selected_period(
+    PDO $pdo,
+    array $scope,
+    int $periodId
+): array {
+    if($periodId<=0){
+        throw new InvalidArgumentException(
+            'Select a Period from Time Settings.'
+        );
+    }
+
+    $stmt=$pdo->prepare(
+        "SELECT
+            id,
+            tenant_id,
+            branch_id,
+            academic_year_id,
+            shift_name,
+            period_name,
+            period_code,
+            start_time,
+            end_time,
+            is_break,
+            display_order,
+            status
+         FROM timetable_periods
+         WHERE id=:id
+           AND tenant_id=:tenant_id
+         LIMIT 1"
+    );
+
+    $stmt->execute([
+        'id'=>$periodId,
+        'tenant_id'=>(int)$scope['tenant_id'],
+    ]);
+
+    $period=$stmt->fetch(
+        PDO::FETCH_ASSOC
+    );
+
+    if(!$period){
+        throw new InvalidArgumentException(
+            'Selected Period was not found in Time Settings.'
+        );
+    }
+
+    /*
+     * Time Settings periods are reusable across timetable Academic Years
+     * and Shifts. The timetable entry stores its own selected Academic Year
+     * and Shift. The Period supplies only the reusable period identity/time.
+     */
+    if(
+        (int)$period['is_break']===1
+        ||strtolower(
+            (string)$period['status']
+        )!=='active'
+    ){
+        throw new InvalidArgumentException(
+            'Selected Period is not available for timetable use.'
+        );
+    }
+
+    return $period;
+}
+
 function tt_entries(PDO $pdo,array $s,array $f): array { $w=['t.tenant_id=:t','(:b=0 OR t.branch_id=:b OR t.branch_id IS NULL)'];$p=['t'=>$s['tenant_id'],'b'=>$s['branch_id']];$search=trim((string)($f['search']??''));if($search!==''){$w[]='(t.timetable_name LIKE :q OR t.class_name LIKE :q OR t.section_name LIKE :q OR t.subject_name LIKE :q OR t.teacher_name LIKE :q OR t.room_name LIKE :q)';$p['q']='%'.$search.'%';}foreach(['academic_year_id','shift_name','day_name','class_id','section_id','teacher_user_id','room_id','status'] as $k){$v=trim((string)($f[$k]??''));if($v!==''&&$v!=='all'){$w[]="t.$k=:$k";$p[$k]=$v;}}$q=$pdo->prepare("SELECT t.*,ay.year_name academic_year_name FROM timetable_entries t LEFT JOIN academic_years ay ON ay.id=t.academic_year_id AND ay.tenant_id=t.tenant_id WHERE ".implode(' AND ',$w)." ORDER BY FIELD(t.day_name,'Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'),t.period_id,t.class_name,t.section_name");$q->execute($p);return $q->fetchAll(PDO::FETCH_ASSOC); }
 function tt_conflicts(PDO $pdo,array $s,array $d,int $exclude=0): array { $q=$pdo->prepare("SELECT id,class_name,section_name,teacher_name,room_name,subject_name,day_name,period_name FROM timetable_entries WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND academic_year_id=:y AND shift_name=:sh AND day_name=:day AND period_id=:p AND id<>:x AND status<>'archived' AND ((class_id=:c AND (:sec=0 OR section_id=:sec)) OR (:teacher>0 AND teacher_user_id=:teacher) OR (:room>0 AND room_id=:room))");$q->execute(['t'=>$s['tenant_id'],'b'=>$s['branch_id'],'y'=>(int)$d['academic_year_id'],'sh'=>(string)$d['shift_name'],'day'=>(string)$d['day_name'],'p'=>(int)$d['period_id'],'x'=>$exclude,'c'=>(int)$d['class_id'],'sec'=>(int)($d['section_id']??0),'teacher'=>(int)($d['teacher_user_id']??0),'room'=>(int)($d['room_id']??0)]);return $q->fetchAll(PDO::FETCH_ASSOC); }
 
@@ -132,15 +485,15 @@ $action=strtolower(
     )
 );
 try{
-if($action==='meta'){if(!tt_can('view'))throw new RuntimeException('Permission denied.',403);tt_json(true,'Metadata loaded.',['csrf_token'=>function_exists('csrfToken')?csrfToken():'','meta'=>tt_meta($pdo,$scope),'permissions'=>['view'=>tt_can('view'),'add'=>tt_can('add')||tt_can('create'),'edit'=>tt_can('edit'),'delete'=>tt_can('delete'),'approve'=>tt_can('approve'),'print'=>tt_can('print'),'export'=>tt_can('export'),'import'=>tt_can('import'),'manage'=>tt_can('manage')]]);}
-if($action==='dashboard'){if(!tt_can('view'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("SELECT COUNT(*) total_entries,SUM(status='approved') approved_entries,SUM(status='pending') pending_entries,COUNT(DISTINCT teacher_user_id) teachers_used,COUNT(DISTINCT room_id) rooms_used FROM timetable_entries WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL)");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);$sum=$q->fetch(PDO::FETCH_ASSOC)?:[];$c=$pdo->prepare("SELECT COUNT(*) FROM(SELECT teacher_user_id,day_name,period_id,COUNT(*) n FROM timetable_entries WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND teacher_user_id>0 AND status<>'archived' GROUP BY teacher_user_id,day_name,period_id HAVING COUNT(*)>1)x");$c->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);$sum['conflicts']=(int)$c->fetchColumn();tt_json(true,'Dashboard loaded.',['summary'=>$sum]);}
-if($action==='list'){if(!tt_can('view'))throw new RuntimeException('Permission denied.',403);tt_json(true,'Entries loaded.',['entries'=>tt_entries($pdo,$scope,$_GET+$in)]);}
-if($action==='periods'){if(!tt_can('view'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("SELECT * FROM timetable_periods WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) ORDER BY display_order,start_time");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);tt_json(true,'Periods loaded.',['periods'=>$q->fetchAll(PDO::FETCH_ASSOC)]);}
+if($action==='meta'){if(!tt_can('view'))throw new RuntimeException('You do not have permission to view Timetable.',403);$canAdd=tt_can('add')||tt_can('create');tt_json(true,'Metadata loaded.',['csrf_token'=>function_exists('csrfToken')?csrfToken():'','meta'=>tt_meta($pdo,$scope),'permissions'=>['view'=>tt_can('view'),'add'=>$canAdd,'create'=>$canAdd,'edit'=>tt_can('edit'),'delete'=>tt_can('delete'),'approve'=>tt_can('approve'),'print'=>tt_can('print'),'pdf'=>tt_can('pdf'),'export'=>tt_can('export'),'import'=>tt_can('import'),'manage'=>tt_can('manage'),'time_settings'=>(tt_can('manage')||tt_can('edit')),'platform_full_access'=>tt_platform_full_access()],'build'=>'2026-08-10-timetable-final-tabs-removed-general-settings-shift-v7']);}
+if($action==='dashboard'){if(!tt_can('view'))throw new RuntimeException('You do not have permission to view Timetable.',403);$q=$pdo->prepare("SELECT COUNT(*) total_entries,SUM(status='approved') approved_entries,SUM(status='pending') pending_entries,COUNT(DISTINCT teacher_user_id) teachers_used,COUNT(DISTINCT room_id) rooms_used FROM timetable_entries WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL)");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);$sum=$q->fetch(PDO::FETCH_ASSOC)?:[];$c=$pdo->prepare("SELECT COUNT(*) FROM(SELECT teacher_user_id,day_name,period_id,COUNT(*) n FROM timetable_entries WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND teacher_user_id>0 AND status<>'archived' GROUP BY teacher_user_id,day_name,period_id HAVING COUNT(*)>1)x");$c->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);$sum['conflicts']=(int)$c->fetchColumn();tt_json(true,'Dashboard loaded.',['summary'=>$sum]);}
+if($action==='list'){if(!tt_can('view'))throw new RuntimeException('You do not have permission to view Timetable.',403);tt_json(true,'Entries loaded.',['entries'=>tt_entries($pdo,$scope,$_GET+$in)]);}
+if($action==='periods'){if(!tt_can('view'))throw new RuntimeException('You do not have permission to view timetable periods.',403);$q=$pdo->prepare("SELECT * FROM timetable_periods WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) ORDER BY display_order,start_time");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);tt_json(true,'Periods loaded.',['periods'=>$q->fetchAll(PDO::FETCH_ASSOC)]);}
 if($action==='assignments'){if(!tt_can('view'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("SELECT * FROM timetable_subject_assignments WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) ORDER BY class_name,section_name,subject_name");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);tt_json(true,'Assignments loaded.',['assignments'=>$q->fetchAll(PDO::FETCH_ASSOC)]);}
 if($action==='substitutes'){if(!tt_can('view'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("SELECT s.*,t.day_name,t.period_name,t.class_name,t.section_name,t.subject_name FROM timetable_substitutes s LEFT JOIN timetable_entries t ON t.id=s.timetable_entry_id WHERE s.tenant_id=:t AND (:b=0 OR s.branch_id=:b OR s.branch_id IS NULL) ORDER BY s.substitute_date DESC,s.id DESC");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);tt_json(true,'Substitutes loaded.',['substitutes'=>$q->fetchAll(PDO::FETCH_ASSOC)]);}
 if($action==='logs'){if(!tt_can('manage'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("SELECT * FROM timetable_logs WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) ORDER BY id DESC LIMIT 200");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);tt_json(true,'Logs loaded.',['logs'=>$q->fetchAll(PDO::FETCH_ASSOC)]);}
 if($action==='conflicts'){if(!tt_can('view'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("SELECT day_name,period_id,period_name,teacher_user_id,teacher_name,COUNT(*) total,GROUP_CONCAT(CONCAT(class_name,' ',COALESCE(section_name,'')) SEPARATOR ', ') affected_classes FROM timetable_entries WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND teacher_user_id>0 AND status<>'archived' GROUP BY day_name,period_id,teacher_user_id HAVING COUNT(*)>1");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);$teacher=$q->fetchAll(PDO::FETCH_ASSOC);$q=$pdo->prepare("SELECT day_name,period_id,period_name,room_id,room_name,COUNT(*) total,GROUP_CONCAT(CONCAT(class_name,' ',COALESCE(section_name,'')) SEPARATOR ', ') affected_classes FROM timetable_entries WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND room_id>0 AND status<>'archived' GROUP BY day_name,period_id,room_id HAVING COUNT(*)>1");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']]);tt_json(true,'Conflicts loaded.',['teacher_conflicts'=>$teacher,'room_conflicts'=>$q->fetchAll(PDO::FETCH_ASSOC)]);}
-if($action==='export'){if(!tt_can('export')&&!tt_can('print'))throw new RuntimeException('Permission denied.',403);$rows=tt_entries($pdo,$scope,$_GET);$format=strtolower((string)($_GET['format']??'csv'));while(ob_get_level()>0)ob_end_clean();$heads=['Day','Period','Class','Section','Subject','Teacher','Room','Shift','Status'];if($format==='csv'){header('Content-Type:text/csv; charset=utf-8');header('Content-Disposition:attachment; filename="timetable-'.date('Ymd-His').'.csv"');$f=fopen('php://output','wb');fputcsv($f,$heads);foreach($rows as $r)fputcsv($f,[$r['day_name'],$r['period_name'],$r['class_name'],$r['section_name'],$r['subject_name'],$r['teacher_name'],$r['room_name'],$r['shift_name'],$r['status']]);fclose($f);exit;}if($format==='excel'){header('Content-Type:application/vnd.ms-excel; charset=utf-8');header('Content-Disposition:attachment; filename="timetable-'.date('Ymd-His').'.xls"');echo "\xEF\xBB\xBF";}else header('Content-Type:text/html; charset=utf-8');echo '<!doctype html><html><head><meta charset="utf-8"><style>
+if($action==='export'){$format=strtolower((string)($_GET['format']??'csv'));$requiredPermission=match($format){'print'=>'print','pdf'=>'pdf',default=>'export'};if(!tt_can($requiredPermission))throw new RuntimeException('Permission denied for timetable '.$requiredPermission.'.',403);$rows=tt_entries($pdo,$scope,$_GET);while(ob_get_level()>0)ob_end_clean();$heads=['Day','Period','Class','Section','Subject','Teacher','Room','Shift','Status'];if($format==='csv'){header('Content-Type:text/csv; charset=utf-8');header('Content-Disposition:attachment; filename="timetable-'.date('Ymd-His').'.csv"');$f=fopen('php://output','wb');fputcsv($f,$heads);foreach($rows as $r)fputcsv($f,[$r['day_name'],$r['period_name'],$r['class_name'],$r['section_name'],$r['subject_name'],$r['teacher_name'],$r['room_name'],$r['shift_name'],$r['status']]);fclose($f);exit;}if($format==='excel'){header('Content-Type:application/vnd.ms-excel; charset=utf-8');header('Content-Disposition:attachment; filename="timetable-'.date('Ymd-His').'.xls"');echo "\xEF\xBB\xBF";}else header('Content-Type:text/html; charset=utf-8');echo '<!doctype html><html><head><meta charset="utf-8"><style>
 body{font-family:Arial,sans-serif;padding:20px;color:#111827}
 h1{font-size:22px;margin:0 0 16px}
 table{border-collapse:collapse;width:100%;font-size:11px}
@@ -149,10 +502,10 @@ th{background:#f1f5f9}
 </style></head><body'.($format==='print'?' onload="window.print()"':'').'><h1>Timetable Report</h1><table><tr>';foreach($heads as $h)echo '<th>'.htmlspecialchars($h).'</th>';echo '</tr>';foreach($rows as $r){echo '<tr>';foreach([$r['day_name'],$r['period_name'],$r['class_name'],$r['section_name'],$r['subject_name'],$r['teacher_name'],$r['room_name'],$r['shift_name'],$r['status']] as $v)echo '<td>'.htmlspecialchars((string)$v).'</td>';echo '</tr>';}echo '</table></body></html>';exit;}
 
 tt_csrf($in);
-if($action==='save_entry'){if(!tt_can((int)($in['id']??0)>0?'edit':'add')&&!tt_can((int)($in['id']??0)>0?'edit':'create'))throw new RuntimeException('Permission denied.',403);foreach(['academic_year_id','period_id','class_id','subject_id'] as $k)if((int)($in[$k]??0)<=0)throw new InvalidArgumentException('Complete all required fields.');$id=(int)($in['id']??0);$d=['branch_id'=>(int)($in['branch_id']??0),'academic_year_id'=>(int)$in['academic_year_id'],'shift_name'=>trim((string)($in['shift_name']??'General')),'timetable_name'=>trim((string)($in['timetable_name']??'Weekly Timetable')),'day_name'=>trim((string)$in['day_name']),'period_id'=>(int)$in['period_id'],'period_name'=>trim((string)$in['period_name']),'class_id'=>(int)$in['class_id'],'class_name'=>trim((string)$in['class_name']),'section_id'=>(int)($in['section_id']??0),'section_name'=>trim((string)($in['section_name']??'')),'subject_id'=>(int)$in['subject_id'],'subject_name'=>trim((string)$in['subject_name']),'teacher_user_id'=>(int)($in['teacher_user_id']??0),'teacher_name'=>trim((string)($in['teacher_name']??'')),'room_id'=>(int)($in['room_id']??0),'room_name'=>trim((string)($in['room_name']??'')),'entry_type'=>trim((string)($in['entry_type']??'regular')),'status'=>trim((string)($in['status']??'draft')),'approval_note'=>trim((string)($in['approval_note']??''))];if(tt_conflicts($pdo,$scope,$d,$id))throw new InvalidArgumentException('Conflict detected for this class, teacher, or room.');$old=null;if($id>0){$q=$pdo->prepare("SELECT * FROM timetable_entries WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>$id,'t'=>$scope['tenant_id']]);$old=$q->fetch(PDO::FETCH_ASSOC);if(!$old)throw new RuntimeException('Entry not found.',404);$v=$pdo->prepare("INSERT INTO timetable_versions(tenant_id,branch_id,timetable_entry_id,version_no,snapshot_json,change_note,created_by) VALUES(:t,:b,:id,:v,:j,:n,:u)");$v->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']?:null,'id'=>$id,'v'=>(int)$old['version_no'],'j'=>json_encode($old),'n'=>trim((string)($in['change_note']??'Updated')),'u'=>$scope['user_id']?:null]);$q=$pdo->prepare("UPDATE timetable_entries SET branch_id=:b,academic_year_id=:y,shift_name=:sh,timetable_name=:n,day_name=:d,period_id=:p,period_name=:pn,class_id=:c,class_name=:cn,section_id=:s,section_name=:sn,subject_id=:sub,subject_name=:subn,teacher_user_id=:teacher,teacher_name=:teachern,room_id=:r,room_name=:rn,entry_type=:et,status=:st,approval_note=:an,version_no=version_no+1,updated_by=:u WHERE id=:id AND tenant_id=:t");$q->execute(['b'=>$d['branch_id']?:null,'y'=>$d['academic_year_id'],'sh'=>$d['shift_name'],'n'=>$d['timetable_name'],'d'=>$d['day_name'],'p'=>$d['period_id'],'pn'=>$d['period_name'],'c'=>$d['class_id'],'cn'=>$d['class_name'],'s'=>$d['section_id']?:null,'sn'=>$d['section_name'],'sub'=>$d['subject_id'],'subn'=>$d['subject_name'],'teacher'=>$d['teacher_user_id']?:null,'teachern'=>$d['teacher_name'],'r'=>$d['room_id']?:null,'rn'=>$d['room_name'],'et'=>$d['entry_type'],'st'=>$d['status'],'an'=>$d['approval_note'],'u'=>$scope['user_id']?:null,'id'=>$id,'t'=>$scope['tenant_id']]);}else{$q=$pdo->prepare("INSERT INTO timetable_entries(tenant_id,branch_id,academic_year_id,shift_name,timetable_name,day_name,period_id,period_name,class_id,class_name,section_id,section_name,subject_id,subject_name,teacher_user_id,teacher_name,room_id,room_name,entry_type,status,approval_note,created_by) VALUES(:t,:b,:y,:sh,:n,:d,:p,:pn,:c,:cn,:s,:sn,:sub,:subn,:teacher,:teachern,:r,:rn,:et,:st,:an,:u)");$q->execute(['t'=>$scope['tenant_id'],'b'=>$d['branch_id']?:null,'y'=>$d['academic_year_id'],'sh'=>$d['shift_name'],'n'=>$d['timetable_name'],'d'=>$d['day_name'],'p'=>$d['period_id'],'pn'=>$d['period_name'],'c'=>$d['class_id'],'cn'=>$d['class_name'],'s'=>$d['section_id']?:null,'sn'=>$d['section_name'],'sub'=>$d['subject_id'],'subn'=>$d['subject_name'],'teacher'=>$d['teacher_user_id']?:null,'teachern'=>$d['teacher_name'],'r'=>$d['room_id']?:null,'rn'=>$d['room_name'],'et'=>$d['entry_type'],'st'=>$d['status'],'an'=>$d['approval_note'],'u'=>$scope['user_id']?:null]);$id=(int)$pdo->lastInsertId();}tt_log($pdo,$scope,$old?'update':'create','timetable_entry',$id,$old?'Entry updated.':'Entry created.',$old,$d);tt_json(true,$old?'Timetable entry updated.':'Timetable entry created.',['id'=>$id]);}
+if($action==='save_entry'){$editing=(int)($in['id']??0)>0;$requiredPermission=$editing?'edit':'create';if(!tt_can($requiredPermission))throw new RuntimeException($editing?'You do not have permission to edit timetable entries.':'You do not have permission to add timetable entries.',403);foreach(['academic_year_id','period_id','class_id','subject_id'] as $k)if((int)($in[$k]??0)<=0)throw new InvalidArgumentException('Complete all required fields.');$id=(int)($in['id']??0);$selectedYearId=(int)$in['academic_year_id'];$selectedShift=tt_require_enabled_shift($pdo,$scope,(string)($in['shift_name']??''));$selectedPeriod=tt_selected_period($pdo,$scope,(int)$in['period_id']);$d=['branch_id'=>(int)($in['branch_id']??0),'academic_year_id'=>$selectedYearId,'shift_name'=>$selectedShift,'timetable_name'=>trim((string)($in['timetable_name']??'Weekly Timetable')),'day_name'=>trim((string)$in['day_name']),'period_id'=>(int)$selectedPeriod['id'],'period_name'=>(string)$selectedPeriod['period_name'],'class_id'=>(int)$in['class_id'],'class_name'=>trim((string)$in['class_name']),'section_id'=>(int)($in['section_id']??0),'section_name'=>trim((string)($in['section_name']??'')),'subject_id'=>(int)$in['subject_id'],'subject_name'=>trim((string)$in['subject_name']),'teacher_user_id'=>(int)($in['teacher_user_id']??0),'teacher_name'=>trim((string)($in['teacher_name']??'')),'room_id'=>(int)($in['room_id']??0),'room_name'=>trim((string)($in['room_name']??'')),'entry_type'=>trim((string)($in['entry_type']??'regular')),'status'=>trim((string)($in['status']??'draft')),'approval_note'=>trim((string)($in['approval_note']??''))];if(tt_conflicts($pdo,$scope,$d,$id))throw new InvalidArgumentException('Conflict detected for this class, teacher, or room.');$old=null;if($id>0){$q=$pdo->prepare("SELECT * FROM timetable_entries WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>$id,'t'=>$scope['tenant_id']]);$old=$q->fetch(PDO::FETCH_ASSOC);if(!$old)throw new RuntimeException('Entry not found.',404);$v=$pdo->prepare("INSERT INTO timetable_versions(tenant_id,branch_id,timetable_entry_id,version_no,snapshot_json,change_note,created_by) VALUES(:t,:b,:id,:v,:j,:n,:u)");$v->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']?:null,'id'=>$id,'v'=>(int)$old['version_no'],'j'=>json_encode($old),'n'=>trim((string)($in['change_note']??'Updated')),'u'=>$scope['user_id']?:null]);$q=$pdo->prepare("UPDATE timetable_entries SET branch_id=:b,academic_year_id=:y,shift_name=:sh,timetable_name=:n,day_name=:d,period_id=:p,period_name=:pn,class_id=:c,class_name=:cn,section_id=:s,section_name=:sn,subject_id=:sub,subject_name=:subn,teacher_user_id=:teacher,teacher_name=:teachern,room_id=:r,room_name=:rn,entry_type=:et,status=:st,approval_note=:an,version_no=version_no+1,updated_by=:u WHERE id=:id AND tenant_id=:t");$q->execute(['b'=>$d['branch_id']?:null,'y'=>$d['academic_year_id'],'sh'=>$d['shift_name'],'n'=>$d['timetable_name'],'d'=>$d['day_name'],'p'=>$d['period_id'],'pn'=>$d['period_name'],'c'=>$d['class_id'],'cn'=>$d['class_name'],'s'=>$d['section_id']?:null,'sn'=>$d['section_name'],'sub'=>$d['subject_id'],'subn'=>$d['subject_name'],'teacher'=>$d['teacher_user_id']?:null,'teachern'=>$d['teacher_name'],'r'=>$d['room_id']?:null,'rn'=>$d['room_name'],'et'=>$d['entry_type'],'st'=>$d['status'],'an'=>$d['approval_note'],'u'=>$scope['user_id']?:null,'id'=>$id,'t'=>$scope['tenant_id']]);}else{$q=$pdo->prepare("INSERT INTO timetable_entries(tenant_id,branch_id,academic_year_id,shift_name,timetable_name,day_name,period_id,period_name,class_id,class_name,section_id,section_name,subject_id,subject_name,teacher_user_id,teacher_name,room_id,room_name,entry_type,status,approval_note,created_by) VALUES(:t,:b,:y,:sh,:n,:d,:p,:pn,:c,:cn,:s,:sn,:sub,:subn,:teacher,:teachern,:r,:rn,:et,:st,:an,:u)");$q->execute(['t'=>$scope['tenant_id'],'b'=>$d['branch_id']?:null,'y'=>$d['academic_year_id'],'sh'=>$d['shift_name'],'n'=>$d['timetable_name'],'d'=>$d['day_name'],'p'=>$d['period_id'],'pn'=>$d['period_name'],'c'=>$d['class_id'],'cn'=>$d['class_name'],'s'=>$d['section_id']?:null,'sn'=>$d['section_name'],'sub'=>$d['subject_id'],'subn'=>$d['subject_name'],'teacher'=>$d['teacher_user_id']?:null,'teachern'=>$d['teacher_name'],'r'=>$d['room_id']?:null,'rn'=>$d['room_name'],'et'=>$d['entry_type'],'st'=>$d['status'],'an'=>$d['approval_note'],'u'=>$scope['user_id']?:null]);$id=(int)$pdo->lastInsertId();}tt_log($pdo,$scope,$old?'update':'create','timetable_entry',$id,$old?'Entry updated.':'Entry created.',$old,$d);tt_json(true,$old?'Timetable entry updated.':'Timetable entry created.',['id'=>$id]);}
 if($action==='delete_entry'){if(!tt_can('delete'))throw new RuntimeException('Permission denied.',403);$id=(int)($in['id']??0);$q=$pdo->prepare("SELECT * FROM timetable_entries WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>$id,'t'=>$scope['tenant_id']]);$old=$q->fetch(PDO::FETCH_ASSOC);if(!$old)throw new RuntimeException('Entry not found.',404);$q=$pdo->prepare("DELETE FROM timetable_entries WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>$id,'t'=>$scope['tenant_id']]);tt_log($pdo,$scope,'delete','timetable_entry',$id,'Entry deleted.',$old,null);tt_json(true,'Timetable entry deleted.');}
-if($action==='save_period'){if(!tt_can('manage')&&!tt_can('edit'))throw new RuntimeException('Permission denied.',403);$id=(int)($in['id']??0);foreach(['academic_year_id','period_name','period_code','start_time','end_time'] as $k)if(trim((string)($in[$k]??''))==='')throw new InvalidArgumentException('Complete period details.');$p=['t'=>$scope['tenant_id'],'b'=>(int)($in['branch_id']??0)?:null,'y'=>(int)$in['academic_year_id'],'sh'=>trim((string)($in['shift_name']??'General')),'n'=>trim((string)$in['period_name']),'c'=>strtoupper(trim((string)$in['period_code'])),'st'=>trim((string)$in['start_time']),'et'=>trim((string)$in['end_time']),'br'=>!empty($in['is_break'])?1:0,'o'=>max(0,(int)($in['display_order']??0)),'s'=>trim((string)($in['status']??'active')),'u'=>$scope['user_id']?:null];if($id){$q=$pdo->prepare("UPDATE timetable_periods SET branch_id=:b,academic_year_id=:y,shift_name=:sh,period_name=:n,period_code=:c,start_time=:st,end_time=:et,is_break=:br,display_order=:o,status=:s,updated_by=:u WHERE id=:id AND tenant_id=:t");$q->execute($p+['id'=>$id]);}else{$q=$pdo->prepare("INSERT INTO timetable_periods(tenant_id,branch_id,academic_year_id,shift_name,period_name,period_code,start_time,end_time,is_break,display_order,status,created_by) VALUES(:t,:b,:y,:sh,:n,:c,:st,:et,:br,:o,:s,:u)");$q->execute($p);$id=(int)$pdo->lastInsertId();}tt_json(true,'Period saved.',['id'=>$id]);}
-if($action==='delete_period'){if(!tt_can('manage')&&!tt_can('delete'))throw new RuntimeException('Permission denied.',403);$id=(int)($in['id']??0);$q=$pdo->prepare("SELECT COUNT(*) FROM timetable_entries WHERE tenant_id=:t AND period_id=:id");$q->execute(['t'=>$scope['tenant_id'],'id'=>$id]);if((int)$q->fetchColumn()>0)throw new InvalidArgumentException('This period is already used.');$q=$pdo->prepare("DELETE FROM timetable_periods WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>$id,'t'=>$scope['tenant_id']]);tt_json(true,'Period deleted.');}
+if($action==='save_period'){if(!tt_can('manage')&&!tt_can('edit'))throw new RuntimeException('You do not have permission to manage Time Settings.',403);$id=(int)($in['id']??0);foreach(['academic_year_id','period_name','period_code','start_time','end_time'] as $k)if(trim((string)($in[$k]??''))==='')throw new InvalidArgumentException('Complete period details.');$periodStart=trim((string)$in['start_time']);$periodEnd=trim((string)$in['end_time']);if($periodEnd<=$periodStart)throw new InvalidArgumentException('Period End Time must be after Start Time.');$p=['t'=>$scope['tenant_id'],'b'=>(int)($in['branch_id']??0)?:null,'y'=>(int)$in['academic_year_id'],'sh'=>tt_require_enabled_shift($pdo,$scope,(string)($in['shift_name']??'')),'n'=>trim((string)$in['period_name']),'c'=>strtoupper(trim((string)$in['period_code'])),'st'=>trim((string)$in['start_time']),'et'=>trim((string)$in['end_time']),'br'=>!empty($in['is_break'])?1:0,'o'=>max(0,(int)($in['display_order']??0)),'s'=>trim((string)($in['status']??'active')),'u'=>$scope['user_id']?:null];if($id){$q=$pdo->prepare("UPDATE timetable_periods SET branch_id=:b,academic_year_id=:y,shift_name=:sh,period_name=:n,period_code=:c,start_time=:st,end_time=:et,is_break=:br,display_order=:o,status=:s,updated_by=:u WHERE id=:id AND tenant_id=:t");$q->execute($p+['id'=>$id]);}else{$q=$pdo->prepare("INSERT INTO timetable_periods(tenant_id,branch_id,academic_year_id,shift_name,period_name,period_code,start_time,end_time,is_break,display_order,status,created_by) VALUES(:t,:b,:y,:sh,:n,:c,:st,:et,:br,:o,:s,:u)");$q->execute($p);$id=(int)$pdo->lastInsertId();}tt_json(true,'Period saved.',['id'=>$id]);}
+if($action==='delete_period'){if(!tt_can('manage')&&!tt_can('delete'))throw new RuntimeException('You do not have permission to delete Time Settings.',403);$id=(int)($in['id']??0);$q=$pdo->prepare("SELECT COUNT(*) FROM timetable_entries WHERE tenant_id=:t AND period_id=:id");$q->execute(['t'=>$scope['tenant_id'],'id'=>$id]);if((int)$q->fetchColumn()>0)throw new InvalidArgumentException('This period is already used.');$q=$pdo->prepare("DELETE FROM timetable_periods WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>$id,'t'=>$scope['tenant_id']]);tt_json(true,'Period deleted.');}
 if($action==='save_assignment'){if(!tt_can('manage')&&!tt_can('edit'))throw new RuntimeException('Permission denied.',403);foreach(['academic_year_id','class_id','subject_id'] as $k)if((int)($in[$k]??0)<=0)throw new InvalidArgumentException('Academic year, class, and subject are required.');$id=(int)($in['id']??0);$p=['t'=>$scope['tenant_id'],'b'=>(int)($in['branch_id']??0)?:null,'y'=>(int)$in['academic_year_id'],'c'=>(int)$in['class_id'],'cn'=>trim((string)$in['class_name']),'s'=>(int)($in['section_id']??0)?:null,'sn'=>trim((string)($in['section_name']??'')),'sub'=>(int)$in['subject_id'],'subn'=>trim((string)$in['subject_name']),'teacher'=>(int)($in['teacher_user_id']??0)?:null,'teachern'=>trim((string)($in['teacher_name']??'')),'ppw'=>max(1,(int)($in['periods_per_week']??1)),'st'=>trim((string)($in['status']??'active')),'u'=>$scope['user_id']?:null];if($id){$q=$pdo->prepare("UPDATE timetable_subject_assignments SET branch_id=:b,academic_year_id=:y,class_id=:c,class_name=:cn,section_id=:s,section_name=:sn,subject_id=:sub,subject_name=:subn,teacher_user_id=:teacher,teacher_name=:teachern,periods_per_week=:ppw,status=:st,updated_by=:u WHERE id=:id AND tenant_id=:t");$q->execute($p+['id'=>$id]);}else{$q=$pdo->prepare("INSERT INTO timetable_subject_assignments(tenant_id,branch_id,academic_year_id,class_id,class_name,section_id,section_name,subject_id,subject_name,teacher_user_id,teacher_name,periods_per_week,status,created_by) VALUES(:t,:b,:y,:c,:cn,:s,:sn,:sub,:subn,:teacher,:teachern,:ppw,:st,:u)");$q->execute($p);$id=(int)$pdo->lastInsertId();}tt_json(true,'Subject assignment saved.',['id'=>$id]);}
 if($action==='delete_assignment'){if(!tt_can('manage')&&!tt_can('delete'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("DELETE FROM timetable_subject_assignments WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>(int)($in['id']??0),'t'=>$scope['tenant_id']]);tt_json(true,'Assignment deleted.');}
 if($action==='save_substitute'){if(!tt_can('manage')&&!tt_can('edit'))throw new RuntimeException('Permission denied.',403);$entry=(int)($in['timetable_entry_id']??0);$teacher=(int)($in['substitute_teacher_user_id']??0);$date=trim((string)($in['substitute_date']??''));if($entry<=0||$teacher<=0||$date==='')throw new InvalidArgumentException('Entry, date, and teacher are required.');$q=$pdo->prepare("SELECT * FROM timetable_entries WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>$entry,'t'=>$scope['tenant_id']]);$e=$q->fetch(PDO::FETCH_ASSOC);if(!$e)throw new RuntimeException('Entry not found.',404);$q=$pdo->prepare("INSERT INTO timetable_substitutes(tenant_id,branch_id,academic_year_id,timetable_entry_id,substitute_date,original_teacher_user_id,original_teacher_name,substitute_teacher_user_id,substitute_teacher_name,reason,status,created_by) VALUES(:t,:b,:y,:e,:d,:ot,:otn,:st,:stn,:r,:s,:u)");$q->execute(['t'=>$scope['tenant_id'],'b'=>$e['branch_id'],'y'=>$e['academic_year_id'],'e'=>$entry,'d'=>$date,'ot'=>$e['teacher_user_id'],'otn'=>$e['teacher_name'],'st'=>$teacher,'stn'=>trim((string)($in['substitute_teacher_name']??'')),'r'=>trim((string)($in['reason']??'')),'s'=>trim((string)($in['status']??'pending')),'u'=>$scope['user_id']?:null]);tt_json(true,'Substitute saved.',['id'=>(int)$pdo->lastInsertId()]);}
@@ -174,7 +527,7 @@ if($action==='approve_entry'){if(!tt_can('approve'))throw new RuntimeException('
         'Approval updated.'
     );}
 if($action==='duplicate'){if(!tt_can('add')&&!tt_can('create'))throw new RuntimeException('Permission denied.',403);$q=$pdo->prepare("SELECT * FROM timetable_entries WHERE id=:id AND tenant_id=:t");$q->execute(['id'=>(int)($in['id']??0),'t'=>$scope['tenant_id']]);$e=$q->fetch(PDO::FETCH_ASSOC);if(!$e)throw new RuntimeException('Entry not found.',404);unset($e['id'],$e['created_at'],$e['updated_at'],$e['approved_by'],$e['approved_at']);$e['status']='draft';$e['timetable_name'].=' Copy';if(tt_conflicts($pdo,$scope,$e))throw new InvalidArgumentException('Duplicate slot has a conflict.');$q=$pdo->prepare("INSERT INTO timetable_entries(tenant_id,branch_id,academic_year_id,shift_name,timetable_name,day_name,period_id,period_name,class_id,class_name,section_id,section_name,subject_id,subject_name,teacher_user_id,teacher_name,room_id,room_name,entry_type,status,approval_note,created_by) VALUES(:tenant_id,:branch_id,:academic_year_id,:shift_name,:timetable_name,:day_name,:period_id,:period_name,:class_id,:class_name,:section_id,:section_name,:subject_id,:subject_name,:teacher_user_id,:teacher_name,:room_id,:room_name,:entry_type,:status,:approval_note,:created_by)");$q->execute(['tenant_id'=>$scope['tenant_id'],'branch_id'=>$e['branch_id'],'academic_year_id'=>$e['academic_year_id'],'shift_name'=>$e['shift_name'],'timetable_name'=>$e['timetable_name'],'day_name'=>$e['day_name'],'period_id'=>$e['period_id'],'period_name'=>$e['period_name'],'class_id'=>$e['class_id'],'class_name'=>$e['class_name'],'section_id'=>$e['section_id'],'section_name'=>$e['section_name'],'subject_id'=>$e['subject_id'],'subject_name'=>$e['subject_name'],'teacher_user_id'=>$e['teacher_user_id'],'teacher_name'=>$e['teacher_name'],'room_id'=>$e['room_id'],'room_name'=>$e['room_name'],'entry_type'=>$e['entry_type'],'status'=>'draft','approval_note'=>$e['approval_note'],'created_by'=>$scope['user_id']?:null]);tt_json(true,'Entry duplicated.',['id'=>(int)$pdo->lastInsertId()]);}
-if($action==='auto_generate'){if(!tt_can('manage'))throw new RuntimeException('Permission denied.',403);$year=(int)($in['academic_year_id']??0);$shift=trim((string)($in['shift_name']??'General'));if($year<=0)throw new InvalidArgumentException('Select an academic year.');$q=$pdo->prepare("SELECT * FROM timetable_subject_assignments WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND academic_year_id=:y AND status='active' ORDER BY class_id,section_id,id");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id'],'y'=>$year]);$as=$q->fetchAll(PDO::FETCH_ASSOC);$q=$pdo->prepare("SELECT * FROM timetable_periods WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND academic_year_id=:y AND shift_name=:s AND status='active' AND is_break=0 ORDER BY display_order,start_time");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id'],'y'=>$year,'s'=>$shift]);$ps=$q->fetchAll(PDO::FETCH_ASSOC);if(!$as||!$ps)throw new InvalidArgumentException('Create assignments and periods first.');$days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];$created=0;$slot=0;foreach($as as $a){for($i=0;$i<(int)$a['periods_per_week'];$i++){for($try=0;$try<count($days)*count($ps);$try++,$slot++){$day=$days[intdiv($slot,count($ps))%count($days)];$p=$ps[$slot%count($ps)];$cand=['academic_year_id'=>$year,'shift_name'=>$shift,'day_name'=>$day,'period_id'=>(int)$p['id'],'class_id'=>(int)$a['class_id'],'section_id'=>(int)($a['section_id']??0),'teacher_user_id'=>(int)($a['teacher_user_id']??0),'room_id'=>0];if(!tt_conflicts($pdo,$scope,$cand)){$ins=$pdo->prepare("INSERT INTO timetable_entries(tenant_id,branch_id,academic_year_id,shift_name,timetable_name,day_name,period_id,period_name,class_id,class_name,section_id,section_name,subject_id,subject_name,teacher_user_id,teacher_name,entry_type,status,created_by) VALUES(:t,:b,:y,:sh,'Auto Generated',:d,:p,:pn,:c,:cn,:s,:sn,:sub,:subn,:teacher,:teachern,'regular','draft',:u)");$ins->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']?:null,'y'=>$year,'sh'=>$shift,'d'=>$day,'p'=>$p['id'],'pn'=>$p['period_name'],'c'=>$a['class_id'],'cn'=>$a['class_name'],'s'=>$a['section_id'],'sn'=>$a['section_name'],'sub'=>$a['subject_id'],'subn'=>$a['subject_name'],'teacher'=>$a['teacher_user_id'],'teachern'=>$a['teacher_name'],'u'=>$scope['user_id']?:null]);$created++;break;}}}}tt_json(true,"$created timetable entries generated.",['created'=>$created]);}
+if($action==='auto_generate'){if(!tt_can('manage'))throw new RuntimeException('Permission denied.',403);$year=(int)($in['academic_year_id']??0);$shift=tt_require_enabled_shift($pdo,$scope,(string)($in['shift_name']??''));if($year<=0)throw new InvalidArgumentException('Select an academic year.');$q=$pdo->prepare("SELECT * FROM timetable_subject_assignments WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND academic_year_id=:y AND status='active' ORDER BY class_id,section_id,id");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id'],'y'=>$year]);$as=$q->fetchAll(PDO::FETCH_ASSOC);$q=$pdo->prepare("SELECT * FROM timetable_periods WHERE tenant_id=:t AND (:b=0 OR branch_id=:b OR branch_id IS NULL) AND academic_year_id=:y AND shift_name=:s AND status='active' AND is_break=0 ORDER BY display_order,start_time");$q->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id'],'y'=>$year,'s'=>$shift]);$ps=$q->fetchAll(PDO::FETCH_ASSOC);if(!$as||!$ps)throw new InvalidArgumentException('Create assignments and periods first.');$days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];$created=0;$slot=0;foreach($as as $a){for($i=0;$i<(int)$a['periods_per_week'];$i++){for($try=0;$try<count($days)*count($ps);$try++,$slot++){$day=$days[intdiv($slot,count($ps))%count($days)];$p=$ps[$slot%count($ps)];$cand=['academic_year_id'=>$year,'shift_name'=>$shift,'day_name'=>$day,'period_id'=>(int)$p['id'],'class_id'=>(int)$a['class_id'],'section_id'=>(int)($a['section_id']??0),'teacher_user_id'=>(int)($a['teacher_user_id']??0),'room_id'=>0];if(!tt_conflicts($pdo,$scope,$cand)){$ins=$pdo->prepare("INSERT INTO timetable_entries(tenant_id,branch_id,academic_year_id,shift_name,timetable_name,day_name,period_id,period_name,class_id,class_name,section_id,section_name,subject_id,subject_name,teacher_user_id,teacher_name,entry_type,status,created_by) VALUES(:t,:b,:y,:sh,'Auto Generated',:d,:p,:pn,:c,:cn,:s,:sn,:sub,:subn,:teacher,:teachern,'regular','draft',:u)");$ins->execute(['t'=>$scope['tenant_id'],'b'=>$scope['branch_id']?:null,'y'=>$year,'sh'=>$shift,'d'=>$day,'p'=>$p['id'],'pn'=>$p['period_name'],'c'=>$a['class_id'],'cn'=>$a['class_name'],'s'=>$a['section_id'],'sn'=>$a['section_name'],'sub'=>$a['subject_id'],'subn'=>$a['subject_name'],'teacher'=>$a['teacher_user_id'],'teachern'=>$a['teacher_name'],'u'=>$scope['user_id']?:null]);$created++;break;}}}}tt_json(true,"$created timetable entries generated.",['created'=>$created]);}
 if($action==='import_csv'){if(!tt_can('import'))throw new RuntimeException('Permission denied.',403);$csv=trim((string)($in['csv_text']??''));if($csv==='')throw new InvalidArgumentException('Paste CSV content first.');$lines=preg_split('/\r\n|\r|\n/',$csv);$head=array_map(fn($v)=>strtolower(trim($v)),str_getcsv(array_shift($lines)));$created=0;$errors=[];foreach($lines as $i=>$line){if(trim($line)==='')continue;$row=array_combine($head,array_pad(str_getcsv($line),count($head),''));try{foreach(['academic_year_id','period_id','class_id','subject_id'] as $k)if((int)($row[$k]??0)<=0)throw new RuntimeException('Missing required value.');if(tt_conflicts($pdo,$scope,$row))throw new RuntimeException('Conflict detected.');$q=$pdo->prepare("INSERT INTO timetable_entries(tenant_id,branch_id,academic_year_id,shift_name,timetable_name,day_name,period_id,period_name,class_id,class_name,section_id,section_name,subject_id,subject_name,teacher_user_id,teacher_name,room_id,room_name,entry_type,status,created_by) VALUES(:t,:b,:y,:sh,:n,:d,:p,:pn,:c,:cn,:s,:sn,:sub,:subn,:teacher,:teachern,:r,:rn,:et,:st,:u)");$q->execute(['t'=>$scope['tenant_id'],'b'=>(int)($row['branch_id']??0)?:null,'y'=>(int)$row['academic_year_id'],'sh'=>$row['shift_name']??'General','n'=>$row['timetable_name']??'Imported','d'=>$row['day_name']??'Monday','p'=>(int)$row['period_id'],'pn'=>$row['period_name']??'','c'=>(int)$row['class_id'],'cn'=>$row['class_name']??'','s'=>(int)($row['section_id']??0)?:null,'sn'=>$row['section_name']??'','sub'=>(int)$row['subject_id'],'subn'=>$row['subject_name']??'','teacher'=>(int)($row['teacher_user_id']??0)?:null,'teachern'=>$row['teacher_name']??'','r'=>(int)($row['room_id']??0)?:null,'rn'=>$row['room_name']??'','et'=>$row['entry_type']??'regular','st'=>$row['status']??'draft','u'=>$scope['user_id']?:null]);$created++;}catch(Throwable $e){$errors[]='Line '.($i+2).': '.$e->getMessage();}}tt_json(true,"$created rows imported.",['created'=>$created,'errors'=>$errors]);}
 tt_json(false,'Invalid timetable action.',[],400);
 }catch(InvalidArgumentException $e){tt_json(false,$e->getMessage(),[],422);}catch(RuntimeException $e){$st=(int)$e->getCode();tt_json(false,$e->getMessage(),[],$st>=400&&$st<=599?$st:403);}catch(Throwable $e){error_log('timetable-api.php: '.$e->getMessage());tt_json(false,'Timetable request failed: '.$e->getMessage(),[],500);}

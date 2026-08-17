@@ -376,7 +376,7 @@ $csrfToken = function_exists('csrfToken') ? csrfToken() : '';
                                     <i data-lucide="search"></i>
                                 </button>
                             </div>
-                            <small class="sa-icon-help">Choose an icon visually. Invalid icon names automatically use Circle.</small>
+                            <small class="sa-icon-help">Choose from all icons available in the currently loaded Lucide library.</small>
                         </div>
 
                         <div class="col-md-8">
@@ -466,7 +466,7 @@ $csrfToken = function_exists('csrfToken') ? csrfToken() : '';
                                     <i data-lucide="search"></i>
                                 </button>
                             </div>
-                            <small class="sa-icon-help">Choose an icon visually. Invalid icon names automatically use Circle.</small>
+                            <small class="sa-icon-help">Choose from all icons available in the currently loaded Lucide library.</small>
                         </div>
 
                         <div class="col-md-8">
@@ -506,7 +506,7 @@ $csrfToken = function_exists('csrfToken') ? csrfToken() : '';
                     <button type="button" class="btn-ui" data-bs-dismiss="modal">Cancel</button>
                     <button id="applySidebarEditBtn" type="submit" class="btn-ui btn-primary-ui">
                         <i data-lucide="save"></i>
-                        Apply Changes
+                        Update Sidebar Option
                     </button>
                 </div>
             </form>
@@ -521,7 +521,7 @@ $csrfToken = function_exists('csrfToken') ? csrfToken() : '';
             <div class="modal-header">
                 <div>
                     <h5 class="modal-title">Choose Menu Icon</h5>
-                    <small class="text-muted">Search and select a supported icon.</small>
+                    <small class="text-muted">Search and select any icon available in the currently loaded Lucide library.</small>
                 </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
@@ -562,44 +562,68 @@ let csrf = <?= json_encode(
 let items = [];
 let activeIconTarget = null;
 
-const supportedIcons = Object.freeze([
+const fallbackIconCatalog = Object.freeze([
     'circle','layout-dashboard','school','graduation-cap','book-open',
-    'book-marked','library','users','users-round','user-round',
-    'user-plus','contact','contact-round','building-2','landmark',
-    'git-branch','network','layers','folder','folder-open','files',
-    'file-text','file-spreadsheet','clipboard-list','clipboard-check',
-    'calendar','calendar-days','clock','timer','history',
-    'indian-rupee','wallet','credit-card','receipt','badge-indian-rupee',
-    'banknote','chart-bar','chart-line','chart-pie','trending-up',
-    'table','list','list-checks','search','filter','sliders-horizontal',
-    'settings','settings-2','palette','paintbrush','monitor',
-    'shield','shield-check','key-round','lock','unlock','log-in',
-    'log-out','bell','bell-ring','mail','message-circle','phone',
-    'map-pin','navigation','bus','car','route','warehouse',
-    'package','boxes','shopping-cart','store','briefcase-business',
-    'id-card','badge-check','award','trophy','star','heart',
-    'image','image-up','camera','upload','download','printer',
-    'save','plus','plus-circle','square-pen','pencil','trash-2',
+    'library','users','users-round','user-round','user-plus',
+    'contact','building-2','landmark','network','layers',
+    'folder','folder-open','files','file-text','calendar',
+    'calendar-days','clock','history','indian-rupee','wallet',
+    'credit-card','receipt','chart-bar','chart-line','chart-pie',
+    'settings','settings-2','shield','shield-check','key-round',
+    'bell','mail','message-circle','map-pin','navigation',
+    'bus','car','route','package','boxes','store',
+    'briefcase-business','badge-check','award','trophy','star',
+    'image','camera','upload','download','printer','save',
+    'plus','plus-circle','square-pen','pencil','trash-2',
     'refresh-cw','rotate-ccw','wrench','circle-help','info',
     'triangle-alert','circle-check','circle-x','eye','eye-off',
-    'chevron-right','chevrons-right','menu','panel-left','home'
+    'search','filter','menu','panel-left','home'
 ]);
 
-const fallbackGlyphs = Object.freeze({
-    school:'🏫',
-    users:'👥',
-    'users-round':'👥',
-    settings:'⚙️',
-    'settings-2':'⚙️',
-    'layout-dashboard':'▦',
-    file:'📄',
-    'file-text':'📄',
-    calendar:'📅',
-    bus:'🚌',
-    wallet:'₹',
-    'indian-rupee':'₹',
-    circle:'●'
-});
+let cachedLucideIconCatalog = null;
+
+function lucideKeyToKebab(value) {
+    return String(value || '')
+        .replace(/Icon$/, '')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')
+        .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+        .replace(/[_\s]+/g, '-')
+        .replace(/[^A-Za-z0-9-]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .toLowerCase();
+}
+
+function getLucideIconCatalog(force = false) {
+    if (cachedLucideIconCatalog && !force) {
+        return cachedLucideIconCatalog;
+    }
+
+    const names = new Set(fallbackIconCatalog);
+
+    const lucideIcons =
+        window.lucide
+        && window.lucide.icons
+        && typeof window.lucide.icons === 'object'
+            ? window.lucide.icons
+            : {};
+
+    Object.keys(lucideIcons).forEach(key => {
+        const iconName = lucideKeyToKebab(key);
+
+        if (
+            iconName
+            && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(iconName)
+        ) {
+            names.add(iconName);
+        }
+    });
+
+    cachedLucideIconCatalog = Array.from(names)
+        .sort((a, b) => a.localeCompare(b));
+
+    return cachedLucideIconCatalog;
+}
 
 const $ = id => document.getElementById(id);
 
@@ -627,6 +651,7 @@ const editOrder = $('editOrder');
 const editCanShow = $('editCanShow');
 const editVisible = $('editVisible');
 const editActive = $('editActive');
+const editSaveButton = $('applySidebarEditBtn');
 const newIcon = $('newIcon');
 const newIconPreview = $('newIconPreview');
 const editIconPreview = $('editIconPreview');
@@ -700,51 +725,49 @@ const iconPickerModal = modalController('iconPickerModal');
 function normalizeIcon(value) {
     const icon = String(value || '')
         .trim()
+        .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
         .toLowerCase()
         .replace(/[^a-z0-9-]+/g, '-')
+        .replace(/-+/g, '-')
         .replace(/^-+|-+$/g, '');
 
-    return supportedIcons.includes(icon)
-        ? icon
-        : 'circle';
+    return icon || 'circle';
 }
 
 function iconMarkup(iconName) {
     const icon = normalizeIcon(iconName);
-
-    if (window.lucide?.icons?.[icon]) {
-        return `<i data-lucide="${esc(icon)}"></i>`;
-    }
-
-    return `<span class="sa-icon-fallback">${
-        esc(fallbackGlyphs[icon] || fallbackGlyphs.circle)
-    }</span>`;
+    return `<i data-lucide="${esc(icon)}"></i>`;
 }
 
 function refreshLucide(scope = document) {
-    if (window.lucide?.createIcons) {
-        window.lucide.createIcons({
-            attrs: {
-                'stroke-width': 1.9
-            },
-            nameAttr: 'data-lucide',
-            root: scope
-        });
+    if (!window.lucide?.createIcons) {
+        return;
     }
+
+    window.lucide.createIcons({
+        attrs: {
+            'stroke-width': 1.9
+        },
+        nameAttr: 'data-lucide'
+    });
 }
 
 function setIconPreview(element, iconName) {
     if (!element) return;
 
     const normalized = normalizeIcon(iconName);
+
     element.innerHTML = iconMarkup(normalized);
     element.dataset.icon = normalized;
+
     refreshLucide(element);
 }
 
 function openIconPicker(targetInput) {
     activeIconTarget = targetInput;
     iconPickerSearch.value = '';
+
+    cachedLucideIconCatalog = null;
     renderIconPicker('');
     iconPickerModal.show();
 
@@ -762,9 +785,13 @@ function renderIconPicker(query = '') {
         activeIconTarget?.value || 'circle'
     );
 
-    const icons = supportedIcons.filter(icon =>
-        icon.includes(normalizedQuery)
-    );
+    const allIcons = getLucideIconCatalog();
+
+    const icons = normalizedQuery === ''
+        ? allIcons
+        : allIcons.filter(icon =>
+            icon.includes(normalizedQuery)
+        );
 
     iconPickerGrid.innerHTML = icons.length
         ? icons.map(icon => `
@@ -772,12 +799,13 @@ function renderIconPicker(query = '') {
                 class="sa-icon-option ${icon === selected ? 'active' : ''}"
                 type="button"
                 data-icon="${esc(icon)}"
+                title="${esc(icon)}"
             >
                 ${iconMarkup(icon)}
                 <span>${esc(icon)}</span>
             </button>
         `).join('')
-        : '<div class="sa-icon-empty">No matching icons found.</div>';
+        : '<div class="sa-icon-empty">No matching Lucide icons found.</div>';
 
     refreshLucide(iconPickerGrid);
 }
@@ -790,10 +818,16 @@ function chooseIcon(iconName) {
 
     if (activeIconTarget === newIcon) {
         setIconPreview(newIconPreview, icon);
-    }
-
-    if (activeIconTarget === editIcon) {
+    } else if (activeIconTarget === editIcon) {
         setIconPreview(editIconPreview, icon);
+    } else {
+        const row = activeIconTarget.closest('tr[data-id]');
+        const preview = row?.querySelector('.sa-live-row-icon .sa-icon');
+
+        if (preview) {
+            preview.innerHTML = iconMarkup(icon);
+            refreshLucide(preview);
+        }
     }
 
     activeIconTarget.dispatchEvent(
@@ -1410,7 +1444,7 @@ function openEditSidebar(id) {
     editModal.show();
 }
 
-function applySidebarEdit() {
+async function applySidebarEdit() {
     const item = items.find(value =>
         Number(value.sidebar_item_id)
         === Number(editId.value)
@@ -1422,38 +1456,78 @@ function applySidebarEdit() {
     }
 
     const title = editTitle.value.trim();
+    const routeValue = editRoute.value.trim() || '#';
     const icon = normalizeIcon(editIcon.value);
-
-    item.parent_id =
+    const parentId =
         editParent.value === ''
             ? null
             : Number(editParent.value);
 
-    item.menu_title = title;
-    item.effective_title = title;
-    item.custom_title = '';
-    item.route = editRoute.value.trim() || '#';
-    item.icon = icon;
-    item.effective_icon = icon;
-    item.custom_icon = '';
-    item.display_order =
-        Number(editOrder.value || 0);
-    item.can_show =
-        editCanShow.checked ? 1 : 0;
-    item.is_visible =
-        editVisible.checked ? 1 : 0;
-    item.is_active =
-        editActive.checked ? 1 : 0;
+    if (!title) {
+        message('Menu Title is required.', false);
+        editTitle.focus();
+        return;
+    }
 
-    editModal.hide();
-    render();
+    editSaveButton.disabled = true;
 
-    message(
-        'Sidebar item updated. Click Save Changes to store it in the database.',
-        true
-    );
+    try {
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            body: JSON.stringify({
+                action: 'update_item',
+                role_id: Number(role.value),
+                csrf_token: csrf,
+                sidebar_item_id: Number(item.sidebar_item_id),
+                parent_id: parentId,
+                menu_title: title,
+                route: routeValue,
+                icon,
+                display_order: Number(editOrder.value || 0),
+                can_show: editCanShow.checked ? 1 : 0,
+                is_visible: editVisible.checked ? 1 : 0,
+                is_active: editActive.checked ? 1 : 0
+            })
+        });
+
+        const result = await readJson(response);
+
+        if (!response.ok || !result.success) {
+            throw new Error(
+                result.message
+                || 'Unable to update sidebar option.'
+            );
+        }
+
+        if (result.data?.csrf_token) {
+            csrf = result.data.csrf_token;
+        }
+
+        editModal.hide();
+
+        message(
+            result.message
+            || 'Sidebar option updated successfully.',
+            true
+        );
+
+        await load(role.value);
+    } catch (error) {
+        message(
+            error.message
+            || 'Unable to update sidebar option.',
+            false
+        );
+    } finally {
+        editSaveButton.disabled = false;
+    }
 }
-
 async function deleteSidebarOption(id, title) {
     if (!window.confirm(
         `Delete "${title}" and all of its child sidebar items?`
@@ -1695,7 +1769,7 @@ addForm.addEventListener('submit', event => {
     createSidebarOption();
 });
 
-editForm.addEventListener('submit', event => {
+editForm.addEventListener('submit', async event => {
     event.preventDefault();
 
     if (!editForm.checkValidity()) {
@@ -1703,7 +1777,7 @@ editForm.addEventListener('submit', event => {
         return;
     }
 
-    applySidebarEdit();
+    await applySidebarEdit();
 });
 
 function initializePage() {

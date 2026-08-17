@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-17-fee-structures-hy093-fix-v8 */
+
 ob_start();
 ini_set('display_errors','0');
 error_reporting(E_ALL);
@@ -20,12 +22,142 @@ function fsInput():array{
     }
     return $_POST;
 }
-function fsScope():array{
+function fsScope(PDO $pdo):array{
+    if(session_status()!==PHP_SESSION_ACTIVE){session_start();}
+
     $user=function_exists('current_user')?current_user():[];
     $user=is_array($user)?$user:[];
+
+    $tenantId=(int)(
+        $user['tenant_id']
+        ??$user['school_id']
+        ??$_SESSION['tenant_id']
+        ??$_SESSION['school_id']
+        ??0
+    );
+
+    $userId=(int)(
+        $user['id']
+        ??$user['user_id']
+        ??$_SESSION['user_id']
+        ??0
+    );
+
+    /*
+     * Branch Settings selected/current branch is authoritative.
+     * Never prefer an older branch value cached in current_user().
+     */
+    $branchId=0;
+
+    if(function_exists('current_branch_id')){
+        try{$branchId=(int)current_branch_id();}catch(Throwable){$branchId=0;}
+    }
+
+    if($branchId<=0&&function_exists('branch_current_id')){
+        try{$branchId=(int)branch_current_id();}catch(Throwable){$branchId=0;}
+    }
+
+    if($branchId<=0){
+        $branchId=(int)(
+            $_SESSION['branch_id']
+            ??$_SESSION['default_branch_id']
+            ??$user['branch_id']
+            ??$user['default_branch_id']
+            ??0
+        );
+    }
+
+    if(
+        $branchId<=0
+        &&$userId>0
+        &&fsTable($pdo,'users')
+        &&fsColumn($pdo,'users','default_branch_id')
+    ){
+        $s=$pdo->prepare(
+            "SELECT default_branch_id
+             FROM users
+             WHERE id=:user_id
+               AND tenant_id=:tenant_id
+             LIMIT 1"
+        );
+        $s->execute([
+            'user_id'=>$userId,
+            'tenant_id'=>$tenantId,
+        ]);
+        $branchId=(int)$s->fetchColumn();
+    }
+
+    if($branchId<=0&&$tenantId>0&&fsTable($pdo,'branches')){
+        $s=$pdo->prepare(
+            "SELECT id
+             FROM branches
+             WHERE tenant_id=:tenant_id
+               AND status='active'
+             ORDER BY is_main DESC,id ASC
+             LIMIT 1"
+        );
+        $s->execute(['tenant_id'=>$tenantId]);
+        $branchId=(int)$s->fetchColumn();
+    }
+
+    if($tenantId<=0||$userId<=0){
+        throw new RuntimeException(
+            'School tenant or user session was not found.',
+            401
+        );
+    }
+
+    if($branchId<=0){
+        throw new RuntimeException(
+            'Active Branch is required for Fee Structures.',
+            422
+        );
+    }
+
+    if(fsTable($pdo,'branches')){
+        $s=$pdo->prepare(
+            "SELECT branch_name
+             FROM branches
+             WHERE id=:branch_id
+               AND tenant_id=:tenant_id
+               AND status='active'
+             LIMIT 1"
+        );
+        $s->execute([
+            'branch_id'=>$branchId,
+            'tenant_id'=>$tenantId,
+        ]);
+        $branchName=(string)($s->fetchColumn()?:'');
+
+        if($branchName===''){
+            throw new RuntimeException(
+                'The selected Branch does not belong to this School.',
+                403
+            );
+        }
+
+        $_SESSION['branch_id']=$branchId;
+        $_SESSION['default_branch_id']=$branchId;
+        $_SESSION['branch_name']=$branchName;
+    }
+
+    try{
+        $s=$pdo->prepare(
+            "SET @schoolerp_tenant_id=:tenant_id,
+                 @schoolerp_branch_id=:branch_id"
+        );
+        $s->execute([
+            'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
+        ]);
+    }catch(Throwable){
+        /* Compatibility with databases without strict branch triggers. */
+    }
+
     return[
-        'tenant_id'=>(int)($user['tenant_id']??$user['school_id']??$_SESSION['tenant_id']??$_SESSION['school_id']??0),
-        'user_id'=>(int)($user['id']??$user['user_id']??$_SESSION['user_id']??0),
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+        'user_id'=>$userId,
     ];
 }
 function fsCsrf(array $input):void{
@@ -48,9 +180,27 @@ function fsIndex(PDO $pdo,string $table,string $index):bool{
     $s->execute(['table'=>$table,'index'=>$index]);
     return (int)$s->fetchColumn()>0;
 }
-function fsEnsure(PDO $pdo,int $tenantId):void{
+function fsEnsure(PDO $pdo,int $tenantId,int $branchId):void{
+    /* Build: 2026-08-12-fee-structure-list-total-sync-fixed-v6 */
     foreach(['academic_years','classes','fee_heads','fee_structures','fee_structure_items','student_fee_assignments'] as $table){
         if(!fsTable($pdo,$table))throw new RuntimeException('Missing required database table: '.$table.'.');
+    }
+
+    foreach([
+        'academic_years',
+        'class_management_classes',
+        'classes',
+        'sections',
+    ] as $branchTable){
+        if(fsTable($pdo,$branchTable)&&!fsColumn($pdo,$branchTable,'branch_id')){
+            throw new RuntimeException(
+                'Branch-wise Fee Structures require branch_id in '.$branchTable.'.'
+            );
+        }
+    }
+
+    if($branchId<=0){
+        throw new RuntimeException('Active Branch is required for Fee Structures.');
     }
 
     $pdo->exec("CREATE TABLE IF NOT EXISTS fee_types(
@@ -170,6 +320,30 @@ function fsEnsure(PDO $pdo,int $tenantId):void{
     }
 
 
+
+    /*
+     * School rule:
+     * Tuition Fee + Admission Fee are part of every Fee Structure.
+     * The page already auto-renders mandatory fee types, so enforcing these
+     * two master records here keeps old installations consistent too.
+     */
+    $mandatoryBaseFees = $pdo->prepare(
+        "UPDATE fee_types
+         SET is_mandatory = 1,
+             is_enabled = 1,
+             usage_scope = CASE
+                 WHEN COALESCE(usage_scope,'structure') = 'extra'
+                 THEN 'both'
+                 ELSE COALESCE(usage_scope,'structure')
+             END
+         WHERE tenant_id = :tenant_id
+           AND fee_type_code IN ('TUITION_FEE','ADMISSION_FEE')
+           AND deleted_at IS NULL"
+    );
+    $mandatoryBaseFees->execute([
+        'tenant_id' => $tenantId,
+    ]);
+
     $pdo->exec("CREATE TABLE IF NOT EXISTS extra_fee_batches(
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         tenant_id BIGINT UNSIGNED NOT NULL,
@@ -209,7 +383,7 @@ function fsEnsure(PDO $pdo,int $tenantId):void{
         KEY idx_extra_fee_student_item(student_fee_item_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 
-    fsSyncManagedClasses($pdo,$tenantId);
+    fsSyncManagedClasses($pdo,$tenantId,$branchId);
 
     /* Migrate legacy Admission/Tuition/Term items when possible. */
     if(fsColumn($pdo,'fee_structure_items','fee_type_key')){
@@ -225,21 +399,25 @@ function fsEnsure(PDO $pdo,int $tenantId):void{
  * Synchronize Class Management rows into the canonical classes/sections tables
  * used by Fee Structures, Students, Attendance and Fee Collection.
  */
-function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
+function fsSyncManagedClasses(PDO $pdo,int $tenantId,int $branchId):void{
     if(!fsTable($pdo,'class_management_classes')){
         return;
     }
 
     $source=$pdo->prepare(
         "SELECT
-            id,academic_year_id,class_name,section_name,
+            id,branch_id,academic_year_id,class_name,section_name,
             maximum_strength,display_order,status
          FROM class_management_classes
          WHERE tenant_id=:tenant_id
+           AND branch_id=:branch_id
            AND status='active'
          ORDER BY academic_year_id,display_order,class_name,section_name,id"
     );
-    $source->execute(['tenant_id'=>$tenantId]);
+    $source->execute([
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+    ]);
     $rows=$source->fetchAll(PDO::FETCH_ASSOC);
 
     if(!$rows){
@@ -250,42 +428,48 @@ function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
         "SELECT id
          FROM classes
          WHERE tenant_id=:tenant_id
+           AND branch_id=:branch_id
            AND academic_year_id=:academic_year_id
            AND class_name=:class_name
          LIMIT 1"
     );
     $insertClass=$pdo->prepare(
         "INSERT INTO classes(
-            tenant_id,academic_year_id,class_name,display_order,status
+            tenant_id,branch_id,academic_year_id,class_name,display_order,status
          ) VALUES(
-            :tenant_id,:academic_year_id,:class_name,:display_order,'active'
+            :tenant_id,:branch_id,:academic_year_id,:class_name,:display_order,'active'
          )"
     );
     $updateClass=$pdo->prepare(
         "UPDATE classes
          SET display_order=:display_order,status='active'
-         WHERE id=:id AND tenant_id=:tenant_id"
+         WHERE id=:id
+           AND tenant_id=:tenant_id
+           AND branch_id=:branch_id"
     );
 
     $findSection=$pdo->prepare(
         "SELECT id
          FROM sections
          WHERE tenant_id=:tenant_id
+           AND branch_id=:branch_id
            AND class_id=:class_id
            AND section_name=:section_name
          LIMIT 1"
     );
     $insertSection=$pdo->prepare(
         "INSERT INTO sections(
-            tenant_id,class_id,section_name,capacity,status
+            tenant_id,branch_id,class_id,section_name,capacity,status
          ) VALUES(
-            :tenant_id,:class_id,:section_name,:capacity,'active'
+            :tenant_id,:branch_id,:class_id,:section_name,:capacity,'active'
          )"
     );
     $updateSection=$pdo->prepare(
         "UPDATE sections
          SET capacity=:capacity,status='active'
-         WHERE id=:id AND tenant_id=:tenant_id"
+         WHERE id=:id
+           AND tenant_id=:tenant_id
+           AND branch_id=:branch_id"
     );
 
     foreach($rows as $row){
@@ -297,8 +481,26 @@ function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
             continue;
         }
 
+        $yearCheck=$pdo->prepare(
+            "SELECT id
+             FROM academic_years
+             WHERE id=:year_id
+               AND tenant_id=:tenant_id
+               AND branch_id=:branch_id
+             LIMIT 1"
+        );
+        $yearCheck->execute([
+            'year_id'=>$yearId,
+            'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
+        ]);
+        if(!(int)$yearCheck->fetchColumn()){
+            continue;
+        }
+
         $findClass->execute([
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
             'academic_year_id'=>$yearId,
             'class_name'=>$className,
         ]);
@@ -307,6 +509,7 @@ function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
         if($classId<=0){
             $insertClass->execute([
                 'tenant_id'=>$tenantId,
+                'branch_id'=>$branchId,
                 'academic_year_id'=>$yearId,
                 'class_name'=>$className,
                 'display_order'=>(int)($row['display_order']??0),
@@ -317,6 +520,7 @@ function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
                 'display_order'=>(int)($row['display_order']??0),
                 'id'=>$classId,
                 'tenant_id'=>$tenantId,
+                'branch_id'=>$branchId,
             ]);
         }
 
@@ -326,6 +530,7 @@ function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
 
         $findSection->execute([
             'tenant_id'=>$tenantId,
+            'branch_id'=>$branchId,
             'class_id'=>$classId,
             'section_name'=>$sectionName,
         ]);
@@ -335,6 +540,7 @@ function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
         if($sectionId<=0){
             $insertSection->execute([
                 'tenant_id'=>$tenantId,
+                'branch_id'=>$branchId,
                 'class_id'=>$classId,
                 'section_name'=>$sectionName,
                 'capacity'=>$capacity,
@@ -344,24 +550,66 @@ function fsSyncManagedClasses(PDO $pdo,int $tenantId):void{
                 'capacity'=>$capacity,
                 'id'=>$sectionId,
                 'tenant_id'=>$tenantId,
+                'branch_id'=>$branchId,
             ]);
         }
     }
 }
 
-function fsMeta(PDO $pdo,int $tenantId):array{
-    $y=$pdo->prepare("SELECT id,year_name,start_date,end_date,is_current,status FROM academic_years WHERE tenant_id=:tenant_id ORDER BY is_current DESC,start_date DESC,id DESC");
-    $y->execute(['tenant_id'=>$tenantId]);
-    $c=$pdo->prepare(
-        "SELECT id,academic_year_id,class_name,display_order
-         FROM classes
+function fsMeta(PDO $pdo,int $tenantId,int $branchId):array{
+    $y=$pdo->prepare(
+        "SELECT id,branch_id,year_name,start_date,end_date,is_current,status
+         FROM academic_years
          WHERE tenant_id=:tenant_id
-           AND status='active'
-         ORDER BY academic_year_id DESC,display_order,class_name,id"
+           AND branch_id=:branch_id
+         ORDER BY is_current DESC,start_date DESC,id DESC"
     );
-    $c->execute(['tenant_id'=>$tenantId]);
-    $s=$pdo->prepare("SELECT sec.id,sec.class_id,sec.section_name,c.academic_year_id FROM sections sec INNER JOIN classes c ON c.id=sec.class_id AND c.tenant_id=sec.tenant_id WHERE sec.tenant_id=:tenant_id AND sec.status='active' ORDER BY c.display_order,sec.section_name");
-    $s->execute(['tenant_id'=>$tenantId]);
+    $y->execute([
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+    ]);
+
+    $c=$pdo->prepare(
+        "SELECT c.id,c.branch_id,c.academic_year_id,c.class_name,c.display_order
+         FROM classes c
+         INNER JOIN academic_years ay
+            ON ay.id=c.academic_year_id
+           AND ay.tenant_id=c.tenant_id
+           AND ay.branch_id=c.branch_id
+         WHERE c.tenant_id=:tenant_id
+           AND c.branch_id=:branch_id
+           AND c.status='active'
+         ORDER BY c.academic_year_id DESC,c.display_order,c.class_name,c.id"
+    );
+    $c->execute([
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+    ]);
+
+    $s=$pdo->prepare(
+        "SELECT
+            sec.id,sec.branch_id,sec.class_id,sec.section_name,
+            c.academic_year_id
+         FROM sections sec
+         INNER JOIN classes c
+            ON c.id=sec.class_id
+           AND c.tenant_id=sec.tenant_id
+           AND c.branch_id=sec.branch_id
+         INNER JOIN academic_years ay
+            ON ay.id=c.academic_year_id
+           AND ay.tenant_id=c.tenant_id
+           AND ay.branch_id=c.branch_id
+         WHERE sec.tenant_id=:tenant_id
+           AND sec.branch_id=:branch_id
+           AND sec.status='active'
+         ORDER BY c.display_order,sec.section_name"
+    );
+    $s->execute([
+        'tenant_id'=>$tenantId,
+        'branch_id'=>$branchId,
+    ]);
+
+    /* Fee Types are school-level master settings and remain shared by the school. */
     $structureTypes=$pdo->prepare(
         "SELECT
             id,fee_type_name,fee_type_code,description,
@@ -397,12 +645,13 @@ function fsMeta(PDO $pdo,int $tenantId):array{
         'years'=>$y->fetchAll(PDO::FETCH_ASSOC),
         'classes'=>$c->fetchAll(PDO::FETCH_ASSOC),
         'sections'=>$s->fetchAll(PDO::FETCH_ASSOC),
-        // Backward-compatible key for older pages.
         'fee_types'=>$structureRows,
         'structure_fee_types'=>$structureRows,
         'extra_fee_types'=>$extraRows,
+        'active_branch_id'=>$branchId,
     ];
 }
+
 function fsHeadId(PDO $pdo,int $tenantId,array $type):int{
     $code=(string)$type['fee_type_code'];
     $name=(string)$type['fee_type_name'];
@@ -415,47 +664,248 @@ function fsHeadId(PDO $pdo,int $tenantId,array $type):int{
     $insert->execute(['tenant_id'=>$tenantId,'name'=>$name,'code'=>$code]);
     return (int)$pdo->lastInsertId();
 }
+function fsNormalizedOccurrences(string $frequency,int $occurrences):int{
+    $frequency=strtolower(trim($frequency));
+    $occurrences=max(1,$occurrences);
+    return match($frequency){
+        'one_time'=>1,
+        'monthly'=>12,
+        'quarterly'=>4,
+        'half_yearly'=>2,
+        'yearly','annual'=>1,
+        default=>$occurrences,
+    };
+}
 function fsItemRows(PDO $pdo,int $structureId):array{
-    $s=$pdo->prepare("SELECT fsi.id,fsi.fee_structure_id,fsi.fee_type_id,fsi.amount,fsi.frequency,fsi.occurrence_count,fsi.display_order,fsi.status,ft.fee_type_name,ft.fee_type_code,ft.description,ft.is_mandatory,ft.is_enabled FROM fee_structure_items fsi LEFT JOIN fee_types ft ON ft.id=fsi.fee_type_id WHERE fsi.fee_structure_id=:id ORDER BY fsi.display_order,fsi.id");
+    /*
+     * Keep list/view totals exactly aligned with the Edit Fee Structure form.
+     *
+     * Only current Fee Structure items are counted:
+     * - structure item is active
+     * - Fee Type is enabled
+     * - Fee Type is usable in Fee Structure
+     *
+     * Older installations can contain duplicate fee_structure_items for the
+     * same fee_type_id. The edit form naturally keeps one item per Fee Type,
+     * therefore this API does the same and keeps the latest active row.
+     */
+    $s=$pdo->prepare(
+        "SELECT
+            fsi.id,
+            fsi.fee_structure_id,
+            fsi.fee_type_id,
+            fsi.amount,
+            fsi.frequency,
+            fsi.occurrence_count,
+            fsi.display_order,
+            fsi.status,
+            ft.fee_type_name,
+            ft.fee_type_code,
+            ft.description,
+            ft.is_mandatory,
+            ft.is_enabled,
+            ft.usage_scope
+         FROM fee_structure_items fsi
+         INNER JOIN fee_types ft
+            ON ft.id=fsi.fee_type_id
+         WHERE fsi.fee_structure_id=:id
+           AND fsi.status='active'
+           AND ft.deleted_at IS NULL
+           AND ft.is_enabled=1
+           AND COALESCE(ft.usage_scope,'structure') IN('structure','both')
+         ORDER BY
+            fsi.display_order,
+            fsi.fee_type_id,
+            fsi.id"
+    );
+
     $s->execute(['id'=>$structureId]);
-    $items=$s->fetchAll(PDO::FETCH_ASSOC);
+    $raw=$s->fetchAll(PDO::FETCH_ASSOC);
+
+    /*
+     * One current row per Fee Type.
+     * Latest ID wins, matching the effective value used by the edit UI.
+     */
+    $deduped=[];
+
+    foreach($raw as $item){
+        $feeTypeId=(int)($item['fee_type_id']??0);
+
+        if($feeTypeId<=0){
+            continue;
+        }
+
+        if(
+            !isset($deduped[$feeTypeId])
+            || (int)$item['id']>(int)$deduped[$feeTypeId]['id']
+        ){
+            $deduped[$feeTypeId]=$item;
+        }
+    }
+
+    $items=array_values($deduped);
+
+    usort(
+        $items,
+        static function(array $a,array $b):int{
+            $order=((int)($a['display_order']??0))
+                <=>
+                ((int)($b['display_order']??0));
+
+            if($order!==0){
+                return $order;
+            }
+
+            return ((int)$a['id'])<=>((int)$b['id']);
+        }
+    );
+
     foreach($items as &$item){
-        $item['fee_type_name']=$item['fee_type_name']?:('Fee Type #'.(int)$item['fee_type_id']);
-        $item['frequency']=$item['frequency']?:'one_time';
-        $item['occurrence_count']=max(1,(int)$item['occurrence_count']);
-        $item['annual_amount']=round((float)$item['amount']*$item['occurrence_count'],2);
+        $item['fee_type_name']=$item['fee_type_name']
+            ?:('Fee Type #'.(int)$item['fee_type_id']);
+
+        $item['frequency']=$item['frequency']
+            ?: 'one_time';
+
+        $item['occurrence_count']=fsNormalizedOccurrences(
+            (string)$item['frequency'],
+            (int)$item['occurrence_count']
+        );
+
+        $item['annual_amount']=round(
+            (float)$item['amount']
+            * (int)$item['occurrence_count'],
+            2
+        );
     }
     unset($item);
+
     return $items;
 }
-function fsList(PDO $pdo,int $tenantId,array $filters):array{
-    $where=['fs.tenant_id=:tenant_id'];$params=['tenant_id'=>$tenantId];
+function fsList(PDO $pdo,int $tenantId,int $branchId,array $filters):array{
+    $where=[
+        'fs.tenant_id=:tenant_id',
+        'ay.branch_id=:ay_branch_id',
+        'c.branch_id=:class_branch_id',
+    ];
+    $params=[
+        'tenant_id'=>$tenantId,
+        'ay_branch_id'=>$branchId,
+        'class_branch_id'=>$branchId,
+    ];
+
     $search=trim((string)($filters['search']??''));
-    if($search!==''){$where[]="(fs.structure_name LIKE :search_structure OR c.class_name LIKE :search_class OR ay.year_name LIKE :search_year)";$searchValue='%'.$search.'%';$params['search_structure']=$searchValue;$params['search_class']=$searchValue;$params['search_year']=$searchValue;}
-    foreach(['academic_year_id'=>'fs.academic_year_id','class_id'=>'fs.class_id'] as $key=>$column){$value=(string)($filters[$key]??'all');if($value!==''&&$value!=='all'){$where[]="$column=:$key";$params[$key]=(int)$value;}}
-    $status=strtolower(trim((string)($filters['status']??'all')));if(in_array($status,['active','inactive'],true)){$where[]='fs.status=:status';$params['status']=$status;}
-    $page=max(1,(int)($filters['page']??1));$per=min(100,max(5,(int)($filters['per_page']??10)));
-    $base=" FROM fee_structures fs INNER JOIN academic_years ay ON ay.id=fs.academic_year_id AND ay.tenant_id=fs.tenant_id INNER JOIN classes c ON c.id=fs.class_id AND c.tenant_id=fs.tenant_id WHERE ".implode(' AND ',$where);
-    $count=$pdo->prepare("SELECT COUNT(*)".$base);$count->execute($params);$total=(int)$count->fetchColumn();$last=max(1,(int)ceil($total/$per));$page=min($page,$last);$offset=($page-1)*$per;
-    $sort=match((string)($filters['sort']??'')){'class_asc'=>'ay.start_date DESC,c.display_order,c.class_name','amount_desc'=>'fs.id DESC','amount_asc'=>'fs.id ASC',default=>'fs.id DESC'};
-    $s=$pdo->prepare("SELECT fs.*,ay.year_name,c.class_name,c.display_order,(SELECT COUNT(*) FROM student_fee_assignments a WHERE a.tenant_id=fs.tenant_id AND a.fee_structure_id=fs.id) assignment_count".$base." ORDER BY $sort LIMIT $per OFFSET $offset");
-    $s->execute($params);$rows=$s->fetchAll(PDO::FETCH_ASSOC);
+    if($search!==''){
+        $where[]="(fs.structure_name LIKE :search_structure OR c.class_name LIKE :search_class OR ay.year_name LIKE :search_year)";
+        $searchValue='%'.$search.'%';
+        $params['search_structure']=$searchValue;
+        $params['search_class']=$searchValue;
+        $params['search_year']=$searchValue;
+    }
+
+    foreach(['academic_year_id'=>'fs.academic_year_id','class_id'=>'fs.class_id'] as $key=>$column){
+        $value=(string)($filters[$key]??'all');
+        if($value!==''&&$value!=='all'){
+            $where[]="$column=:$key";
+            $params[$key]=(int)$value;
+        }
+    }
+
+    $status=strtolower(trim((string)($filters['status']??'all')));
+    if(in_array($status,['active','inactive'],true)){
+        $where[]='fs.status=:status';
+        $params['status']=$status;
+    }
+
+    $page=max(1,(int)($filters['page']??1));
+    $per=min(100,max(5,(int)($filters['per_page']??10)));
+
+    $base=" FROM fee_structures fs
+            INNER JOIN academic_years ay
+               ON ay.id=fs.academic_year_id
+              AND ay.tenant_id=fs.tenant_id
+            INNER JOIN classes c
+               ON c.id=fs.class_id
+              AND c.tenant_id=fs.tenant_id
+              AND c.academic_year_id=fs.academic_year_id
+              AND c.branch_id=ay.branch_id
+            WHERE ".implode(' AND ',$where);
+
+    $count=$pdo->prepare("SELECT COUNT(*)".$base);
+    $count->execute($params);
+    $total=(int)$count->fetchColumn();
+    $last=max(1,(int)ceil($total/$per));
+    $page=min($page,$last);
+    $offset=($page-1)*$per;
+
+    $sort=match((string)($filters['sort']??'')){
+        'class_asc'=>'ay.start_date DESC,c.display_order,c.class_name',
+        'amount_desc'=>'fs.id DESC',
+        'amount_asc'=>'fs.id ASC',
+        default=>'fs.id DESC'
+    };
+
+    $s=$pdo->prepare(
+        "SELECT
+            fs.*,ay.year_name,c.class_name,c.display_order,
+            (SELECT COUNT(*)
+             FROM student_fee_assignments a
+             WHERE a.tenant_id=fs.tenant_id
+               AND a.fee_structure_id=fs.id) assignment_count"
+        .$base.
+        " ORDER BY $sort LIMIT $per OFFSET $offset"
+    );
+    $s->execute($params);
+    $rows=$s->fetchAll(PDO::FETCH_ASSOC);
+
     foreach($rows as &$row){
         $row['items']=fsItemRows($pdo,(int)$row['id']);
         $row['item_count']=count($row['items']);
-        $row['annual_total']=round(array_sum(array_column($row['items'],'annual_amount')),2);
+        $row['annual_total']=round(
+            array_sum(array_column($row['items'],'annual_amount')),
+            2
+        );
     }
     unset($row);
-    if(($filters['sort']??'')==='amount_desc')usort($rows,fn($a,$b)=>(float)$b['annual_total']<=>(float)$a['annual_total']);
-    if(($filters['sort']??'')==='amount_asc')usort($rows,fn($a,$b)=>(float)$a['annual_total']<=>(float)$b['annual_total']);
-    return['records'=>$rows,'pagination'=>['total'=>$total,'page'=>$page,'per_page'=>$per,'last_page'=>$last]];
-}
-function fsStats(PDO $pdo,int $tenantId):array{
-    $list=fsList($pdo,$tenantId,['page'=>1,'per_page'=>10000]);$rows=$list['records'];$classes=[];$amount=0.0;$active=0;
-    foreach($rows as $row){if($row['status']==='active')$active++;$classes[$row['academic_year_id'].':'.$row['class_id']]=true;$amount+=(float)$row['annual_total'];}
-    return['total'=>count($rows),'active'=>$active,'classes'=>count($classes),'amount'=>$amount];
+
+    if(($filters['sort']??'')==='amount_desc'){
+        usort($rows,fn($a,$b)=>(float)$b['annual_total']<=>(float)$a['annual_total']);
+    }
+    if(($filters['sort']??'')==='amount_asc'){
+        usort($rows,fn($a,$b)=>(float)$a['annual_total']<=>(float)$b['annual_total']);
+    }
+
+    return[
+        'records'=>$rows,
+        'pagination'=>[
+            'total'=>$total,
+            'page'=>$page,
+            'per_page'=>$per,
+            'last_page'=>$last,
+        ],
+    ];
 }
 
+function fsStats(PDO $pdo,int $tenantId,int $branchId):array{
+    $list=fsList($pdo,$tenantId,$branchId,['page'=>1,'per_page'=>10000]);
+    $rows=$list['records'];
+    $classes=[];
+    $amount=0.0;
+    $active=0;
+
+    foreach($rows as $row){
+        if($row['status']==='active')$active++;
+        $classes[$row['academic_year_id'].':'.$row['class_id']]=true;
+        $amount+=(float)$row['annual_total'];
+    }
+
+    return[
+        'total'=>count($rows),
+        'active'=>$active,
+        'classes'=>count($classes),
+        'amount'=>$amount,
+    ];
+}
 
 function fsAggregateAssignment(PDO $pdo,int $tenantId,int $assignmentId):void{
     $s=$pdo->prepare("SELECT COALESCE(SUM(original_amount),0) gross,COALESCE(SUM(discount_amount),0) discount,COALESCE(SUM(paid_amount),0) paid,COALESCE(SUM(balance_amount),0) balance,COALESCE(SUM(CASE WHEN item_type<>'transport' THEN original_amount ELSE 0 END),0) base,COALESCE(SUM(CASE WHEN item_type='transport' THEN original_amount ELSE 0 END),0) transport FROM student_fee_items WHERE tenant_id=:tenant_id AND assignment_id=:assignment_id AND item_status<>'cancelled'");
@@ -474,22 +924,22 @@ function fsAggregateAssignment(PDO $pdo,int $tenantId,int $assignmentId):void{
 if(!isset($pdo)||!$pdo instanceof PDO)fsOut(false,'Database connection unavailable.',[],500);
 if(session_status()!==PHP_SESSION_ACTIVE)session_start();
 if(empty($_SESSION['fee_csrf_token']))$_SESSION['fee_csrf_token']=bin2hex(random_bytes(32));
-$scope=fsScope();
-if($scope['tenant_id']<=0||$scope['user_id']<=0)fsOut(false,'School tenant or user session was not found.',[],401);
-try{fsEnsure($pdo,$scope['tenant_id']);}catch(Throwable $e){fsOut(false,'Unable to initialize Fee Structures: '.$e->getMessage(),[],500);}
+$scope=fsScope($pdo);
+if($scope['tenant_id']<=0||$scope['branch_id']<=0||$scope['user_id']<=0)fsOut(false,'Active School, Branch or user session was not found.',[],401);
+try{fsEnsure($pdo,$scope['tenant_id'],$scope['branch_id']);}catch(Throwable $e){fsOut(false,'Unable to initialize Fee Structures: '.$e->getMessage(),[],500);}
 $input=fsInput();$action=strtolower(trim((string)($input['action']??$_GET['action']??'')));
 
 try{
     if($action==='meta'){
         fsOut(true,'Latest Fee Settings loaded.',[
-            'meta'=>fsMeta($pdo,$scope['tenant_id']),
+            'meta'=>fsMeta($pdo,$scope['tenant_id'],$scope['branch_id']),
             'csrf_token'=>$_SESSION['fee_csrf_token'],
         ]);
     }
 
     if($action==='list'){
-        $list=fsList($pdo,$scope['tenant_id'],array_merge($_GET,$input));
-        fsOut(true,'Fee structures loaded.',['meta'=>fsMeta($pdo,$scope['tenant_id']),'records'=>$list['records'],'pagination'=>$list['pagination'],'stats'=>fsStats($pdo,$scope['tenant_id']),'csrf_token'=>$_SESSION['fee_csrf_token']]);
+        $list=fsList($pdo,$scope['tenant_id'],$scope['branch_id'],array_merge($_GET,$input));
+        fsOut(true,'Fee structures loaded.',['meta'=>fsMeta($pdo,$scope['tenant_id'],$scope['branch_id']),'records'=>$list['records'],'pagination'=>$list['pagination'],'stats'=>fsStats($pdo,$scope['tenant_id'],$scope['branch_id']),'csrf_token'=>$_SESSION['fee_csrf_token']]);
     }
 
 
@@ -541,12 +991,42 @@ try{
         $date=DateTimeImmutable::createFromFormat('Y-m-d',$dueDate);
         if(!$date||$date->format('Y-m-d')!==$dueDate)throw new InvalidArgumentException('Due Date is invalid.');
 
-        $check=$pdo->prepare("SELECT id FROM classes WHERE id=:class_id AND academic_year_id=:year_id AND tenant_id=:tenant_id AND status='active'");
-        $check->execute(['class_id'=>$classId,'year_id'=>$yearId,'tenant_id'=>$scope['tenant_id']]);
+        $check=$pdo->prepare(
+            "SELECT c.id
+             FROM classes c
+             INNER JOIN academic_years ay
+                ON ay.id=c.academic_year_id
+               AND ay.tenant_id=c.tenant_id
+               AND ay.branch_id=c.branch_id
+             WHERE c.id=:class_id
+               AND c.academic_year_id=:year_id
+               AND c.tenant_id=:tenant_id
+               AND c.branch_id=:branch_id
+               AND c.status='active'"
+        );
+        $check->execute([
+            'class_id'=>$classId,
+            'year_id'=>$yearId,
+            'tenant_id'=>$scope['tenant_id'],
+            'branch_id'=>$scope['branch_id'],
+        ]);
         if(!$check->fetchColumn())throw new InvalidArgumentException('Selected Class does not belong to the selected Academic Year.');
         if($sectionId>0){
-            $sec=$pdo->prepare("SELECT id FROM sections WHERE id=:section_id AND class_id=:class_id AND tenant_id=:tenant_id AND status='active'");
-            $sec->execute(['section_id'=>$sectionId,'class_id'=>$classId,'tenant_id'=>$scope['tenant_id']]);
+            $sec=$pdo->prepare(
+                "SELECT id
+                 FROM sections
+                 WHERE id=:section_id
+                   AND class_id=:class_id
+                   AND tenant_id=:tenant_id
+                   AND branch_id=:branch_id
+                   AND status='active'"
+            );
+            $sec->execute([
+                'section_id'=>$sectionId,
+                'class_id'=>$classId,
+                'tenant_id'=>$scope['tenant_id'],
+                'branch_id'=>$scope['branch_id'],
+            ]);
             if(!$sec->fetchColumn())throw new InvalidArgumentException('Selected Section does not belong to the selected Class.');
         }
 
@@ -561,11 +1041,26 @@ try{
         ]);
         $batchId=(int)$pdo->lastInsertId();
 
-        $where=["e.tenant_id=:tenant_id","e.academic_year_id=:year_id","e.class_id=:class_id","e.enrollment_status='active'","st.status='active'","st.deleted_at IS NULL"];
-        $params=['tenant_id'=>$scope['tenant_id'],'year_id'=>$yearId,'class_id'=>$classId];
+        $where=[
+            "e.tenant_id=:tenant_id",
+            "e.branch_id=:enrollment_branch_id",
+            "st.branch_id=:student_branch_id",
+            "e.academic_year_id=:year_id",
+            "e.class_id=:class_id",
+            "e.enrollment_status='active'",
+            "st.status='active'",
+            "st.deleted_at IS NULL"
+        ];
+        $params=[
+            'tenant_id'=>$scope['tenant_id'],
+            'enrollment_branch_id'=>$scope['branch_id'],
+            'student_branch_id'=>$scope['branch_id'],
+            'year_id'=>$yearId,
+            'class_id'=>$classId,
+        ];
         if($sectionId>0){$where[]='e.section_id=:section_id';$params['section_id']=$sectionId;}
         if($gender!=='all'){$where[]='LOWER(st.gender)=:gender';$params['gender']=$gender;}
-        $students=$pdo->prepare("SELECT DISTINCT st.id FROM student_enrollments e INNER JOIN students st ON st.id=e.student_id AND st.tenant_id=e.tenant_id WHERE ".implode(' AND ',$where));
+        $students=$pdo->prepare("SELECT DISTINCT st.id FROM student_enrollments e INNER JOIN students st ON st.id=e.student_id AND st.tenant_id=e.tenant_id AND st.branch_id=e.branch_id WHERE ".implode(' AND ',$where));
         $students->execute($params);
         $studentIds=array_map('intval',$students->fetchAll(PDO::FETCH_COLUMN));
 
@@ -609,10 +1104,10 @@ try{
 
         if($yearId<=0||$classId<=0)throw new InvalidArgumentException('Academic Year and Class are required.');
         if(!in_array($status,['active','inactive'],true))throw new InvalidArgumentException('Invalid structure status.');
-        if(!is_array($items)||$items===[])throw new InvalidArgumentException('At least one enabled Fee Type is required.');
+        if(!is_array($items)||$items===[])throw new InvalidArgumentException('Add at least one Fee Type to the Fee Structure.');
 
-        $classStmt=$pdo->prepare("SELECT c.id,c.class_name,ay.year_name FROM classes c INNER JOIN academic_years ay ON ay.id=c.academic_year_id AND ay.tenant_id=c.tenant_id WHERE c.id=:class_id AND c.academic_year_id=:year_id AND c.tenant_id=:tenant_id AND c.status='active' LIMIT 1");
-        $classStmt->execute(['class_id'=>$classId,'year_id'=>$yearId,'tenant_id'=>$scope['tenant_id']]);
+        $classStmt=$pdo->prepare("SELECT c.id,c.class_name,ay.year_name FROM classes c INNER JOIN academic_years ay ON ay.id=c.academic_year_id AND ay.tenant_id=c.tenant_id AND ay.branch_id=c.branch_id WHERE c.id=:class_id AND c.academic_year_id=:year_id AND c.tenant_id=:tenant_id AND c.branch_id=:branch_id AND c.status='active' LIMIT 1");
+        $classStmt->execute(['class_id'=>$classId,'year_id'=>$yearId,'tenant_id'=>$scope['tenant_id'],'branch_id'=>$scope['branch_id']]);
         $class=$classStmt->fetch(PDO::FETCH_ASSOC);
         if(!$class)throw new InvalidArgumentException('Selected Class does not belong to the selected Academic Year.');
         if($name==='')$name=$class['class_name'].' Fee Structure';
@@ -631,14 +1126,18 @@ try{
         $types=[];foreach($typesStmt->fetchAll(PDO::FETCH_ASSOC) as $type)$types[(int)$type['id']]=$type;
         if($types===[])throw new InvalidArgumentException('No enabled Fee Types are available for Fee Structures. Configure Fees Settings → Use In.');
 
-        $normalized=[];$total=0.0;
+        $normalized=[];$total=0.0;$submittedTypeIds=[];
         foreach($items as $item){
             if(!is_array($item))continue;
             $typeId=(int)($item['fee_type_id']??0);
             if($typeId<=0)continue;
+            if(isset($submittedTypeIds[$typeId])){
+                throw new InvalidArgumentException('The same Fee Type cannot be added more than once.');
+            }
+            $submittedTypeIds[$typeId]=true;
             if(!isset($types[$typeId])){
                 throw new InvalidArgumentException(
-                    'One selected Fee Type is disabled or is not configured for Fee Structure.'
+                    'One selected Fee Type is disabled or is not configured for Fee Structure in Fees Settings.'
                 );
             }
             $amount=$item['amount']??0;
@@ -653,17 +1152,10 @@ try{
             }
 
             $occurrences=max(1,min(36,(int)($item['occurrence_count']??$types[$typeId]['default_occurrence_count']??1)));
-            $frequencyOccurrences=[
-                'one_time'=>1,
-                'monthly'=>12,
-                'term'=>max(1,$occurrences),
-                'quarterly'=>4,
-                'half_yearly'=>2,
-                'yearly'=>1,
-                'annual'=>1,
-                'custom'=>$occurrences,
-            ];
-            $occurrences=$frequencyOccurrences[$frequency]??$occurrences;
+            $occurrences=fsNormalizedOccurrences(
+                $frequency,
+                $occurrences
+            );
 
             $normalized[$typeId]=[
                 'amount'=>$amount,
@@ -692,46 +1184,51 @@ try{
 
         $existing=null;$assignmentCount=0;
         if($id>0){
-            $e=$pdo->prepare("SELECT * FROM fee_structures WHERE id=:id AND tenant_id=:tenant_id FOR UPDATE");
-            $e->execute(['id'=>$id,'tenant_id'=>$scope['tenant_id']]);$existing=$e->fetch(PDO::FETCH_ASSOC);
+            $e=$pdo->prepare(
+                "SELECT fs.*
+                 FROM fee_structures fs
+                 INNER JOIN academic_years ay
+                    ON ay.id=fs.academic_year_id
+                   AND ay.tenant_id=fs.tenant_id
+                 INNER JOIN classes c
+                    ON c.id=fs.class_id
+                   AND c.tenant_id=fs.tenant_id
+                   AND c.academic_year_id=fs.academic_year_id
+                 WHERE fs.id=:id
+                   AND fs.tenant_id=:tenant_id
+                   AND ay.branch_id=:ay_branch_id
+                   AND c.branch_id=:class_branch_id
+                 FOR UPDATE"
+            );
+            $e->execute([
+                'id'=>$id,
+                'tenant_id'=>$scope['tenant_id'],
+                'ay_branch_id'=>$scope['branch_id'],
+                'class_branch_id'=>$scope['branch_id'],
+            ]);
+            $existing=$e->fetch(PDO::FETCH_ASSOC);
             if(!$existing)throw new InvalidArgumentException('Fee Structure not found.');
             $assigned=$pdo->prepare("SELECT COUNT(*) FROM student_fee_assignments WHERE tenant_id=:tenant_id AND fee_structure_id=:id");
             $assigned->execute(['tenant_id'=>$scope['tenant_id'],'id'=>$id]);$assignmentCount=(int)$assigned->fetchColumn();
             if($assignmentCount>0){
-                $oldItems=[];
-                foreach(fsItemRows($pdo,$id) as $row){
-                    $oldItems[(int)$row['fee_type_id']]=[
-                        'amount'=>(float)$row['amount'],
-                        'frequency'=>(string)$row['frequency'],
-                        'occurrences'=>(int)$row['occurrence_count'],
-                    ];
-                }
-
                 /*
-                 * Once assigned, the fee amount and fee-type composition remain
-                 * protected. Frequency and occurrences may be changed because
-                 * Fee Collection can safely rebuild only unpaid installments.
+                 * Assigned structures remain editable.
+                 *
+                 * Allowed:
+                 * - add Fee Types
+                 * - remove optional Fee Types
+                 * - change Amount
+                 * - change Frequency
+                 * - change Occurrences
+                 *
+                 * The Academic Year and Class remain fixed after assignment,
+                 * because student_fee_assignments references this structure
+                 * for that exact year/class combination.
+                 *
+                 * Historical student fee/receipt rows are preserved because
+                 * removed structure items are marked inactive later instead
+                 * of being physically deleted.
                  */
-                if(count($oldItems)!==count($normalized)){
-                    throw new InvalidArgumentException(
-                        'Fee types cannot be added or removed after this structure is assigned to students. Frequency and occurrences may still be updated.'
-                    );
-                }
-
-                foreach($normalized as $typeId=>$item){
-                    if(!array_key_exists($typeId,$oldItems)){
-                        throw new InvalidArgumentException(
-                            'Fee types cannot be added or removed after this structure is assigned to students.'
-                        );
-                    }
-
-                    if(abs($oldItems[$typeId]['amount']-$item['amount'])>0.009){
-                        throw new InvalidArgumentException(
-                            'Fee amount cannot be changed after this structure is assigned to students. You may update only Frequency and Occurrences.'
-                        );
-                    }
-                }
-
                 if(
                     (int)$existing['academic_year_id']!==$yearId
                     || (int)$existing['class_id']!==$classId
@@ -744,10 +1241,10 @@ try{
         }
 
         if($id>0){
-            $u=$pdo->prepare("UPDATE fee_structures SET academic_year_id=:year_id,class_id=:class_id,structure_name=:name,status=:status WHERE id=:id AND tenant_id=:tenant_id");
-            $u->execute(['year_id'=>$yearId,'class_id'=>$classId,'name'=>$name,'status'=>$status,'id'=>$id,'tenant_id'=>$scope['tenant_id']]);
+            $u=$pdo->prepare("UPDATE fee_structures fs SET academic_year_id=:year_id,class_id=:class_id,structure_name=:name,status=:status WHERE fs.id=:id AND fs.tenant_id=:tenant_id AND EXISTS(SELECT 1 FROM academic_years ay WHERE ay.id=fs.academic_year_id AND ay.tenant_id=fs.tenant_id AND ay.branch_id=:branch_id)");
+            $u->execute(['year_id'=>$yearId,'class_id'=>$classId,'name'=>$name,'status'=>$status,'id'=>$id,'tenant_id'=>$scope['tenant_id'],'branch_id'=>$scope['branch_id']]);
             $message=$assignmentCount>0
-                ?'Fee Structure updated successfully. Unpaid student schedules will synchronize automatically in Fee Collection.'
+                ?'Fee Structure updated successfully. Existing paid fee history was preserved.'
                 :'Fee Structure updated successfully.';
         }else{
             $i=$pdo->prepare("INSERT INTO fee_structures(tenant_id,academic_year_id,class_id,structure_name,status) VALUES(:tenant_id,:year_id,:class_id,:name,:status)");
@@ -755,9 +1252,20 @@ try{
             $id=(int)$pdo->lastInsertId();$message='Fee Structure created successfully.';
         }
 
-        $existingItem=$pdo->prepare("SELECT id FROM fee_structure_items WHERE fee_structure_id=:structure_id AND fee_type_id=:fee_type_id LIMIT 1");
+        $existingItem=$pdo->prepare(
+            "SELECT id
+             FROM fee_structure_items
+             WHERE fee_structure_id=:structure_id
+               AND fee_type_id=:fee_type_id
+             ORDER BY
+                status='active' DESC,
+                id DESC
+             LIMIT 1"
+        );
         $updateItem=$pdo->prepare("UPDATE fee_structure_items SET fee_head_id=:head_id,amount=:amount,frequency=:frequency,occurrence_count=:occurrences,display_order=:display_order,status='active' WHERE id=:id");
         $insertItem=$pdo->prepare("INSERT INTO fee_structure_items(fee_structure_id,fee_head_id,fee_type_id,amount,due_date,fine_type,fine_value,frequency,occurrence_count,display_order,status) VALUES(:structure_id,:head_id,:fee_type_id,:amount,NULL,'none',0,:frequency,:occurrences,:display_order,'active')");
+
+        $savedItemIds=[];
 
         foreach($normalized as $typeId=>$item){
             $type=$item['type'];$headId=fsHeadId($pdo,$scope['tenant_id'],$type);
@@ -769,39 +1277,246 @@ try{
                 'occurrences'=>$item['occurrences'],
                 'display_order'=>(int)$type['display_order']
             ];
-            if($itemId>0){$params['id']=$itemId;$updateItem->execute($params);}
-            else{$params['structure_id']=$id;$params['fee_type_id']=$typeId;$insertItem->execute($params);}
+            if($itemId>0){
+                $params['id']=$itemId;
+                $updateItem->execute($params);
+                $savedItemIds[]=$itemId;
+            }else{
+                $params['structure_id']=$id;
+                $params['fee_type_id']=$typeId;
+                $insertItem->execute($params);
+                $savedItemIds[]=(int)$pdo->lastInsertId();
+            }
         }
 
         /*
-         * Unused enabled optional types are removed only before assignment.
-         * Disabled historical fee types are preserved for reporting.
+         * Repair duplicate current rows automatically.
+         * Keep only the exact row that was just saved for each selected Fee Type.
          */
-        if($assignmentCount===0){
-            $ids=array_keys($normalized);
-            if($ids!==[]){
-                $marks=implode(',',array_fill(0,count($ids),'?'));
-                $delete=$pdo->prepare("DELETE fsi FROM fee_structure_items fsi INNER JOIN fee_types ft ON ft.id=fsi.fee_type_id WHERE fsi.fee_structure_id=? AND ft.is_enabled=1 AND fsi.fee_type_id NOT IN ($marks)");
+        if($savedItemIds!==[]){
+            $savedMarks=implode(
+                ',',
+                array_fill(0,count($savedItemIds),'?')
+            );
+
+            $selectedTypeIds=array_map(
+                'intval',
+                array_keys($normalized)
+            );
+
+            $typeMarks=implode(
+                ',',
+                array_fill(0,count($selectedTypeIds),'?')
+            );
+
+            $deactivateDuplicates=$pdo->prepare(
+                "UPDATE fee_structure_items
+                 SET status='inactive'
+                 WHERE fee_structure_id=?
+                   AND fee_type_id IN ($typeMarks)
+                   AND id NOT IN ($savedMarks)
+                   AND status='active'"
+            );
+
+            $deactivateDuplicates->execute([
+                $id,
+                ...$selectedTypeIds,
+                ...$savedItemIds,
+            ]);
+        }
+
+        /*
+         * Remove fee types that are no longer selected.
+         *
+         * Unassigned structure:
+         *   delete unused current rows normally.
+         *
+         * Assigned structure:
+         *   do NOT physically delete old fee_structure_items because existing
+         *   student_fee_items / receipts may still refer to those row IDs.
+         *   Mark them inactive instead. Current Fee Structure totals/list/view
+         *   read only active rows.
+         */
+        $ids=array_keys($normalized);
+
+        if($ids!==[]){
+            $marks=implode(',',array_fill(0,count($ids),'?'));
+
+            if($assignmentCount===0){
+                $delete=$pdo->prepare(
+                    "DELETE fsi
+                     FROM fee_structure_items fsi
+                     INNER JOIN fee_types ft
+                        ON ft.id=fsi.fee_type_id
+                     WHERE fsi.fee_structure_id=?
+                       AND ft.is_enabled=1
+                       AND fsi.fee_type_id NOT IN ($marks)"
+                );
                 $delete->execute([$id,...$ids]);
+            }else{
+                $deactivate=$pdo->prepare(
+                    "UPDATE fee_structure_items fsi
+                     INNER JOIN fee_types ft
+                        ON ft.id=fsi.fee_type_id
+                     SET fsi.status='inactive'
+                     WHERE fsi.fee_structure_id=?
+                       AND ft.is_enabled=1
+                       AND ft.is_mandatory=0
+                       AND fsi.fee_type_id NOT IN ($marks)"
+                );
+                $deactivate->execute([$id,...$ids]);
             }
         }
 
         $pdo->commit();
-        fsOut(true,$message,['id'=>$id,'annual_total'=>round($total,2)]);
+
+        $savedRows=fsItemRows($pdo,$id);
+        $savedAnnualTotal=round(
+            array_sum(
+                array_map(
+                    static fn(array $row):float =>
+                        (float)($row['annual_amount']??0),
+                    $savedRows
+                )
+            ),
+            2
+        );
+
+        fsOut(
+            true,
+            $message,
+            [
+                'id'=>$id,
+                'annual_total'=>$savedAnnualTotal,
+                'item_count'=>count($savedRows),
+                'saved_fee_type_ids'=>array_map(
+                    'intval',
+                    array_keys($normalized)
+                ),
+            ]
+        );
     }
 
     if($action==='delete'){
-        fsCsrf($input);$id=(int)($input['id']??0);
-        if($id<=0)throw new InvalidArgumentException('Valid Fee Structure ID is required.');
-        $count=$pdo->prepare("SELECT COUNT(*) FROM student_fee_assignments WHERE tenant_id=:tenant_id AND fee_structure_id=:id");
-        $count->execute(['tenant_id'=>$scope['tenant_id'],'id'=>$id]);
-        if((int)$count->fetchColumn()>0)throw new InvalidArgumentException('This Fee Structure is assigned to students. Set it to Inactive instead of deleting it.');
+        fsCsrf($input);
+        $id=(int)($input['id']??0);
+        if($id<=0){
+            throw new InvalidArgumentException(
+                'Valid Fee Structure ID is required.'
+            );
+        }
+
+        $structure=$pdo->prepare(
+            "SELECT fs.id,fs.status
+             FROM fee_structures fs
+             INNER JOIN academic_years ay
+                ON ay.id=fs.academic_year_id
+               AND ay.tenant_id=fs.tenant_id
+             INNER JOIN classes c
+                ON c.id=fs.class_id
+               AND c.tenant_id=fs.tenant_id
+               AND c.academic_year_id=fs.academic_year_id
+             WHERE fs.id=:id
+               AND fs.tenant_id=:tenant_id
+               AND ay.branch_id=:ay_branch_id
+               AND c.branch_id=:class_branch_id
+             LIMIT 1"
+        );
+        $structure->execute([
+            'id'=>$id,
+            'tenant_id'=>$scope['tenant_id'],
+            'ay_branch_id'=>$scope['branch_id'],
+            'class_branch_id'=>$scope['branch_id'],
+        ]);
+        $current=$structure->fetch(PDO::FETCH_ASSOC);
+
+        if(!$current){
+            throw new InvalidArgumentException(
+                'Fee Structure not found.'
+            );
+        }
+
+        $count=$pdo->prepare(
+            "SELECT COUNT(*)
+             FROM student_fee_assignments
+             WHERE tenant_id=:tenant_id
+               AND fee_structure_id=:id"
+        );
+        $count->execute([
+            'tenant_id'=>$scope['tenant_id'],
+            'id'=>$id,
+        ]);
+        $assignmentCount=(int)$count->fetchColumn();
+
         $pdo->beginTransaction();
-        $pdo->prepare("DELETE FROM fee_structure_items WHERE fee_structure_id=:id")->execute(['id'=>$id]);
-        $delete=$pdo->prepare("DELETE FROM fee_structures WHERE id=:id AND tenant_id=:tenant_id");
-        $delete->execute(['id'=>$id,'tenant_id'=>$scope['tenant_id']]);
-        if($delete->rowCount()===0)throw new InvalidArgumentException('Fee Structure not found.');
-        $pdo->commit();fsOut(true,'Fee Structure deleted successfully.');
+
+        if($assignmentCount>0){
+            /*
+             * Do not physically delete a structure that is already part of
+             * student financial history. Treat the Delete action as a safe
+             * archive/inactivation so the user does not receive an error and
+             * existing receipts/fee assignments remain valid.
+             */
+            $update=$pdo->prepare(
+                "UPDATE fee_structures
+                 SET status='inactive'
+                 WHERE id=:id
+                   AND tenant_id=:tenant_id
+                   AND EXISTS(SELECT 1 FROM academic_years ay WHERE ay.id=fee_structures.academic_year_id AND ay.tenant_id=fee_structures.tenant_id AND ay.branch_id=:branch_id)"
+            );
+            $update->execute([
+                'id'=>$id,
+                'tenant_id'=>$scope['tenant_id'],
+                'branch_id'=>$scope['branch_id'],
+            ]);
+
+            $pdo->commit();
+
+            fsOut(
+                true,
+                'Fee Structure set to Inactive successfully. Existing student fee records were preserved.',
+                [
+                    'id'=>$id,
+                    'action'=>'inactivated',
+                    'assignment_count'=>$assignmentCount,
+                ]
+            );
+        }
+
+        $pdo->prepare(
+            "DELETE FROM fee_structure_items
+             WHERE fee_structure_id=:id"
+        )->execute(['id'=>$id]);
+
+        $delete=$pdo->prepare(
+            "DELETE FROM fee_structures
+             WHERE id=:id
+               AND tenant_id=:tenant_id
+               AND EXISTS(SELECT 1 FROM academic_years ay WHERE ay.id=fee_structures.academic_year_id AND ay.tenant_id=fee_structures.tenant_id AND ay.branch_id=:branch_id)"
+        );
+        $delete->execute([
+            'id'=>$id,
+            'tenant_id'=>$scope['tenant_id'],
+            'branch_id'=>$scope['branch_id'],
+        ]);
+
+        if($delete->rowCount()===0){
+            throw new InvalidArgumentException(
+                'Fee Structure not found.'
+            );
+        }
+
+        $pdo->commit();
+
+        fsOut(
+            true,
+            'Fee Structure deleted successfully.',
+            [
+                'id'=>$id,
+                'action'=>'deleted',
+                'assignment_count'=>0,
+            ]
+        );
     }
 
     fsOut(false,'Invalid Fee Structures action.',[],400);

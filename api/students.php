@@ -5,7 +5,14 @@ ob_start();
 ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
+if (!defined('SCHOOL_API_PAGE_KEY')) {
+    define('SCHOOL_API_PAGE_KEY', 'students');
+}
+
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
+require_once dirname(__DIR__) . '/includes/general-settings-runtime.php';
+
+/* Build: 2026-08-15-student-strict-school-branch-v15 */
 
 function studentsJson(bool $success, string $message = '', array $data = [], int $status = 200): never
 {
@@ -42,13 +49,139 @@ function studentsUser(): array
     return is_array($user) ? $user : [];
 }
 
-function studentsScope(): array
+function studentsScope(PDO $pdo): array
 {
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        session_start();
+    }
+
     $user = studentsUser();
+
+    $tenantId = (int)(
+        $user['tenant_id']
+        ?? $user['school_id']
+        ?? $_SESSION['tenant_id']
+        ?? $_SESSION['school_id']
+        ?? ($_SESSION['tenant']['id'] ?? 0)
+    );
+
+    $userId = (int)(
+        $user['id']
+        ?? $user['user_id']
+        ?? $_SESSION['user_id']
+        ?? 0
+    );
+
+    $branchId = (int)(
+        $user['branch_id']
+        ?? $user['default_branch_id']
+        ?? $_SESSION['branch_id']
+        ?? $_SESSION['default_branch_id']
+        ?? 0
+    );
+
+    $roleId = (int)(
+        $user['role_id']
+        ?? $_SESSION['role_id']
+        ?? 0
+    );
+
+    if ($tenantId <= 0 || $userId <= 0) {
+        throw new RuntimeException('Active School Admin login required.', 401);
+    }
+
+    /* Same branch resolution method used by Academic Year Management. */
+    if ($branchId <= 0 && studentsTableExists($pdo, 'users')) {
+        try {
+            $statement = $pdo->prepare(
+                "SELECT default_branch_id
+                 FROM users
+                 WHERE id=:user_id
+                   AND tenant_id=:tenant_id
+                   AND deleted_at IS NULL
+                 LIMIT 1"
+            );
+            $statement->execute([
+                'user_id' => $userId,
+                'tenant_id' => $tenantId,
+            ]);
+            $branchId = (int)$statement->fetchColumn();
+        } catch (Throwable) {
+            $statement = $pdo->prepare(
+                "SELECT default_branch_id
+                 FROM users
+                 WHERE id=:user_id
+                   AND tenant_id=:tenant_id
+                 LIMIT 1"
+            );
+            $statement->execute([
+                'user_id' => $userId,
+                'tenant_id' => $tenantId,
+            ]);
+            $branchId = (int)$statement->fetchColumn();
+        }
+    }
+
+    if ($branchId <= 0 && studentsTableExists($pdo, 'branches')) {
+        $statement = $pdo->prepare(
+            "SELECT id
+             FROM branches
+             WHERE tenant_id=:tenant_id
+               AND status='active'
+             ORDER BY is_main DESC,id ASC
+             LIMIT 1"
+        );
+        $statement->execute(['tenant_id' => $tenantId]);
+        $branchId = (int)$statement->fetchColumn();
+    }
+
+    if ($branchId <= 0) {
+        throw new RuntimeException(
+            'Active School and Branch context is required. Assign an active branch to this School Admin.',
+            422
+        );
+    }
+
+    $branchName = 'Branch #' . $branchId;
+    if (studentsTableExists($pdo, 'branches')) {
+        $statement = $pdo->prepare(
+            "SELECT branch_name
+             FROM branches
+             WHERE id=:branch_id
+               AND tenant_id=:tenant_id
+               AND status='active'
+             LIMIT 1"
+        );
+        $statement->execute([
+            'branch_id' => $branchId,
+            'tenant_id' => $tenantId,
+        ]);
+        $branchName = (string)($statement->fetchColumn() ?: '');
+
+        if ($branchName === '') {
+            throw new RuntimeException(
+                'The active Branch does not belong to this School.',
+                403
+            );
+        }
+    }
+
+    /* Required by the database branch-isolation triggers. */
+    $statement = $pdo->prepare(
+        "SET @schoolerp_tenant_id=:tenant_id,
+             @schoolerp_branch_id=:branch_id"
+    );
+    $statement->execute([
+        'tenant_id' => $tenantId,
+        'branch_id' => $branchId,
+    ]);
+
     return [
-        'tenant_id' => (int)($user['tenant_id'] ?? $user['school_id'] ?? $_SESSION['tenant_id'] ?? $_SESSION['school_id'] ?? 0),
-        'branch_id' => (int)($user['branch_id'] ?? $_SESSION['branch_id'] ?? 0),
-        'user_id' => (int)($user['id'] ?? $user['user_id'] ?? $_SESSION['user_id'] ?? 0),
+        'tenant_id' => $tenantId,
+        'branch_id' => $branchId,
+        'branch_name' => $branchName,
+        'user_id' => $userId,
+        'role_id' => $roleId,
     ];
 }
 
@@ -403,18 +536,115 @@ function studentsEnsureSupportSchema(PDO $pdo): void
             KEY idx_student_profile_extra_student (student_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     );
+
+    /*
+     * Parent Portal login link.
+     * One guardian receives one user account, even when the same guardian
+     * is linked to multiple students.
+     */
+    if (
+        studentsTableExists($pdo, 'users')
+        && studentsTableExists($pdo, 'guardians')
+    ) {
+        if (!studentsColumnExists($pdo, 'guardians', 'user_id')) {
+            $pdo->exec(
+                "ALTER TABLE guardians
+                 ADD COLUMN user_id BIGINT UNSIGNED NULL AFTER tenant_id"
+            );
+        }
+
+        $indexStatement = $pdo->prepare(
+            "SELECT COUNT(*)
+             FROM information_schema.statistics
+             WHERE table_schema = DATABASE()
+               AND table_name = 'guardians'
+               AND index_name = 'idx_guardian_user'"
+        );
+        $indexStatement->execute();
+
+        if ((int)$indexStatement->fetchColumn() === 0) {
+            $pdo->exec(
+                "ALTER TABLE guardians
+                 ADD KEY idx_guardian_user (tenant_id, user_id)"
+            );
+        }
+
+        /*
+         * Do not retain broken links when a user account has been removed.
+         */
+        $pdo->exec(
+            "UPDATE guardians g
+             LEFT JOIN users u
+               ON u.id = g.user_id
+              AND u.tenant_id = g.tenant_id
+              AND u.deleted_at IS NULL
+             SET g.user_id = NULL
+             WHERE g.user_id IS NOT NULL
+               AND u.id IS NULL"
+        );
+
+        /*
+         * Student-specific Parent Portal accounts.
+         *
+         * This table is the durable link used by the Students module.
+         * One student can have one Parent Login account. The same guardian
+         * may therefore have separate Parent Login accounts for different
+         * students when the school explicitly generates them.
+         *
+         * Passwords are NEVER stored here. Only users.password_hash stores
+         * the secure hash. Temporary passwords are returned only once at
+         * generation time for printing/sharing.
+         */
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS student_parent_logins (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                tenant_id BIGINT UNSIGNED NOT NULL,
+                student_id BIGINT UNSIGNED NOT NULL,
+                guardian_id BIGINT UNSIGNED NOT NULL,
+                user_id BIGINT UNSIGNED NOT NULL,
+                status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+                created_by BIGINT UNSIGNED NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_student_parent_login_student (tenant_id, student_id),
+                UNIQUE KEY uq_student_parent_login_user (tenant_id, user_id),
+                KEY idx_student_parent_login_guardian (tenant_id, guardian_id),
+                KEY idx_student_parent_login_student (student_id),
+                KEY idx_student_parent_login_user (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        );
+
+        /*
+         * Remove mappings only when their linked user was deleted.
+         * This does not reset or overwrite any valid existing account.
+         */
+        $pdo->exec(
+            "DELETE spl
+             FROM student_parent_logins spl
+             LEFT JOIN users u
+               ON u.id = spl.user_id
+              AND u.tenant_id = spl.tenant_id
+              AND u.deleted_at IS NULL
+             WHERE u.id IS NULL"
+        );
+    }
 }
 
-function studentsCurrentAcademicYearId(PDO $pdo, int $tenantId): int
+function studentsCurrentAcademicYearId(PDO $pdo, int $tenantId, int $branchId): int
 {
     $statement = $pdo->prepare(
         "SELECT id
          FROM academic_years
          WHERE tenant_id = :tenant_id
+           AND branch_id = :branch_id
          ORDER BY is_current DESC, status = 'active' DESC, start_date DESC, id DESC
          LIMIT 1"
     );
-    $statement->execute(['tenant_id' => $tenantId]);
+    $statement->execute([
+        'tenant_id' => $tenantId,
+        'branch_id' => $branchId,
+    ]);
     return (int)$statement->fetchColumn();
 }
 
@@ -506,22 +736,27 @@ function studentsLog(
     }
 }
 
-function studentsFindAcademicYear(PDO $pdo, int $tenantId, int $academicYearId): array
+function studentsFindAcademicYear(PDO $pdo, int $tenantId, int $branchId, int $academicYearId): array
 {
     $statement = $pdo->prepare(
-        'SELECT id, year_name, start_date, end_date, is_current, status
+        'SELECT id, branch_id, year_name, start_date, end_date, is_current, status
          FROM academic_years
-         WHERE id = :id AND tenant_id = :tenant_id
+         WHERE id = :id
+           AND tenant_id = :tenant_id
+           AND branch_id = :branch_id
          LIMIT 1'
     );
     $statement->execute([
         'id' => $academicYearId,
         'tenant_id' => $tenantId,
+        'branch_id' => $branchId,
     ]);
     $row = $statement->fetch(PDO::FETCH_ASSOC);
 
     if (!$row) {
-        throw new InvalidArgumentException('Please select a valid academic year.');
+        throw new InvalidArgumentException(
+            'Please select a valid academic year configured for the current branch.'
+        );
     }
 
     return $row;
@@ -555,6 +790,7 @@ function studentsFindBranch(PDO $pdo, int $tenantId, int $branchId): array
 function studentsResolveClass(
     PDO $pdo,
     int $tenantId,
+    int $branchId,
     int $academicYearId,
     int $inputClassId
 ): array {
@@ -562,222 +798,208 @@ function studentsResolveClass(
         throw new InvalidArgumentException('Please select a class.');
     }
 
-    $className = '';
-    $sourceClassId = $inputClassId;
-    $displayOrder = 0;
+    $statement = $pdo->prepare(
+        "SELECT id, branch_id, academic_year_id, class_name, display_order, status
+         FROM classes
+         WHERE id = :id
+           AND tenant_id = :tenant_id
+           AND branch_id = :branch_id
+           AND academic_year_id = :academic_year_id
+         LIMIT 1"
+    );
+    $statement->execute([
+        'id' => $inputClassId,
+        'tenant_id' => $tenantId,
+        'branch_id' => $branchId,
+        'academic_year_id' => $academicYearId,
+    ]);
+    $source = $statement->fetch(PDO::FETCH_ASSOC);
 
-    if (studentsTableExists($pdo, 'class_management_classes')) {
-        $statement = $pdo->prepare(
-            "SELECT id, academic_year_id, class_name, display_order
+    /* Compatibility for old Class Management row IDs. */
+    if (!$source && studentsTableExists($pdo, 'class_management_classes')) {
+        $managedStatement = $pdo->prepare(
+            "SELECT academic_year_id, class_name
              FROM class_management_classes
              WHERE id = :id
                AND tenant_id = :tenant_id
+               AND branch_id = :branch_id
+               AND academic_year_id = :academic_year_id
                AND status <> 'archived'
              LIMIT 1"
         );
-        $statement->execute([
+        $managedStatement->execute([
             'id' => $inputClassId,
             'tenant_id' => $tenantId,
-        ]);
-        $source = $statement->fetch(PDO::FETCH_ASSOC);
-        if ($source) {
-            if ((int)$source['academic_year_id'] !== $academicYearId) {
-                throw new InvalidArgumentException('The selected class does not belong to the selected academic year.');
-            }
-            $className = trim((string)$source['class_name']);
-            $displayOrder = (int)($source['display_order'] ?? 0);
-        }
-    }
-
-    if ($className === '') {
-        $statement = $pdo->prepare(
-            "SELECT id, academic_year_id, class_name, display_order
-             FROM classes
-             WHERE id = :id
-               AND tenant_id = :tenant_id
-               AND status = 'active'
-             LIMIT 1"
-        );
-        $statement->execute([
-            'id' => $inputClassId,
-            'tenant_id' => $tenantId,
-        ]);
-        $source = $statement->fetch(PDO::FETCH_ASSOC);
-        if (!$source || (int)$source['academic_year_id'] !== $academicYearId) {
-            throw new InvalidArgumentException('Please select a valid class for the selected academic year.');
-        }
-        $className = trim((string)$source['class_name']);
-        $displayOrder = (int)($source['display_order'] ?? 0);
-    }
-
-    $statement = $pdo->prepare(
-        'SELECT id
-         FROM classes
-         WHERE tenant_id = :tenant_id
-           AND academic_year_id = :academic_year_id
-           AND class_name = :class_name
-         LIMIT 1'
-    );
-    $statement->execute([
-        'tenant_id' => $tenantId,
-        'academic_year_id' => $academicYearId,
-        'class_name' => $className,
-    ]);
-    $canonicalClassId = (int)$statement->fetchColumn();
-
-    if ($canonicalClassId <= 0) {
-        $statement = $pdo->prepare(
-            "INSERT INTO classes
-                (tenant_id, academic_year_id, class_name, display_order, status)
-             VALUES
-                (:tenant_id, :academic_year_id, :class_name, :display_order, 'active')"
-        );
-        $statement->execute([
-            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
             'academic_year_id' => $academicYearId,
-            'class_name' => $className,
-            'display_order' => $displayOrder,
         ]);
-        $canonicalClassId = (int)$pdo->lastInsertId();
+        $managed = $managedStatement->fetch(PDO::FETCH_ASSOC);
+
+        if ($managed) {
+            $statement = $pdo->prepare(
+                "SELECT id, branch_id, academic_year_id, class_name, display_order, status
+                 FROM classes
+                 WHERE tenant_id = :tenant_id
+                   AND branch_id = :branch_id
+                   AND academic_year_id = :academic_year_id
+                   AND LOWER(TRIM(class_name)) = LOWER(TRIM(:class_name))
+                 LIMIT 1"
+            );
+            $statement->execute([
+                'tenant_id' => $tenantId,
+                'branch_id' => $branchId,
+                'academic_year_id' => $academicYearId,
+                'class_name' => (string)$managed['class_name'],
+            ]);
+            $source = $statement->fetch(PDO::FETCH_ASSOC);
+        }
+    }
+
+    if (!$source) {
+        throw new InvalidArgumentException(
+            'Please select a valid class created in Class Management for the current branch and academic year.'
+        );
     }
 
     return [
-        'source_class_id' => $sourceClassId,
-        'canonical_class_id' => $canonicalClassId,
-        'class_name' => $className,
+        'source_class_id' => (int)$source['id'],
+        'canonical_class_id' => (int)$source['id'],
+        'class_name' => trim((string)$source['class_name']),
+        'display_order' => (int)($source['display_order'] ?? 0),
+        'status' => (string)($source['status'] ?? 'active'),
     ];
 }
 
 function studentsResolveSection(
     PDO $pdo,
     int $tenantId,
+    int $branchId,
     int $academicYearId,
     array $class,
     int $inputSectionId
 ): array {
-    $sectionName = '';
-    $sourceSectionId = $inputSectionId;
-    $capacity = null;
+    $canonicalClassId = (int)($class['canonical_class_id'] ?? 0);
 
-    if ($inputSectionId > 0 && studentsTableExists($pdo, 'school_sections')) {
+    if ($canonicalClassId <= 0) {
+        throw new InvalidArgumentException(
+            'Please select a valid class before selecting a section.'
+        );
+    }
+
+    $source = null;
+
+    if ($inputSectionId > 0) {
         $statement = $pdo->prepare(
-            "SELECT id, academic_year_id, class_id, class_name_snapshot, section_name, maximum_student_capacity
+            "SELECT
+                s.id,
+                s.section_name,
+                s.capacity,
+                s.status,
+                c.academic_year_id,
+                c.class_name
+             FROM sections s
+             INNER JOIN classes c
+                ON c.id = s.class_id
+               AND c.tenant_id = s.tenant_id
+               AND c.branch_id = s.branch_id
+             WHERE s.id = :id
+               AND s.tenant_id = :tenant_id
+               AND s.branch_id = :branch_id
+               AND s.class_id = :class_id
+               AND c.branch_id = :branch_id_class
+               AND c.academic_year_id = :academic_year_id
+             LIMIT 1"
+        );
+        $statement->execute([
+            'id' => $inputSectionId,
+            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
+            'branch_id_class' => $branchId,
+            'class_id' => $canonicalClassId,
+            'academic_year_id' => $academicYearId,
+        ]);
+        $source = $statement->fetch(PDO::FETCH_ASSOC);
+    }
+
+    if (
+        !$source
+        && $inputSectionId > 0
+        && studentsTableExists($pdo, 'school_sections')
+    ) {
+        $legacyStatement = $pdo->prepare(
+            "SELECT section_name
              FROM school_sections
              WHERE id = :id
                AND tenant_id = :tenant_id
+               AND branch_id = :branch_id
+               AND academic_year_id = :academic_year_id
+               AND LOWER(TRIM(class_name_snapshot)) = LOWER(TRIM(:class_name))
                AND status <> 'archived'
              LIMIT 1"
         );
-        $statement->execute([
+        $legacyStatement->execute([
             'id' => $inputSectionId,
             'tenant_id' => $tenantId,
-        ]);
-        $source = $statement->fetch(PDO::FETCH_ASSOC);
-        if ($source) {
-            if ((int)$source['academic_year_id'] !== $academicYearId) {
-                throw new InvalidArgumentException('The selected section does not belong to the selected academic year.');
-            }
-            if (strcasecmp(trim((string)$source['class_name_snapshot']), (string)$class['class_name']) !== 0) {
-                throw new InvalidArgumentException('The selected section does not belong to the selected class.');
-            }
-            $sectionName = trim((string)$source['section_name']);
-            $capacity = $source['maximum_student_capacity'] !== null
-                ? (int)$source['maximum_student_capacity']
-                : null;
-        }
-    }
-
-    if ($inputSectionId > 0 && $sectionName === '') {
-        $statement = $pdo->prepare(
-            "SELECT s.id, s.section_name, s.capacity, c.academic_year_id, c.class_name
-             FROM sections s
-             INNER JOIN classes c ON c.id = s.class_id AND c.tenant_id = s.tenant_id
-             WHERE s.id = :id
-               AND s.tenant_id = :tenant_id
-               AND s.status = 'active'
-             LIMIT 1"
-        );
-        $statement->execute([
-            'id' => $inputSectionId,
-            'tenant_id' => $tenantId,
-        ]);
-        $source = $statement->fetch(PDO::FETCH_ASSOC);
-        if (!$source
-            || (int)$source['academic_year_id'] !== $academicYearId
-            || strcasecmp(trim((string)$source['class_name']), (string)$class['class_name']) !== 0
-        ) {
-            throw new InvalidArgumentException('Please select a valid section.');
-        }
-        $sectionName = trim((string)$source['section_name']);
-        $capacity = $source['capacity'] !== null ? (int)$source['capacity'] : null;
-    }
-
-    if ($sectionName === '' && studentsTableExists($pdo, 'school_sections')) {
-        $statement = $pdo->prepare(
-            "SELECT id, section_name, maximum_student_capacity
-             FROM school_sections
-             WHERE tenant_id = :tenant_id
-               AND academic_year_id = :academic_year_id
-               AND class_name_snapshot = :class_name
-               AND status = 'active'
-             ORDER BY display_order, id
-             LIMIT 1"
-        );
-        $statement->execute([
-            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
             'academic_year_id' => $academicYearId,
-            'class_name' => $class['class_name'],
+            'class_name' => (string)$class['class_name'],
         ]);
-        $source = $statement->fetch(PDO::FETCH_ASSOC);
-        if ($source) {
-            $sourceSectionId = (int)$source['id'];
-            $sectionName = trim((string)$source['section_name']);
-            $capacity = $source['maximum_student_capacity'] !== null
-                ? (int)$source['maximum_student_capacity']
-                : null;
+        $legacy = $legacyStatement->fetch(PDO::FETCH_ASSOC);
+
+        if ($legacy) {
+            $statement = $pdo->prepare(
+                "SELECT id, section_name, capacity, status
+                 FROM sections
+                 WHERE tenant_id = :tenant_id
+                   AND branch_id = :branch_id
+                   AND class_id = :class_id
+                   AND LOWER(TRIM(section_name)) = LOWER(TRIM(:section_name))
+                 LIMIT 1"
+            );
+            $statement->execute([
+                'tenant_id' => $tenantId,
+                'branch_id' => $branchId,
+                'class_id' => $canonicalClassId,
+                'section_name' => (string)$legacy['section_name'],
+            ]);
+            $source = $statement->fetch(PDO::FETCH_ASSOC);
         }
     }
 
-    if ($sectionName === '') {
-        $sectionName = 'General';
-        $sourceSectionId = 0;
-    }
-
-    $statement = $pdo->prepare(
-        'SELECT id
-         FROM sections
-         WHERE tenant_id = :tenant_id
-           AND class_id = :class_id
-           AND section_name = :section_name
-         LIMIT 1'
-    );
-    $statement->execute([
-        'tenant_id' => $tenantId,
-        'class_id' => $class['canonical_class_id'],
-        'section_name' => $sectionName,
-    ]);
-    $canonicalSectionId = (int)$statement->fetchColumn();
-
-    if ($canonicalSectionId <= 0) {
+    if (!$source && $inputSectionId <= 0) {
         $statement = $pdo->prepare(
-            "INSERT INTO sections
-                (tenant_id, class_id, section_name, capacity, status)
-             VALUES
-                (:tenant_id, :class_id, :section_name, :capacity, 'active')"
+            "SELECT id, section_name, capacity, status
+             FROM sections
+             WHERE tenant_id = :tenant_id
+               AND branch_id = :branch_id
+               AND class_id = :class_id
+             ORDER BY status = 'active' DESC, id
+             LIMIT 2"
         );
         $statement->execute([
             'tenant_id' => $tenantId,
-            'class_id' => $class['canonical_class_id'],
-            'section_name' => $sectionName,
-            'capacity' => $capacity,
+            'branch_id' => $branchId,
+            'class_id' => $canonicalClassId,
         ]);
-        $canonicalSectionId = (int)$pdo->lastInsertId();
+        $available = $statement->fetchAll(PDO::FETCH_ASSOC);
+
+        if (count($available) === 1) {
+            $source = $available[0];
+        }
+    }
+
+    if (!$source) {
+        throw new InvalidArgumentException(
+            'Please select a valid section configured for the current branch, class and academic year.'
+        );
     }
 
     return [
-        'source_section_id' => $sourceSectionId,
-        'canonical_section_id' => $canonicalSectionId,
-        'section_name' => $sectionName,
+        'source_section_id' => (int)$source['id'],
+        'canonical_section_id' => (int)$source['id'],
+        'section_name' => trim((string)$source['section_name']),
+        'capacity' => $source['capacity'] !== null ? (int)$source['capacity'] : null,
+        'status' => (string)($source['status'] ?? 'active'),
     ];
 }
 
@@ -1303,10 +1525,13 @@ function studentsFeeStructures(
          INNER JOIN classes c
             ON c.id = fs.class_id
            AND c.tenant_id = fs.tenant_id
+           AND c.branch_id = fs.branch_id
          INNER JOIN academic_years ay
             ON ay.id = fs.academic_year_id
            AND ay.tenant_id = fs.tenant_id
+           AND ay.branch_id = fs.branch_id
          WHERE fs.tenant_id = :tenant_id
+           AND fs.branch_id = :branch_id
            AND fs.status = 'active'
          ORDER BY
             fs.academic_year_id DESC,
@@ -1316,6 +1541,7 @@ function studentsFeeStructures(
     );
     $statement->execute([
         'tenant_id' => $scope['tenant_id'],
+        'branch_id' => $scope['branch_id'],
     ]);
     $rows = $statement->fetchAll(PDO::FETCH_ASSOC);
 
@@ -1470,7 +1696,7 @@ function studentsTransportRoutes(
         )
     ) {
         $where[] =
-            '(r.branch_id IS NULL OR r.branch_id = :branch_id)';
+            'r.branch_id = :branch_id';
         $params['branch_id'] = (int)$scope['branch_id'];
     }
 
@@ -1635,7 +1861,7 @@ function studentsTransportStops(
         )
     ) {
         $where[] =
-            '(rs.branch_id IS NULL OR rs.branch_id = :branch_id)';
+            'rs.branch_id = :branch_id';
         $params['branch_id'] = (int)$scope['branch_id'];
     }
 
@@ -1660,17 +1886,20 @@ function studentsTransportStops(
 function studentsResolveFeeStructure(
     PDO $pdo,
     int $tenantId,
+    int $branchId,
     int $academicYearId,
     int $canonicalClassId,
     int $requestedStructureId
 ): array {
     $params = [
         'tenant_id' => $tenantId,
+        'branch_id' => $branchId,
         'academic_year_id' => $academicYearId,
         'class_id' => $canonicalClassId,
     ];
     $where = [
         'fs.tenant_id = :tenant_id',
+        'fs.branch_id = :branch_id',
         'fs.academic_year_id = :academic_year_id',
         'fs.class_id = :class_id',
         "fs.status = 'active'",
@@ -1693,6 +1922,7 @@ function studentsResolveFeeStructure(
          INNER JOIN academic_years ay
             ON ay.id = fs.academic_year_id
            AND ay.tenant_id = fs.tenant_id
+           AND ay.branch_id = fs.branch_id
          WHERE " . implode(' AND ', $where) . "
          ORDER BY fs.id DESC"
     );
@@ -1701,17 +1931,17 @@ function studentsResolveFeeStructure(
 
     if ($requestedStructureId > 0 && !$rows) {
         throw new InvalidArgumentException(
-            'The selected Fee Structure does not match the selected Academic Year and Class.'
+            'The selected Fee Structure does not match the current Branch, Academic Year and Class.'
         );
     }
     if (count($rows) > 1) {
         throw new InvalidArgumentException(
-            'More than one Active Fee Structure exists for this Academic Year and Class. Keep only one structure active.'
+            'More than one Active Fee Structure exists for this Branch, Academic Year and Class. Keep only one structure active.'
         );
     }
     if (!$rows) {
         throw new InvalidArgumentException(
-            'No Active Fee Structure exists for the selected Academic Year and Class.'
+            'No Active Fee Structure exists for the current Branch, Academic Year and Class.'
         );
     }
 
@@ -1865,10 +2095,7 @@ function studentsResolveTransportSelection(
         'school_routes',
         'branch_id'
     )
-        ? "AND (
-                r.branch_id IS NULL
-                OR r.branch_id = :branch_id
-           )"
+        ? "AND r.branch_id = :branch_id"
         : '';
 
     $branchField = studentsColumnExists(
@@ -2223,41 +2450,64 @@ function studentsGenerateFeeSchedule(
     ?array $route
 ): void {
     $tenantId = $scope['tenant_id'];
-    $paidStatement = $pdo->prepare(
-        "SELECT COALESCE(SUM(paid_amount),0)
-         FROM student_fee_items
-         WHERE tenant_id = :tenant_id
-           AND assignment_id = :assignment_id"
-    );
-    $paidStatement->execute([
-        'tenant_id' => $tenantId,
-        'assignment_id' => $assignmentId,
-    ]);
-    $paid = (float)$paidStatement->fetchColumn();
     $scheduleStart = new DateTimeImmutable($structure['start_date']);
     $assignmentDate = new DateTimeImmutable(
         (string)($structure['assignment_date'] ?? $structure['start_date'])
     );
 
+    /*
+     * For a new admission, fees start from the actual enrollment/admission
+     * date. For promoted/existing students, the academic-year start is used.
+     */
     if ($applyAdmissionFee && $assignmentDate > $scheduleStart) {
         $scheduleStart = $assignmentDate;
     }
 
-    if ($paid > 0.009) {
-        studentsAggregateAssignment(
-            $pdo,
-            $tenantId,
-            $assignmentId,
-            $route
-        );
-        return;
+    /*
+     * Never destroy fee rows which already have a collection/waiver/discount.
+     * Only untouched generated rows are rebuilt. This allows Route, Boarding
+     * Stop and Bus Fee changes even when Tuition/Admission collection has
+     * already started, while preserving the financial history exactly.
+     */
+    $protectedStatement = $pdo->prepare(
+        "SELECT item_type, period_key, original_amount
+         FROM student_fee_items
+         WHERE tenant_id = :tenant_id
+           AND assignment_id = :assignment_id
+           AND item_type IN('admission','tuition','term','additional','transport')
+           AND item_status <> 'cancelled'
+           AND (
+                COALESCE(paid_amount,0) > 0.009
+                OR COALESCE(discount_amount,0) > 0.009
+                OR item_status IN('paid','partial','waived')
+           )"
+    );
+    $protectedStatement->execute([
+        'tenant_id' => $tenantId,
+        'assignment_id' => $assignmentId,
+    ]);
+
+    $protectedKeys = [];
+    $protectedTransportGross = 0.0;
+    foreach ($protectedStatement->fetchAll(PDO::FETCH_ASSOC) as $protectedRow) {
+        $protectedType = strtolower((string)$protectedRow['item_type']);
+        $protectedKeys[
+            $protectedType .
+            '|' . (string)$protectedRow['period_key']
+        ] = true;
+        if ($protectedType === 'transport') {
+            $protectedTransportGross += (float)($protectedRow['original_amount'] ?? 0);
+        }
     }
 
     $pdo->prepare(
         "DELETE FROM student_fee_items
          WHERE tenant_id = :tenant_id
            AND assignment_id = :assignment_id
-           AND item_type IN('admission','tuition','term','transport')"
+           AND item_type IN('admission','tuition','term','additional','transport')
+           AND COALESCE(paid_amount,0) <= 0.009
+           AND COALESCE(discount_amount,0) <= 0.009
+           AND item_status NOT IN('paid','partial','waived')"
     )->execute([
         'tenant_id' => $tenantId,
         'assignment_id' => $assignmentId,
@@ -2305,9 +2555,8 @@ function studentsGenerateFeeSchedule(
              ORDER BY fsi.display_order, fsi.id"
         );
     }
-    $itemParameters = [
-        'structure_id' => $structure['id'],
-    ];
+
+    $itemParameters = ['structure_id' => $structure['id']];
     if ($hasDynamicFeeTypes) {
         $itemParameters['tenant_id'] = $tenantId;
     }
@@ -2316,30 +2565,11 @@ function studentsGenerateFeeSchedule(
 
     $monthlyDueDay = max(
         1,
-        (int)studentsFeeSetting(
-            $pdo,
-            $tenantId,
-            'monthly_due_day',
-            '10'
-        )
+        (int)studentsFeeSetting($pdo, $tenantId, 'monthly_due_day', '10')
     );
     $transportDueDay = max(
         1,
-        (int)studentsFeeSetting(
-            $pdo,
-            $tenantId,
-            'transport_due_day',
-            '10'
-        )
-    );
-    $termCount = max(
-        1,
-        (int)studentsFeeSetting(
-            $pdo,
-            $tenantId,
-            'term_count',
-            '3'
-        )
+        (int)studentsFeeSetting($pdo, $tenantId, 'transport_due_day', '10')
     );
 
     $insert = $pdo->prepare(
@@ -2370,7 +2600,7 @@ function studentsGenerateFeeSchedule(
     );
 
     foreach ($structureItems as $item) {
-        $type = (string)$item['fee_type_key'];
+        $type = strtolower((string)($item['fee_type_key'] ?? ''));
         $amount = round((float)$item['amount'], 2);
         if ($amount <= 0) {
             continue;
@@ -2378,12 +2608,18 @@ function studentsGenerateFeeSchedule(
 
         $frequency = strtolower((string)($item['frequency'] ?? 'one_time'));
         $occurrenceCount = max(1, (int)($item['occurrence_count'] ?? 1));
-        $normalizedCode = strtolower((string)($item['fee_type_key'] ?? ''));
-        $isAdmissionType = str_contains($normalizedCode, 'admission');
+        $isAdmissionType = str_contains($type, 'admission');
 
         if ($isAdmissionType && !$applyAdmissionFee) {
             continue;
         }
+
+        $itemType = match (true) {
+            str_contains($type, 'admission') => 'admission',
+            str_contains($type, 'tuition') => 'tuition',
+            str_contains($type, 'exam'), str_contains($type, 'term') => 'term',
+            default => 'additional',
+        };
 
         $periods = studentsFrequencyPeriods(
             $frequency,
@@ -2406,6 +2642,11 @@ function studentsGenerateFeeSchedule(
         );
 
         foreach ($periods as $period) {
+            $protectedKey = $itemType . '|' . (string)$period['key'];
+            if (isset($protectedKeys[$protectedKey])) {
+                continue;
+            }
+
             $insert->execute([
                 'tenant_id' => $tenantId,
                 'assignment_id' => $assignmentId,
@@ -2414,12 +2655,7 @@ function studentsGenerateFeeSchedule(
                 'structure_item_id' => $item['id'],
                 'route_id' => null,
                 'stop_id' => null,
-                'item_type' => match (true) {
-                    str_contains($type, 'admission') => 'admission',
-                    str_contains($type, 'tuition') => 'tuition',
-                    str_contains($type, 'exam'), str_contains($type, 'term') => 'term',
-                    default => 'additional',
-                },
+                'item_type' => $itemType,
                 'item_name' => $item['head_name'],
                 'period_key' => $period['key'],
                 'period_label' => $period['label'],
@@ -2431,25 +2667,19 @@ function studentsGenerateFeeSchedule(
     }
 
     if ($route && (float)$route['transport_fee'] > 0) {
-        $amount = round((float)$route['transport_fee'], 2);
-
         /*
-         * Keep this value NULL for maximum compatibility.
-         *
-         * Older databases constrain student_fee_items.transport_route_id
-         * to transport_routes(id), while the current Transport Master uses
-         * school_routes(id). The selected School Route is still available
-         * through transport_stop_id -> school_route_stops.route_id and in
-         * student_transport_assignments.
+         * Transport is a fixed one-time student charge. The boarding-stop
+         * amount is stored exactly once and is never expanded into monthly
+         * BUS-* rows.
          */
+        $amount = round(
+            max(0.0, (float)$route['transport_fee'] - $protectedTransportGross),
+            2
+        );
         $feeItemRouteId = null;
-        foreach (
-            studentsMonthPeriods(
-                $scheduleStart->format('Y-m-d'),
-                $structure['end_date'],
-                $transportDueDay
-            ) as $period
-        ) {
+        $periodKey = 'BUS-FIXED';
+
+        if ($amount > 0.009 && !isset($protectedKeys['transport|' . $periodKey])) {
             $insert->execute([
                 'tenant_id' => $tenantId,
                 'assignment_id' => $assignmentId,
@@ -2460,13 +2690,13 @@ function studentsGenerateFeeSchedule(
                 'stop_id' => $route['stop_id'],
                 'item_type' => 'transport',
                 'item_name' =>
-                    'Transport Fee - ' .
+                    'Bus Fee - ' .
                     $route['route_name'] .
                     ' / ' .
                     $route['stop_name'],
-                'period_key' => 'BUS-' . $period['key'],
-                'period_label' => $period['label'],
-                'due_date' => $period['due_date'],
+                'period_key' => $periodKey,
+                'period_label' => 'Fixed',
+                'due_date' => $scheduleStart->format('Y-m-d'),
                 'amount' => $amount,
                 'balance' => $amount,
             ]);
@@ -2480,7 +2710,6 @@ function studentsGenerateFeeSchedule(
         $route
     );
 }
-
 function studentsAssignFeeStructure(
     PDO $pdo,
     array $scope,
@@ -2498,6 +2727,7 @@ function studentsAssignFeeStructure(
     $structure = studentsResolveFeeStructure(
         $pdo,
         $scope['tenant_id'],
+        $branchId,
         $academicYearId,
         $canonicalClassId,
         $requestedStructureId
@@ -2544,28 +2774,38 @@ function studentsAssignFeeStructure(
     $assignment = $existing->fetch(PDO::FETCH_ASSOC);
 
     if ($assignment) {
-        $paid = (float)$assignment['paid_amount'];
+        $paidStatement = $pdo->prepare(
+            "SELECT COALESCE(SUM(paid_amount),0)
+             FROM student_fee_items
+             WHERE tenant_id = :tenant_id
+               AND assignment_id = :assignment_id
+               AND item_status <> 'cancelled'"
+        );
+        $paidStatement->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'assignment_id' => (int)$assignment['id'],
+        ]);
+        $paid = max(
+            (float)($assignment['paid_amount'] ?? 0),
+            (float)$paidStatement->fetchColumn()
+        );
 
-        $changed =
+        $feeStructureChanged =
             (int)$assignment['fee_structure_id']
-                !== (int)$structure['id']
-            || (int)($assignment['transport_route_id'] ?? 0)
-                !== (int)($transport['id'] ?? 0)
-            || (int)($assignment['transport_stop_id'] ?? 0)
-                !== (int)($transport['stop_id'] ?? 0)
-            || (int)($assignment['transport_vehicle_id'] ?? 0)
-                !== (int)($transport['vehicle_id'] ?? 0);
+                !== (int)$structure['id'];
 
-        if ($paid > 0.009 && $changed) {
+        /*
+         * A collected Fee Structure remains immutable, but transport is not.
+         * Route/Stop/Bus Fee changes are handled by the schedule synchronizer,
+         * which preserves collected rows and rebuilds only untouched rows.
+         */
+        if ($paid > 0.009 && $feeStructureChanged) {
             throw new InvalidArgumentException(
-                'Fee Structure, Route or Boarding Stop cannot be changed after Fee Collection has started.'
+                'Fee Structure cannot be changed after Fee Collection has started. Bus Route, Boarding Stop and Bus Fee can still be updated.'
             );
         }
 
-        if (
-            (int)$assignment['fee_structure_id']
-                !== (int)$structure['id']
-        ) {
+        if ($feeStructureChanged) {
             $pdo->prepare(
                 "UPDATE student_fee_assignments
                  SET assignment_status = 'inactive'
@@ -2696,6 +2936,1350 @@ function studentsAssignFeeStructure(
     return (int)$structure['id'];
 }
 
+
+function studentsParentLoginRequireSchema(PDO $pdo): void
+{
+    foreach (
+        [
+            'users',
+            'roles',
+            'guardians',
+            'student_guardians',
+            'students',
+            'student_parent_logins',
+        ] as $table
+    ) {
+        if (!studentsTableExists($pdo, $table)) {
+            throw new RuntimeException(
+                'Parent Login requires the ' . $table . ' table.',
+                500
+            );
+        }
+    }
+}
+
+function studentsParentRole(PDO $pdo, array $scope): array
+{
+    studentsParentLoginRequireSchema($pdo);
+
+    $statement = $pdo->prepare(
+        "SELECT
+            id,
+            tenant_id,
+            role_key,
+            role_name,
+            role_scope,
+            is_system,
+            status,
+            deleted_at
+         FROM roles
+         WHERE tenant_id = :tenant_id
+           AND role_key = 'parent'
+         LIMIT 1"
+    );
+    $statement->execute([
+        'tenant_id' => $scope['tenant_id'],
+    ]);
+    $role = $statement->fetch(PDO::FETCH_ASSOC);
+
+    if ($role) {
+        if (
+            (string)$role['status'] !== 'active'
+            || !empty($role['deleted_at'])
+        ) {
+            $update = $pdo->prepare(
+                "UPDATE roles
+                 SET role_name = 'Parent',
+                     description = 'Parent Portal Login',
+                     role_scope = 'school',
+                     status = 'active',
+                     deleted_at = NULL
+                 WHERE id = :role_id
+                   AND tenant_id = :tenant_id"
+            );
+            $update->execute([
+                'role_id' => (int)$role['id'],
+                'tenant_id' => $scope['tenant_id'],
+            ]);
+        }
+    } else {
+        $insert = $pdo->prepare(
+            "INSERT INTO roles
+             (
+                tenant_id,
+                role_key,
+                role_name,
+                description,
+                role_scope,
+                is_system,
+                status,
+                created_by
+             )
+             VALUES
+             (
+                :tenant_id,
+                'parent',
+                'Parent',
+                'Parent Portal Login',
+                'school',
+                0,
+                'active',
+                :created_by
+             )"
+        );
+        $insert->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'created_by' => $scope['user_id'] > 0
+                ? $scope['user_id']
+                : null,
+        ]);
+    }
+
+    $statement = $pdo->prepare(
+        "SELECT
+            id,
+            tenant_id,
+            role_key,
+            role_name,
+            role_scope,
+            is_system,
+            status
+         FROM roles
+         WHERE tenant_id = :tenant_id
+           AND role_key = 'parent'
+           AND status = 'active'
+           AND deleted_at IS NULL
+         LIMIT 1"
+    );
+    $statement->execute([
+        'tenant_id' => $scope['tenant_id'],
+    ]);
+    $role = $statement->fetch(PDO::FETCH_ASSOC);
+
+    if (!$role) {
+        throw new RuntimeException(
+            'Unable to prepare the Parent role.',
+            500
+        );
+    }
+
+    return $role;
+}
+
+
+function studentsParentLoginNormalizeFilters(
+    PDO $pdo,
+    array $scope,
+    array $filters = [],
+    bool $requireComplete = false
+): array {
+    $yearId = max(0, (int)($filters['academic_year_id'] ?? 0));
+    $classId = max(0, (int)($filters['class_id'] ?? 0));
+    $sectionId = max(0, (int)($filters['section_id'] ?? 0));
+
+    if ($requireComplete && ($yearId <= 0 || $classId <= 0 || $sectionId <= 0)) {
+        throw new InvalidArgumentException(
+            'Select Academic Year, Class and Section before loading students.'
+        );
+    }
+
+    if ($yearId > 0) {
+        $yearStatement = $pdo->prepare(
+            "SELECT id, year_name
+             FROM academic_years
+             WHERE id = :year_id
+               AND tenant_id = :tenant_id
+               AND branch_id = :branch_id
+             LIMIT 1"
+        );
+        $yearStatement->execute([
+            'year_id' => $yearId,
+            'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $scope['branch_id'],
+        ]);
+        if (!$yearStatement->fetch(PDO::FETCH_ASSOC)) {
+            throw new InvalidArgumentException('Selected Academic Year is invalid.');
+        }
+    }
+
+    if ($classId > 0) {
+        if ($yearId <= 0) {
+            throw new InvalidArgumentException('Select Academic Year before selecting Class.');
+        }
+
+        $classStatement = $pdo->prepare(
+            "SELECT id, class_name
+             FROM classes
+             WHERE id = :class_id
+               AND tenant_id = :tenant_id
+               AND branch_id = :branch_id
+               AND academic_year_id = :academic_year_id
+             LIMIT 1"
+        );
+        $classStatement->execute([
+            'class_id' => $classId,
+            'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $scope['branch_id'],
+            'academic_year_id' => $yearId,
+        ]);
+        if (!$classStatement->fetch(PDO::FETCH_ASSOC)) {
+            throw new InvalidArgumentException(
+                'Selected Class does not belong to the selected Academic Year.'
+            );
+        }
+    }
+
+    if ($sectionId > 0) {
+        if ($classId <= 0) {
+            throw new InvalidArgumentException('Select Class before selecting Section.');
+        }
+
+        $sectionStatement = $pdo->prepare(
+            "SELECT s.id
+             FROM sections s
+             INNER JOIN classes c
+                ON c.id = s.class_id
+               AND c.tenant_id = s.tenant_id
+               AND c.branch_id = s.branch_id
+             WHERE s.id = :section_id
+               AND s.tenant_id = :tenant_id
+               AND s.branch_id = :branch_id
+               AND s.class_id = :class_id
+               AND c.academic_year_id = :academic_year_id
+             LIMIT 1"
+        );
+        $sectionStatement->execute([
+            'section_id' => $sectionId,
+            'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $scope['branch_id'],
+            'class_id' => $classId,
+            'academic_year_id' => $yearId,
+        ]);
+        if (!$sectionStatement->fetchColumn()) {
+            throw new InvalidArgumentException(
+                'Selected Section does not belong to the selected Class and Academic Year.'
+            );
+        }
+    }
+
+    return [
+        'academic_year_id' => $yearId,
+        'class_id' => $classId,
+        'section_id' => $sectionId,
+    ];
+}
+
+function studentsParentLoginRows(
+    PDO $pdo,
+    array $scope,
+    string $studentScope = 'active',
+    array $studentIds = [],
+    array $filters = []
+): array {
+    studentsParentLoginRequireSchema($pdo);
+
+    $studentScope = strtolower(trim($studentScope));
+    if (!in_array($studentScope, ['active', 'all'], true)) {
+        $studentScope = 'active';
+    }
+
+    $filter = studentsParentLoginNormalizeFilters(
+        $pdo,
+        $scope,
+        $filters,
+        false
+    );
+
+    $where = [
+        's.tenant_id = :tenant_id',
+        's.deleted_at IS NULL',
+    ];
+    $params = [
+        'tenant_id' => $scope['tenant_id'],
+    ];
+
+    $where[] = 's.branch_id = :scope_branch_id';
+    $params['scope_branch_id'] = $scope['branch_id'];
+
+    if ($studentScope === 'active') {
+        $where[] = "s.status = 'active'";
+    }
+
+    $normalizedIds = array_values(array_unique(array_filter(
+        array_map('intval', $studentIds),
+        static fn(int $id): bool => $id > 0
+    )));
+
+    if ($normalizedIds) {
+        $placeholders = [];
+        foreach ($normalizedIds as $index => $studentId) {
+            $key = 'student_id_' . $index;
+            $placeholders[] = ':' . $key;
+            $params[$key] = $studentId;
+        }
+        $where[] = 's.id IN (' . implode(',', $placeholders) . ')';
+    }
+
+    if ($filter['academic_year_id'] > 0) {
+        $enrollmentJoin = "
+         INNER JOIN student_enrollments se
+           ON se.student_id = s.id
+          AND se.tenant_id = s.tenant_id
+          AND se.branch_id = s.branch_id
+          AND se.academic_year_id = :parent_filter_year_id";
+        $params['parent_filter_year_id'] = $filter['academic_year_id'];
+
+        if ($filter['class_id'] > 0) {
+            $where[] = 'se.class_id = :parent_filter_class_id';
+            $params['parent_filter_class_id'] = $filter['class_id'];
+        }
+
+        if ($filter['section_id'] > 0) {
+            $where[] = 'se.section_id = :parent_filter_section_id';
+            $params['parent_filter_section_id'] = $filter['section_id'];
+        }
+    } else {
+        $enrollmentJoin = "
+         LEFT JOIN student_enrollments se
+           ON se.id = (
+                SELECT se2.id
+                FROM student_enrollments se2
+                LEFT JOIN academic_years ay2
+                  ON ay2.id = se2.academic_year_id
+                 AND ay2.tenant_id = se2.tenant_id
+                 AND ay2.branch_id = se2.branch_id
+                WHERE se2.student_id = s.id
+                  AND se2.tenant_id = s.tenant_id
+                  AND se2.branch_id = s.branch_id
+                ORDER BY
+                    CASE se2.enrollment_status
+                        WHEN 'active' THEN 0
+                        WHEN 'promoted' THEN 1
+                        WHEN 'transferred' THEN 2
+                        WHEN 'completed' THEN 3
+                        ELSE 4
+                    END,
+                    COALESCE(ay2.start_date, '1000-01-01') DESC,
+                    se2.id DESC
+                LIMIT 1
+           )";
+    }
+
+    $statement = $pdo->prepare(
+        "SELECT
+            s.id AS student_id,
+            s.branch_id,
+            s.admission_no AS admission_number,
+            TRIM(CONCAT_WS(' ', s.first_name, s.last_name)) AS student_name,
+            s.status AS student_status,
+            b.branch_name,
+            se.academic_year_id,
+            ay.year_name AS academic_year_name,
+            se.class_id,
+            c.class_name,
+            se.section_id,
+            sec.section_name,
+            g.id AS guardian_id,
+            g.guardian_name,
+            g.relationship,
+            g.mobile AS guardian_mobile,
+            g.email AS guardian_email,
+            g.user_id AS guardian_general_user_id,
+            spl.id AS student_parent_login_id,
+            spl.user_id AS parent_user_id,
+            spl.status AS parent_login_status,
+            u.username AS parent_username,
+            u.status AS parent_user_status
+         FROM students s
+         LEFT JOIN branches b
+           ON b.id = s.branch_id
+          AND b.tenant_id = s.tenant_id"
+        . $enrollmentJoin .
+        "
+         LEFT JOIN academic_years ay
+           ON ay.id = se.academic_year_id
+          AND ay.tenant_id = s.tenant_id
+          AND ay.branch_id = s.branch_id
+         LEFT JOIN classes c
+           ON c.id = se.class_id
+          AND c.tenant_id = s.tenant_id
+          AND c.branch_id = s.branch_id
+         LEFT JOIN sections sec
+           ON sec.id = se.section_id
+          AND sec.tenant_id = s.tenant_id
+          AND sec.branch_id = s.branch_id
+         LEFT JOIN student_guardians sg
+           ON sg.student_id = s.id
+          AND sg.guardian_id = (
+                SELECT sg2.guardian_id
+                FROM student_guardians sg2
+                WHERE sg2.student_id = s.id
+                ORDER BY
+                    sg2.is_primary DESC,
+                    sg2.guardian_id ASC
+                LIMIT 1
+           )
+         LEFT JOIN guardians g
+           ON g.id = sg.guardian_id
+          AND g.tenant_id = s.tenant_id
+         LEFT JOIN student_parent_logins spl
+           ON spl.tenant_id = s.tenant_id
+          AND spl.student_id = s.id
+         LEFT JOIN users u
+           ON u.id = spl.user_id
+          AND u.tenant_id = spl.tenant_id
+          AND u.deleted_at IS NULL
+         WHERE " . implode(' AND ', $where) . "
+         ORDER BY
+            COALESCE(c.display_order, 9999),
+            c.class_name,
+            sec.section_name,
+            s.first_name,
+            s.last_name,
+            s.id"
+    );
+    $statement->execute($params);
+
+    $rows = [];
+    foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $hasAccount =
+            (int)($row['student_parent_login_id'] ?? 0) > 0
+            && (int)($row['parent_user_id'] ?? 0) > 0
+            && trim((string)($row['parent_username'] ?? '')) !== '';
+
+        $hasGuardian = (int)($row['guardian_id'] ?? 0) > 0;
+
+        $row['has_parent_login'] = $hasAccount;
+        $row['can_generate_parent_login'] = $hasGuardian && !$hasAccount;
+        $row['parent_password_display'] = $hasAccount
+            ? 'Previously Generated'
+            : ($hasGuardian ? 'Not Generated' : 'No Guardian');
+
+        $rows[] = $row;
+    }
+
+    return $rows;
+}
+
+
+function studentsParentLoginOneRow(
+    PDO $pdo,
+    array $scope,
+    int $studentId,
+    array $filters = []
+): array {
+    $rows = studentsParentLoginRows(
+        $pdo,
+        $scope,
+        'all',
+        [$studentId],
+        $filters
+    );
+
+    if (!$rows) {
+        throw new RuntimeException(
+            'Student not found in the selected Academic Year / Class / Section or outside your branch access.',
+            404
+        );
+    }
+
+    return $rows[0];
+}
+
+function studentsParentUsernameBase(array $row): string
+{
+    $admission = strtolower(
+        preg_replace(
+            '/[^a-zA-Z0-9]+/',
+            '',
+            (string)($row['admission_number'] ?? '')
+        ) ?? ''
+    );
+
+    if ($admission !== '') {
+        return 'parent.' . $admission;
+    }
+
+    return 'parent.student' . (int)($row['student_id'] ?? 0);
+}
+
+function studentsParentUniqueUsername(
+    PDO $pdo,
+    int $tenantId,
+    string $base
+): string {
+    $base = strtolower(trim($base));
+    $base = preg_replace(
+        '/[^a-z0-9._@-]+/',
+        '',
+        $base
+    ) ?? '';
+
+    if ($base === '' || mb_strlen($base) < 3) {
+        $base = 'parent.account';
+    }
+
+    $base = mb_substr($base, 0, 84);
+
+    $statement = $pdo->prepare(
+        "SELECT COUNT(*)
+         FROM users
+         WHERE tenant_id = :tenant_id
+           AND LOWER(username) = LOWER(:username)"
+    );
+
+    for ($attempt = 0; $attempt < 10000; $attempt++) {
+        $suffix = $attempt === 0
+            ? ''
+            : '.' . ($attempt + 1);
+
+        $candidate = mb_substr(
+            $base,
+            0,
+            100 - mb_strlen($suffix)
+        ) . $suffix;
+
+        $statement->execute([
+            'tenant_id' => $tenantId,
+            'username' => $candidate,
+        ]);
+
+        if ((int)$statement->fetchColumn() === 0) {
+            return $candidate;
+        }
+    }
+
+    throw new RuntimeException(
+        'Unable to generate a unique Parent username.',
+        500
+    );
+}
+
+
+function studentsParentTemporaryPassword(
+    int $studentId,
+    int $randomLength = 6
+): string {
+    $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    $max = strlen($alphabet) - 1;
+    $random = '';
+
+    $randomLength = max(6, min(12, $randomLength));
+
+    for ($index = 0; $index < $randomLength; $index++) {
+        $random .= $alphabet[random_int(0, $max)];
+    }
+
+    $studentPart = strtoupper(
+        base_convert((string)max(1, $studentId), 10, 36)
+    );
+
+    return 'P' . $studentPart . '-' . $random;
+}
+
+function studentsParentSyncUserRole(
+    PDO $pdo,
+    array $scope,
+    int $userId,
+    int $roleId
+): void {
+    if (!studentsTableExists($pdo, 'user_roles')) {
+        return;
+    }
+
+    $pdo->prepare(
+        'DELETE FROM user_roles WHERE user_id = :user_id'
+    )->execute([
+        'user_id' => $userId,
+    ]);
+
+    $statement = $pdo->prepare(
+        "INSERT INTO user_roles
+         (user_id, role_id, is_primary, assigned_by)
+         VALUES
+         (:user_id, :role_id, 1, :assigned_by)"
+    );
+    $statement->execute([
+        'user_id' => $userId,
+        'role_id' => $roleId,
+        'assigned_by' => $scope['user_id'] > 0
+            ? $scope['user_id']
+            : null,
+    ]);
+}
+
+function studentsParentSyncAccess(
+    PDO $pdo,
+    int $tenantId,
+    int $userId,
+    int $studentId,
+    int $branchId,
+    int $academicYearId
+): void {
+    if (
+        studentsTableExists($pdo, 'user_branch_access')
+        && $branchId > 0
+    ) {
+        $insert = $pdo->prepare(
+            "INSERT INTO user_branch_access
+             (user_id, branch_id, can_access)
+             VALUES
+             (:user_id, :branch_id, 1)
+             ON DUPLICATE KEY UPDATE can_access = 1"
+        );
+        $insert->execute([
+            'user_id' => $userId,
+            'branch_id' => $branchId,
+        ]);
+    }
+
+    if (
+        studentsTableExists($pdo, 'user_academic_year_access')
+        && $academicYearId > 0
+    ) {
+        $insert = $pdo->prepare(
+            "INSERT INTO user_academic_year_access
+             (user_id, academic_year_id, can_access)
+             VALUES
+             (:user_id, :academic_year_id, 1)
+             ON DUPLICATE KEY UPDATE can_access = 1"
+        );
+        $insert->execute([
+            'user_id' => $userId,
+            'academic_year_id' => $academicYearId,
+        ]);
+    }
+}
+
+
+
+function studentsParentCredentialSessionBucket(array $scope): string
+{
+    $adminUserId = (int)($scope['user_id'] ?? 0);
+    $tenantId = (int)($scope['tenant_id'] ?? 0);
+
+    return $tenantId . ':' . $adminUserId;
+}
+
+function studentsRememberParentTemporaryCredential(
+    array $scope,
+    int $studentId,
+    int $parentUserId,
+    string $username,
+    string $temporaryPassword
+): void {
+    if ($studentId <= 0 || $parentUserId <= 0 || $temporaryPassword === '') {
+        return;
+    }
+
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        @session_start();
+    }
+
+    if (!isset($_SESSION['student_parent_login_credentials'])
+        || !is_array($_SESSION['student_parent_login_credentials'])) {
+        $_SESSION['student_parent_login_credentials'] = [];
+    }
+
+    $bucket = studentsParentCredentialSessionBucket($scope);
+
+    if (!isset($_SESSION['student_parent_login_credentials'][$bucket])
+        || !is_array($_SESSION['student_parent_login_credentials'][$bucket])) {
+        $_SESSION['student_parent_login_credentials'][$bucket] = [];
+    }
+
+    $_SESSION['student_parent_login_credentials'][$bucket][(string)$studentId] = [
+        'parent_user_id' => $parentUserId,
+        'username' => $username,
+        'temporary_password' => $temporaryPassword,
+        'generated_at' => date('Y-m-d H:i:s'),
+    ];
+}
+
+function studentsParentTemporaryCredentialFromSession(
+    array $scope,
+    int $studentId,
+    int $parentUserId,
+    string $username
+): ?array {
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        @session_start();
+    }
+
+    $bucket = studentsParentCredentialSessionBucket($scope);
+
+    $row = $_SESSION['student_parent_login_credentials'][$bucket][(string)$studentId]
+        ?? null;
+
+    if (!is_array($row)) {
+        return null;
+    }
+
+    if ((int)($row['parent_user_id'] ?? 0) !== $parentUserId) {
+        return null;
+    }
+
+    if (strcasecmp(
+        trim((string)($row['username'] ?? '')),
+        trim($username)
+    ) !== 0) {
+        return null;
+    }
+
+    $password = (string)($row['temporary_password'] ?? '');
+    if ($password === '') {
+        return null;
+    }
+
+    return $row;
+}
+
+function studentsParentLoginCredentialDetails(
+    PDO $pdo,
+    array $scope,
+    int $studentId
+): array {
+    if ($studentId <= 0) {
+        throw new InvalidArgumentException('Select a valid student.');
+    }
+
+    $row = studentsParentLoginOneRow(
+        $pdo,
+        $scope,
+        $studentId
+    );
+
+    $hasLogin = (bool)($row['has_parent_login'] ?? false);
+    $parentUserId = (int)($row['parent_user_id'] ?? 0);
+    $username = trim((string)($row['parent_username'] ?? ''));
+
+    if (!$hasLogin || $parentUserId <= 0 || $username === '') {
+        return [
+            'student_id' => $studentId,
+            'has_parent_login' => false,
+            'username' => '',
+            'temporary_password' => '',
+            'password_available' => false,
+            'generated_at' => '',
+            'status' => 'not_generated',
+            'message' => 'Parent Login has not been generated for this student.',
+        ];
+    }
+
+    $sessionCredential = studentsParentTemporaryCredentialFromSession(
+        $scope,
+        $studentId,
+        $parentUserId,
+        $username
+    );
+
+    /*
+     * A parent may change the password after it was generated. Never display
+     * a cached temporary password unless it still verifies against the current
+     * users.password_hash value.
+     */
+    if ($sessionCredential !== null) {
+        $passwordCheck = $pdo->prepare(
+            "SELECT password_hash
+             FROM users
+             WHERE id = :user_id
+               AND tenant_id = :tenant_id
+               AND deleted_at IS NULL
+             LIMIT 1"
+        );
+        $passwordCheck->execute([
+            'user_id' => $parentUserId,
+            'tenant_id' => $scope['tenant_id'],
+        ]);
+        $currentHash = (string)($passwordCheck->fetchColumn() ?: '');
+
+        if (
+            $currentHash === ''
+            || !password_verify(
+                (string)$sessionCredential['temporary_password'],
+                $currentHash
+            )
+        ) {
+            $sessionCredential = null;
+        }
+    }
+
+    return [
+        'student_id' => $studentId,
+        'has_parent_login' => true,
+        'username' => $username,
+        'temporary_password' => (string)(
+            $sessionCredential['temporary_password'] ?? ''
+        ),
+        'password_available' => $sessionCredential !== null,
+        'generated_at' => (string)(
+            $sessionCredential['generated_at'] ?? ''
+        ),
+        'status' => (string)($row['parent_login_status'] ?? 'active'),
+        'message' => $sessionCredential !== null
+            ? 'Parent Login credentials loaded.'
+            : 'The existing password is securely hashed and cannot be displayed. Generate a new temporary password to view it.',
+    ];
+}
+
+function studentsResetParentLoginPassword(
+    PDO $pdo,
+    array $scope,
+    int $studentId
+): array {
+    if ($studentId <= 0) {
+        throw new InvalidArgumentException('Select a valid student.');
+    }
+
+    $row = studentsParentLoginOneRow(
+        $pdo,
+        $scope,
+        $studentId
+    );
+
+    if (!(bool)($row['has_parent_login'] ?? false)) {
+        throw new RuntimeException(
+            'Parent Login has not been generated for this student.',
+            404
+        );
+    }
+
+    $parentUserId = (int)($row['parent_user_id'] ?? 0);
+    $username = trim((string)($row['parent_username'] ?? ''));
+
+    if ($parentUserId <= 0 || $username === '') {
+        throw new RuntimeException(
+            'Parent Login account is incomplete. Generate the Parent Login again.',
+            409
+        );
+    }
+
+    $temporaryPassword = studentsParentTemporaryPassword(
+        $studentId,
+        7
+    );
+
+    $passwordHash = password_hash(
+        $temporaryPassword,
+        PASSWORD_BCRYPT,
+        ['cost' => 12]
+    );
+
+    if ($passwordHash === false) {
+        throw new RuntimeException(
+            'Unable to secure the new Parent Login password.'
+        );
+    }
+
+    $pdo->beginTransaction();
+
+    try {
+        $update = $pdo->prepare(
+            "UPDATE users
+             SET password_hash = :password_hash
+             WHERE id = :user_id
+               AND tenant_id = :tenant_id
+               AND deleted_at IS NULL"
+        );
+        $update->execute([
+            'password_hash' => $passwordHash,
+            'user_id' => $parentUserId,
+            'tenant_id' => $scope['tenant_id'],
+        ]);
+
+        if ($update->rowCount() < 1) {
+            $check = $pdo->prepare(
+                "SELECT id
+                 FROM users
+                 WHERE id = :user_id
+                   AND tenant_id = :tenant_id
+                   AND deleted_at IS NULL
+                 LIMIT 1"
+            );
+            $check->execute([
+                'user_id' => $parentUserId,
+                'tenant_id' => $scope['tenant_id'],
+            ]);
+
+            if (!(int)$check->fetchColumn()) {
+                throw new RuntimeException(
+                    'Parent Login user account was not found.',
+                    404
+                );
+            }
+        }
+
+        studentsLog(
+            $pdo,
+            $scope,
+            'parent_login_password_reset',
+            $studentId,
+            'A new temporary Parent Login password was generated for '
+                . $username . '.',
+            null,
+            [
+                'parent_user_id' => $parentUserId,
+                'username' => $username,
+            ]
+        );
+
+        $pdo->commit();
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
+
+    studentsRememberParentTemporaryCredential(
+        $scope,
+        $studentId,
+        $parentUserId,
+        $username,
+        $temporaryPassword
+    );
+
+    return [
+        'student_id' => $studentId,
+        'has_parent_login' => true,
+        'username' => $username,
+        'temporary_password' => $temporaryPassword,
+        'password_available' => true,
+        'generated_at' => date('Y-m-d H:i:s'),
+        'status' => 'active',
+        'message' => 'New temporary Parent Login password generated successfully.',
+    ];
+}
+
+
+function studentsGenerateParentLoginForStudent(
+    PDO $pdo,
+    array $scope,
+    int $studentId,
+    array $filters = []
+): array {
+    if ($studentId <= 0) {
+        throw new InvalidArgumentException('Select a valid student.');
+    }
+
+    $parentRole = studentsParentRole($pdo, $scope);
+
+    $pdo->beginTransaction();
+
+    try {
+        $lockWhere = [
+            'id = :student_id',
+            'tenant_id = :tenant_id',
+            'deleted_at IS NULL',
+        ];
+        $lockParams = [
+            'student_id' => $studentId,
+            'tenant_id' => $scope['tenant_id'],
+        ];
+
+        if ($scope['branch_id'] > 0) {
+            $lockWhere[] = 'branch_id = :scope_branch_id';
+            $lockParams['scope_branch_id'] = $scope['branch_id'];
+        }
+
+        $lock = $pdo->prepare(
+            "SELECT id
+             FROM students
+             WHERE " . implode(' AND ', $lockWhere) . "
+             LIMIT 1
+             FOR UPDATE"
+        );
+        $lock->execute($lockParams);
+
+        if (!(int)$lock->fetchColumn()) {
+            throw new RuntimeException(
+                'Student not found or outside your branch access.',
+                404
+            );
+        }
+
+        $row = studentsParentLoginOneRow(
+            $pdo,
+            $scope,
+            $studentId,
+            $filters
+        );
+
+        $existing = $pdo->prepare(
+            "SELECT
+                spl.id,
+                spl.user_id,
+                u.username,
+                u.status
+             FROM student_parent_logins spl
+             LEFT JOIN users u
+               ON u.id = spl.user_id
+              AND u.tenant_id = spl.tenant_id
+              AND u.deleted_at IS NULL
+             WHERE spl.tenant_id = :tenant_id
+               AND spl.student_id = :student_id
+             LIMIT 1"
+        );
+        $existing->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'student_id' => $studentId,
+        ]);
+        $existingRow = $existing->fetch(PDO::FETCH_ASSOC);
+
+        if (
+            $existingRow
+            && (int)($existingRow['user_id'] ?? 0) > 0
+            && trim((string)($existingRow['username'] ?? '')) !== ''
+        ) {
+            $pdo->commit();
+
+            return [
+                'status' => 'existing',
+                'student_id' => $studentId,
+                'username' => (string)$existingRow['username'],
+                'message' => 'Parent Login already exists. Existing credentials were not changed.',
+            ];
+        }
+
+        if ($existingRow) {
+            $pdo->prepare(
+                "DELETE FROM student_parent_logins
+                 WHERE id = :id
+                   AND tenant_id = :tenant_id"
+            )->execute([
+                'id' => (int)$existingRow['id'],
+                'tenant_id' => $scope['tenant_id'],
+            ]);
+        }
+
+        $guardianId = (int)($row['guardian_id'] ?? 0);
+        if ($guardianId <= 0) {
+            throw new RuntimeException(
+                'No Parent / Guardian is linked to this student.'
+            );
+        }
+
+        $username = studentsParentUniqueUsername(
+            $pdo,
+            $scope['tenant_id'],
+            studentsParentUsernameBase($row)
+        );
+
+        $temporaryPassword = studentsParentTemporaryPassword(
+            $studentId,
+            7
+        );
+
+        $passwordHash = password_hash(
+            $temporaryPassword,
+            PASSWORD_BCRYPT,
+            ['cost' => 12]
+        );
+
+        if ($passwordHash === false) {
+            throw new RuntimeException(
+                'Unable to secure the temporary password.'
+            );
+        }
+
+        $guardianName = preg_replace(
+            '/\s+/u',
+            ' ',
+            trim((string)($row['guardian_name'] ?? ''))
+        ) ?? '';
+
+        if ($guardianName === '') {
+            $guardianName = 'Parent';
+        }
+
+        $mobile = trim(
+            (string)($row['guardian_mobile'] ?? '')
+        );
+
+        $insert = $pdo->prepare(
+            "INSERT INTO users
+             (
+                tenant_id,
+                default_branch_id,
+                role_id,
+                employee_id,
+                name,
+                email,
+                mobile,
+                username,
+                password_hash,
+                profile_photo,
+                status
+             )
+             VALUES
+             (
+                :tenant_id,
+                :default_branch_id,
+                :role_id,
+                NULL,
+                :name,
+                NULL,
+                :mobile,
+                :username,
+                :password_hash,
+                NULL,
+                'active'
+             )"
+        );
+        $insert->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'default_branch_id' =>
+                (int)($row['branch_id'] ?? 0) ?: null,
+            'role_id' => (int)$parentRole['id'],
+            'name' => $guardianName,
+            'mobile' => $mobile !== '' ? $mobile : null,
+            'username' => $username,
+            'password_hash' => $passwordHash,
+        ]);
+        $userId = (int)$pdo->lastInsertId();
+
+        $mapping = $pdo->prepare(
+            "INSERT INTO student_parent_logins
+             (
+                tenant_id,
+                student_id,
+                guardian_id,
+                user_id,
+                status,
+                created_by
+             )
+             VALUES
+             (
+                :tenant_id,
+                :student_id,
+                :guardian_id,
+                :user_id,
+                'active',
+                :created_by
+             )"
+        );
+        $mapping->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'student_id' => $studentId,
+            'guardian_id' => $guardianId,
+            'user_id' => $userId,
+            'created_by' => $scope['user_id'] > 0
+                ? $scope['user_id']
+                : null,
+        ]);
+
+        if (studentsColumnExists(
+            $pdo,
+            'guardians',
+            'user_id'
+        )) {
+            $pdo->prepare(
+                "UPDATE guardians
+                 SET user_id = :user_id
+                 WHERE id = :guardian_id
+                   AND tenant_id = :tenant_id
+                   AND user_id IS NULL"
+            )->execute([
+                'user_id' => $userId,
+                'guardian_id' => $guardianId,
+                'tenant_id' => $scope['tenant_id'],
+            ]);
+        }
+
+        studentsParentSyncUserRole(
+            $pdo,
+            $scope,
+            $userId,
+            (int)$parentRole['id']
+        );
+
+        studentsParentSyncAccess(
+            $pdo,
+            $scope['tenant_id'],
+            $userId,
+            $studentId,
+            (int)($row['branch_id'] ?? 0),
+            (int)($row['academic_year_id'] ?? 0)
+        );
+
+        studentsLog(
+            $pdo,
+            $scope,
+            'parent_login_create',
+            $studentId,
+            'Parent Login generated for '
+                . $guardianName
+                . ' (' . $username . ').',
+            null,
+            [
+                'guardian_id' => $guardianId,
+                'parent_user_id' => $userId,
+                'username' => $username,
+            ]
+        );
+
+        $pdo->commit();
+
+        studentsRememberParentTemporaryCredential(
+            $scope,
+            $studentId,
+            $userId,
+            $username,
+            $temporaryPassword
+        );
+
+        return [
+            'status' => 'created',
+            'credential' => [
+                'student_id' => $studentId,
+                'student_name' => (string)($row['student_name'] ?? ''),
+                'admission_number' => (string)($row['admission_number'] ?? ''),
+                'academic_year' => (string)($row['academic_year_name'] ?? ''),
+                'class_name' => (string)($row['class_name'] ?? ''),
+                'section_name' => (string)($row['section_name'] ?? ''),
+                'guardian_name' => $guardianName,
+                'relationship' => (string)($row['relationship'] ?? ''),
+                'mobile' => (string)($row['guardian_mobile'] ?? ''),
+                'email' => (string)($row['guardian_email'] ?? ''),
+                'username' => $username,
+                'temporary_password' => $temporaryPassword,
+            ],
+        ];
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        throw $exception;
+    }
+}
+
+
+function studentsGenerateParentLoginsSelected(
+    PDO $pdo,
+    array $scope,
+    array $studentIds,
+    array $filters = []
+): array {
+    $studentIds = array_values(array_unique(array_filter(
+        array_map('intval', $studentIds),
+        static fn(int $id): bool => $id > 0
+    )));
+
+    if (!$studentIds) {
+        throw new InvalidArgumentException(
+            'Select at least one student.'
+        );
+    }
+
+    if (count($studentIds) > 1000) {
+        throw new InvalidArgumentException(
+            'Generate Parent Login for a maximum of 1000 students at a time.'
+        );
+    }
+
+    $filter = studentsParentLoginNormalizeFilters(
+        $pdo,
+        $scope,
+        $filters,
+        true
+    );
+
+    $eligibleRows = studentsParentLoginRows(
+        $pdo,
+        $scope,
+        'active',
+        $studentIds,
+        $filter
+    );
+    $eligibleIds = array_map(
+        static fn(array $row): int => (int)$row['student_id'],
+        $eligibleRows
+    );
+
+    $missingIds = array_values(array_diff($studentIds, $eligibleIds));
+    if ($missingIds) {
+        throw new InvalidArgumentException(
+            'One or more selected students no longer match the selected Academic Year, Class and Section. Reload the student list and try again.'
+        );
+    }
+
+    $credentials = [];
+    $skipped = [];
+    $failed = [];
+
+    foreach ($studentIds as $studentId) {
+        try {
+            $result = studentsGenerateParentLoginForStudent(
+                $pdo,
+                $scope,
+                $studentId,
+                $filter
+            );
+
+            if (($result['status'] ?? '') === 'created') {
+                $credentials[] = $result['credential'];
+            } else {
+                $row = studentsParentLoginOneRow(
+                    $pdo,
+                    $scope,
+                    $studentId,
+                    $filter
+                );
+
+                $skipped[] = [
+                    'student_id' => $studentId,
+                    'student_name' => (string)($row['student_name'] ?? ''),
+                    'admission_number' => (string)($row['admission_number'] ?? ''),
+                    'guardian_name' => (string)($row['guardian_name'] ?? ''),
+                    'username' => (string)(
+                        $result['username']
+                        ?? $row['parent_username']
+                        ?? ''
+                    ),
+                    'reason' => (string)(
+                        $result['message']
+                        ?? 'Parent Login already exists.'
+                    ),
+                ];
+            }
+        } catch (Throwable $exception) {
+            try {
+                $row = studentsParentLoginOneRow(
+                    $pdo,
+                    $scope,
+                    $studentId,
+                    $filter
+                );
+            } catch (Throwable $ignored) {
+                $row = [
+                    'student_name' => 'Student #' . $studentId,
+                    'admission_number' => '',
+                    'guardian_name' => '',
+                ];
+            }
+
+            $failed[] = [
+                'student_id' => $studentId,
+                'student_name' => (string)($row['student_name'] ?? ''),
+                'admission_number' => (string)($row['admission_number'] ?? ''),
+                'guardian_name' => (string)($row['guardian_name'] ?? ''),
+                'reason' => $exception->getMessage(),
+            ];
+        }
+    }
+
+    return [
+        'created' => count($credentials),
+        'skipped' => count($skipped),
+        'failed' => count($failed),
+        'credentials' => $credentials,
+        'skipped_rows' => $skipped,
+        'failed_rows' => $failed,
+        'filters' => $filter,
+    ];
+}
+
 function studentsMeta(PDO $pdo, array $scope): array
 {
     $years = [];
@@ -2704,62 +4288,174 @@ function studentsMeta(PDO $pdo, array $scope): array
     $branches = [];
 
     $statement = $pdo->prepare(
-        'SELECT id, year_name, start_date, end_date, is_current, status
+        "SELECT
+            id,
+            branch_id,
+            academic_year_code,
+            year_name,
+            start_date,
+            end_date,
+            is_current,
+            status
          FROM academic_years
          WHERE tenant_id = :tenant_id
-         ORDER BY is_current DESC, start_date DESC, id DESC'
+           AND branch_id = :branch_id
+         ORDER BY is_current DESC, start_date DESC, id DESC"
     );
-    $statement->execute(['tenant_id' => $scope['tenant_id']]);
+    $statement->execute([
+        'tenant_id' => $scope['tenant_id'],
+        'branch_id' => $scope['branch_id'],
+    ]);
     $years = $statement->fetchAll(PDO::FETCH_ASSOC);
 
     if (studentsTableExists($pdo, 'class_management_classes')) {
-        $statement = $pdo->prepare(
-            "SELECT MIN(id) AS id, academic_year_id, class_name, MIN(display_order) AS display_order
-             FROM class_management_classes
-             WHERE tenant_id = :tenant_id
-               AND status <> 'archived'
-             GROUP BY academic_year_id, class_name
-             ORDER BY academic_year_id DESC, display_order, class_name"
-        );
-        $statement->execute(['tenant_id' => $scope['tenant_id']]);
-        $classes = $statement->fetchAll(PDO::FETCH_ASSOC);
-    }
+        $managedWhere = [
+            'cmc.tenant_id = :tenant_id',
+            'cmc.branch_id = :branch_id',
+            "cmc.status <> 'archived'",
+        ];
+        $managedParams = [
+            'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $scope['branch_id'],
+        ];
 
-    if (!$classes) {
         $statement = $pdo->prepare(
-            "SELECT id, academic_year_id, class_name, display_order
-             FROM classes
-             WHERE tenant_id = :tenant_id
-               AND status = 'active'
-             ORDER BY academic_year_id DESC, display_order, class_name"
+            "SELECT
+                c.id,
+                cmc.academic_year_id,
+                c.class_name,
+                MIN(cmc.display_order) AS display_order,
+                CASE WHEN SUM(cmc.status = 'active') > 0 THEN 'active' ELSE 'inactive' END AS status,
+                MIN(cmc.id) AS class_management_id
+             FROM class_management_classes cmc
+             INNER JOIN classes c
+                ON c.tenant_id = cmc.tenant_id
+               AND c.branch_id = cmc.branch_id
+               AND c.academic_year_id = cmc.academic_year_id
+               AND LOWER(TRIM(c.class_name)) = LOWER(TRIM(cmc.class_name))
+             INNER JOIN academic_years ay
+                ON ay.id = cmc.academic_year_id
+               AND ay.tenant_id = cmc.tenant_id
+               AND ay.branch_id = cmc.branch_id
+             WHERE " . implode(' AND ', $managedWhere) . "
+             GROUP BY c.id, cmc.academic_year_id, c.class_name
+             ORDER BY cmc.academic_year_id DESC, MIN(cmc.display_order), c.class_name, c.id"
         );
-        $statement->execute(['tenant_id' => $scope['tenant_id']]);
+        $statement->execute($managedParams);
         $classes = $statement->fetchAll(PDO::FETCH_ASSOC);
-    }
 
-    if (studentsTableExists($pdo, 'school_sections')) {
         $statement = $pdo->prepare(
-            "SELECT id, academic_year_id, class_id, class_name_snapshot, section_name, section_code, display_order
-             FROM school_sections
-             WHERE tenant_id = :tenant_id
-               AND status <> 'archived'
-             ORDER BY academic_year_id DESC, class_name_snapshot, display_order, section_name"
+            "SELECT
+                s.id,
+                cmc.academic_year_id,
+                c.id AS class_id,
+                c.class_name AS class_name_snapshot,
+                cmc.section_name,
+                cmc.maximum_strength AS maximum_student_capacity,
+                cmc.status,
+                cmc.class_code AS section_code,
+                cmc.medium,
+                cmc.shift_name,
+                COALESCE(cmc.classroom_name, '') AS room_number,
+                cmc.display_order,
+                COALESCE(cmc.class_teacher_user_id, 0) AS class_teacher_user_id,
+                COALESCE(cmc.class_teacher_name, '') AS class_teacher_name,
+                cmc.id AS class_management_id
+             FROM class_management_classes cmc
+             INNER JOIN classes c
+                ON c.tenant_id = cmc.tenant_id
+               AND c.branch_id = cmc.branch_id
+               AND c.academic_year_id = cmc.academic_year_id
+               AND LOWER(TRIM(c.class_name)) = LOWER(TRIM(cmc.class_name))
+             INNER JOIN sections s
+                ON s.tenant_id = cmc.tenant_id
+               AND s.branch_id = cmc.branch_id
+               AND s.class_id = c.id
+               AND LOWER(TRIM(s.section_name)) = LOWER(TRIM(cmc.section_name))
+             INNER JOIN academic_years ay
+                ON ay.id = cmc.academic_year_id
+               AND ay.tenant_id = cmc.tenant_id
+               AND ay.branch_id = cmc.branch_id
+             WHERE " . implode(' AND ', $managedWhere) . "
+             ORDER BY cmc.academic_year_id DESC, cmc.display_order, c.class_name, cmc.section_name, cmc.id"
         );
-        $statement->execute(['tenant_id' => $scope['tenant_id']]);
+        $statement->execute($managedParams);
         $sections = $statement->fetchAll(PDO::FETCH_ASSOC);
-    }
-
-    if (!$sections) {
+    } else {
         $statement = $pdo->prepare(
-            "SELECT s.id, c.academic_year_id, c.id AS class_id, c.class_name AS class_name_snapshot,
-                    s.section_name, '' AS section_code, 0 AS display_order
-             FROM sections s
-             INNER JOIN classes c ON c.id = s.class_id AND c.tenant_id = s.tenant_id
-             WHERE s.tenant_id = :tenant_id
-               AND s.status = 'active'
-             ORDER BY c.academic_year_id DESC, c.class_name, s.section_name"
+            "SELECT c.id,c.academic_year_id,c.class_name,c.display_order,c.status
+             FROM classes c
+             INNER JOIN academic_years ay
+                ON ay.id=c.academic_year_id
+               AND ay.tenant_id=c.tenant_id
+               AND ay.branch_id=c.branch_id
+             WHERE c.tenant_id=:tenant_id
+               AND c.branch_id=:branch_id
+             ORDER BY c.academic_year_id DESC,c.display_order,c.class_name,c.id"
         );
-        $statement->execute(['tenant_id' => $scope['tenant_id']]);
+        $statement->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $scope['branch_id'],
+        ]);
+        $classes = $statement->fetchAll(PDO::FETCH_ASSOC);
+
+        $sectionSql = "
+            SELECT
+                s.id,
+                c.academic_year_id,
+                c.id AS class_id,
+                c.class_name AS class_name_snapshot,
+                s.section_name,
+                s.capacity AS maximum_student_capacity,
+                s.status";
+
+        if (studentsTableExists($pdo, 'school_sections')) {
+            $sectionSql .= ",
+                COALESCE(ss.section_code, '') AS section_code,
+                COALESCE(ss.medium, 'English') AS medium,
+                COALESCE(ss.shift_name, 'General') AS shift_name,
+                COALESCE(ss.room_number, '') AS room_number,
+                COALESCE(ss.display_order, c.display_order, 0) AS display_order,
+                COALESCE(ss.class_teacher_user_id, 0) AS class_teacher_user_id,
+                COALESCE(ss.class_teacher_name, '') AS class_teacher_name";
+        } else {
+            $sectionSql .= ",
+                '' AS section_code,'English' AS medium,'General' AS shift_name,'' AS room_number,
+                COALESCE(c.display_order, 0) AS display_order,0 AS class_teacher_user_id,'' AS class_teacher_name";
+        }
+
+        $sectionSql .= "
+             FROM sections s
+             INNER JOIN classes c
+                ON c.id=s.class_id
+               AND c.tenant_id=s.tenant_id
+               AND c.branch_id=s.branch_id
+             INNER JOIN academic_years ay
+                ON ay.id=c.academic_year_id
+               AND ay.tenant_id=c.tenant_id
+               AND ay.branch_id=c.branch_id";
+
+        if (studentsTableExists($pdo, 'school_sections')) {
+            $sectionSql .= "
+             LEFT JOIN school_sections ss
+                ON ss.tenant_id=s.tenant_id
+               AND ss.branch_id=s.branch_id
+               AND ss.academic_year_id=c.academic_year_id
+               AND ss.class_id=c.id
+               AND LOWER(TRIM(ss.section_name))=LOWER(TRIM(s.section_name))
+               AND ss.status<>'archived'";
+        }
+
+        $sectionSql .= "
+             WHERE s.tenant_id=:tenant_id
+               AND s.branch_id=:branch_id
+             ORDER BY c.academic_year_id DESC,c.display_order,c.class_name,display_order,s.section_name,s.id";
+
+        $statement = $pdo->prepare($sectionSql);
+        $statement->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $scope['branch_id'],
+        ]);
         $sections = $statement->fetchAll(PDO::FETCH_ASSOC);
     }
 
@@ -2767,12 +4463,17 @@ function studentsMeta(PDO $pdo, array $scope): array
         $statement = $pdo->prepare(
             "SELECT id, branch_name, is_main, status
              FROM branches
-             WHERE tenant_id = :tenant_id
-               AND status = 'active'
-             ORDER BY is_main DESC, branch_name"
+             WHERE tenant_id=:tenant_id
+               AND id=:branch_id
+               AND status='active'
+             LIMIT 1"
         );
-        $statement->execute(['tenant_id' => $scope['tenant_id']]);
-        $branches = $statement->fetchAll(PDO::FETCH_ASSOC);
+        $statement->execute([
+            'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $scope['branch_id'],
+        ]);
+        $branch = $statement->fetch(PDO::FETCH_ASSOC);
+        if ($branch) $branches[] = $branch;
     }
 
     return [
@@ -2784,89 +4485,138 @@ function studentsMeta(PDO $pdo, array $scope): array
         'transport_routes' => studentsTransportRoutes($pdo, $scope),
         'transport_stops' => studentsTransportStops($pdo, $scope),
         'statuses' => ['active', 'inactive', 'tc', 'alumni'],
-        'current_academic_year_id' => studentsCurrentAcademicYearId($pdo, $scope['tenant_id']),
-        'current_branch_id' => $scope['branch_id'] > 0
-            ? $scope['branch_id']
-            : (int)($branches[0]['id'] ?? 0),
+        'current_academic_year_id' => studentsCurrentAcademicYearId(
+            $pdo,
+            $scope['tenant_id'],
+            $scope['branch_id']
+        ),
+        'current_branch_id' => $scope['branch_id'],
+        'current_branch_name' => (string)($scope['branch_name'] ?? ($branches[0]['branch_name'] ?? '')),
+        'general_settings' => school_settings_get($pdo, $scope['tenant_id']),
+        'next_admission_number' => studentsPeekUniqueAdmissionNumber($pdo, $scope['tenant_id']),
     ];
 }
 
-function studentsResolveClassFilter(PDO $pdo, int $tenantId, int $inputClassId): ?array
-{
-    if ($inputClassId <= 0) {
-        return null;
-    }
-
-    if (studentsTableExists($pdo, 'class_management_classes')) {
-        $statement = $pdo->prepare(
-            'SELECT academic_year_id, class_name
-             FROM class_management_classes
-             WHERE id = :id AND tenant_id = :tenant_id
-             LIMIT 1'
-        );
-        $statement->execute(['id' => $inputClassId, 'tenant_id' => $tenantId]);
-        $row = $statement->fetch(PDO::FETCH_ASSOC);
-        if ($row) {
-            return $row;
-        }
-    }
+function studentsResolveClassFilter(
+    PDO $pdo,
+    int $tenantId,
+    int $branchId,
+    int $inputClassId
+): ?array {
+    if ($inputClassId <= 0) return null;
 
     $statement = $pdo->prepare(
-        'SELECT academic_year_id, class_name
+        "SELECT id AS class_id, academic_year_id, class_name
          FROM classes
-         WHERE id = :id AND tenant_id = :tenant_id
-         LIMIT 1'
+         WHERE id=:id AND tenant_id=:tenant_id AND branch_id=:branch_id
+         LIMIT 1"
     );
-    $statement->execute(['id' => $inputClassId, 'tenant_id' => $tenantId]);
-    $row = $statement->fetch(PDO::FETCH_ASSOC);
-    return $row ?: null;
+    $statement->execute([
+        'id'=>$inputClassId,'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+    ]);
+    $row=$statement->fetch(PDO::FETCH_ASSOC);
+    if ($row) return $row;
+
+    if (studentsTableExists($pdo,'class_management_classes')) {
+        $statement=$pdo->prepare(
+            "SELECT academic_year_id,class_name
+             FROM class_management_classes
+             WHERE id=:id AND tenant_id=:tenant_id AND branch_id=:branch_id
+             LIMIT 1"
+        );
+        $statement->execute([
+            'id'=>$inputClassId,'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+        ]);
+        $managed=$statement->fetch(PDO::FETCH_ASSOC);
+        if ($managed) {
+            $statement=$pdo->prepare(
+                "SELECT id AS class_id,academic_year_id,class_name
+                 FROM classes
+                 WHERE tenant_id=:tenant_id AND branch_id=:branch_id
+                   AND academic_year_id=:academic_year_id
+                   AND LOWER(TRIM(class_name))=LOWER(TRIM(:class_name))
+                 LIMIT 1"
+            );
+            $statement->execute([
+                'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+                'academic_year_id'=>(int)$managed['academic_year_id'],
+                'class_name'=>(string)$managed['class_name'],
+            ]);
+            $row=$statement->fetch(PDO::FETCH_ASSOC);
+            if ($row) return $row;
+        }
+    }
+    return null;
 }
 
-function studentsResolveSectionFilter(PDO $pdo, int $tenantId, int $inputSectionId): ?array
-{
-    if ($inputSectionId <= 0) {
-        return null;
-    }
+function studentsResolveSectionFilter(
+    PDO $pdo,
+    int $tenantId,
+    int $branchId,
+    int $inputSectionId
+): ?array {
+    if ($inputSectionId <= 0) return null;
 
-    if (studentsTableExists($pdo, 'school_sections')) {
-        $statement = $pdo->prepare(
-            'SELECT academic_year_id, class_name_snapshot AS class_name, section_name
+    $statement=$pdo->prepare(
+        "SELECT s.id AS section_id,c.academic_year_id,c.id AS class_id,c.class_name,s.section_name
+         FROM sections s
+         INNER JOIN classes c ON c.id=s.class_id AND c.tenant_id=s.tenant_id AND c.branch_id=s.branch_id
+         WHERE s.id=:id AND s.tenant_id=:tenant_id AND s.branch_id=:branch_id
+         LIMIT 1"
+    );
+    $statement->execute([
+        'id'=>$inputSectionId,'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+    ]);
+    $row=$statement->fetch(PDO::FETCH_ASSOC);
+    if ($row) return $row;
+
+    if (studentsTableExists($pdo,'school_sections')) {
+        $statement=$pdo->prepare(
+            "SELECT academic_year_id,class_name_snapshot,section_name
              FROM school_sections
-             WHERE id = :id AND tenant_id = :tenant_id
-             LIMIT 1'
+             WHERE id=:id AND tenant_id=:tenant_id AND branch_id=:branch_id
+             LIMIT 1"
         );
-        $statement->execute(['id' => $inputSectionId, 'tenant_id' => $tenantId]);
-        $row = $statement->fetch(PDO::FETCH_ASSOC);
-        if ($row) {
-            return $row;
+        $statement->execute([
+            'id'=>$inputSectionId,'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+        ]);
+        $legacy=$statement->fetch(PDO::FETCH_ASSOC);
+        if ($legacy) {
+            $statement=$pdo->prepare(
+                "SELECT s.id AS section_id,c.academic_year_id,c.id AS class_id,c.class_name,s.section_name
+                 FROM sections s
+                 INNER JOIN classes c ON c.id=s.class_id AND c.tenant_id=s.tenant_id AND c.branch_id=s.branch_id
+                 WHERE s.tenant_id=:tenant_id AND s.branch_id=:branch_id
+                   AND c.academic_year_id=:academic_year_id
+                   AND LOWER(TRIM(c.class_name))=LOWER(TRIM(:class_name))
+                   AND LOWER(TRIM(s.section_name))=LOWER(TRIM(:section_name))
+                 LIMIT 1"
+            );
+            $statement->execute([
+                'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+                'academic_year_id'=>(int)$legacy['academic_year_id'],
+                'class_name'=>(string)$legacy['class_name_snapshot'],
+                'section_name'=>(string)$legacy['section_name'],
+            ]);
+            $row=$statement->fetch(PDO::FETCH_ASSOC);
+            if ($row) return $row;
         }
     }
-
-    $statement = $pdo->prepare(
-        'SELECT c.academic_year_id, c.class_name, s.section_name
-         FROM sections s
-         INNER JOIN classes c ON c.id = s.class_id AND c.tenant_id = s.tenant_id
-         WHERE s.id = :id AND s.tenant_id = :tenant_id
-         LIMIT 1'
-    );
-    $statement->execute(['id' => $inputSectionId, 'tenant_id' => $tenantId]);
-    $row = $statement->fetch(PDO::FETCH_ASSOC);
-    return $row ?: null;
+    return null;
 }
 
 function studentsList(PDO $pdo, array $scope, array $filters): array
 {
-    $currentYearId = studentsCurrentAcademicYearId($pdo, $scope['tenant_id']);
-
     $where = [
         's.tenant_id = :tenant_id',
-        '(:scope_branch_id = 0 OR s.branch_id = :scope_branch_id)',
+        's.branch_id = :scope_branch_id',
     ];
     $params = [
         'tenant_id' => $scope['tenant_id'],
         'scope_branch_id' => $scope['branch_id'],
-        'current_year_id' => $currentYearId,
     ];
+
+    $academicYearId = (int)($filters['academic_year_id'] ?? 0);
 
     if (studentsColumnExists($pdo, 'students', 'deleted_at')) {
         $where[] = 's.deleted_at IS NULL';
@@ -2900,27 +4650,60 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
     $classFilter = studentsResolveClassFilter(
         $pdo,
         $scope['tenant_id'],
+        $scope['branch_id'],
         (int)($filters['class_id'] ?? 0)
     );
     if ($classFilter) {
-        $where[] = 'se.academic_year_id = :filter_class_year';
-        $where[] = 'c.class_name = :filter_class_name';
-        $params['filter_class_year'] = (int)$classFilter['academic_year_id'];
-        $params['filter_class_name'] = (string)$classFilter['class_name'];
+        $where[] = 'se.class_id = :filter_class_id';
+        $params['filter_class_id'] = (int)$classFilter['class_id'];
     }
 
     $sectionFilter = studentsResolveSectionFilter(
         $pdo,
         $scope['tenant_id'],
+        $scope['branch_id'],
         (int)($filters['section_id'] ?? 0)
     );
     if ($sectionFilter) {
-        $where[] = 'se.academic_year_id = :filter_section_year';
-        $where[] = 'c.class_name = :filter_section_class';
-        $where[] = 'sec.section_name = :filter_section_name';
-        $params['filter_section_year'] = (int)$sectionFilter['academic_year_id'];
-        $params['filter_section_class'] = (string)$sectionFilter['class_name'];
-        $params['filter_section_name'] = (string)$sectionFilter['section_name'];
+        $where[] = 'se.section_id = :filter_section_id';
+        $params['filter_section_id'] = (int)$sectionFilter['section_id'];
+    }
+
+    if ($academicYearId > 0) {
+        $params['filter_academic_year_id'] = $academicYearId;
+        $where[] = 'se.id IS NOT NULL';
+        $enrollmentJoin = "
+        LEFT JOIN student_enrollments se
+          ON se.student_id = s.id
+         AND se.tenant_id = s.tenant_id
+         AND se.branch_id = s.branch_id
+         AND se.academic_year_id = :filter_academic_year_id";
+    } else {
+        $enrollmentJoin = "
+        LEFT JOIN student_enrollments se
+          ON se.id = (
+                SELECT se2.id
+                FROM student_enrollments se2
+                LEFT JOIN academic_years ay2
+                  ON ay2.id = se2.academic_year_id
+                 AND ay2.tenant_id = se2.tenant_id
+                 AND ay2.branch_id = se2.branch_id
+                WHERE se2.student_id = s.id
+                  AND se2.tenant_id = s.tenant_id
+                  AND se2.branch_id = s.branch_id
+                ORDER BY
+                    CASE se2.enrollment_status
+                        WHEN 'active' THEN 0
+                        WHEN 'promoted' THEN 1
+                        WHEN 'transferred' THEN 2
+                        WHEN 'completed' THEN 3
+                        ELSE 4
+                    END,
+                    COALESCE(ay2.start_date, '1000-01-01') DESC,
+                    se2.academic_year_id DESC,
+                    se2.id DESC
+                LIMIT 1
+          )";
     }
 
     $sql = "
@@ -2938,30 +4721,9 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
             s.status,
             se.academic_year_id,
             ay.year_name AS academic_year_name,
-            COALESCE(
-                (
-                    SELECT MIN(cmc.id)
-                    FROM class_management_classes cmc
-                    WHERE cmc.tenant_id = s.tenant_id
-                      AND cmc.academic_year_id = se.academic_year_id
-                      AND cmc.class_name = c.class_name
-                      AND cmc.status <> 'archived'
-                ),
-                se.class_id
-            ) AS class_id,
+            se.class_id AS class_id,
             c.class_name,
-            COALESCE(
-                (
-                    SELECT MIN(ss.id)
-                    FROM school_sections ss
-                    WHERE ss.tenant_id = s.tenant_id
-                      AND ss.academic_year_id = se.academic_year_id
-                      AND ss.class_name_snapshot = c.class_name
-                      AND ss.section_name = sec.section_name
-                      AND ss.status <> 'archived'
-                ),
-                se.section_id
-            ) AS section_id,
+            se.section_id AS section_id,
             sec.section_name,
             se.roll_no AS roll_number,
             se.enrollment_status,
@@ -2972,10 +4734,25 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
             COALESCE(g.address, s.address, '') AS address,
             COALESCE(ex.notes, '') AS notes,
             b.branch_name,
+            COALESCE(
+                (
+                    SELECT sfa0.id
+                    FROM student_fee_assignments sfa0
+                    WHERE sfa0.tenant_id = s.tenant_id
+                      AND sfa0.branch_id = s.branch_id
+                      AND sfa0.student_id = s.id
+                      AND sfa0.academic_year_id = se.academic_year_id
+                      AND sfa0.assignment_status = 'active'
+                    ORDER BY sfa0.id DESC
+                    LIMIT 1
+                ),
+                0
+            ) AS fee_assignment_id,
             (
                 SELECT sfa.fee_structure_id
                 FROM student_fee_assignments sfa
                 WHERE sfa.tenant_id = s.tenant_id
+                      AND sfa.branch_id = s.branch_id
                   AND sfa.student_id = s.id
                   AND sfa.academic_year_id = se.academic_year_id
                   AND sfa.assignment_status = 'active'
@@ -2988,7 +4765,9 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 INNER JOIN fee_structures fs2
                     ON fs2.id = sfa2.fee_structure_id
                    AND fs2.tenant_id = sfa2.tenant_id
+                   AND fs2.branch_id = sfa2.branch_id
                 WHERE sfa2.tenant_id = s.tenant_id
+                      AND sfa2.branch_id = s.branch_id
                   AND sfa2.student_id = s.id
                   AND sfa2.academic_year_id = se.academic_year_id
                   AND sfa2.assignment_status = 'active'
@@ -2997,9 +4776,49 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
             ) AS fee_structure_name,
             COALESCE(
                 (
+                    SELECT sfa3.is_new_admission
+                    FROM student_fee_assignments sfa3
+                    WHERE sfa3.tenant_id = s.tenant_id
+                      AND sfa3.branch_id = s.branch_id
+                      AND sfa3.student_id = s.id
+                      AND sfa3.academic_year_id = se.academic_year_id
+                      AND sfa3.assignment_status = 'active'
+                    ORDER BY sfa3.id DESC
+                    LIMIT 1
+                ),
+                0
+            ) AS fee_is_new_admission,
+            (
+                SELECT sfa4.assignment_date
+                FROM student_fee_assignments sfa4
+                WHERE sfa4.tenant_id = s.tenant_id
+                      AND sfa4.branch_id = s.branch_id
+                  AND sfa4.student_id = s.id
+                  AND sfa4.academic_year_id = se.academic_year_id
+                  AND sfa4.assignment_status = 'active'
+                ORDER BY sfa4.id DESC
+                LIMIT 1
+            ) AS fee_assignment_date,
+            COALESCE(
+                (
+                    SELECT sfa5.gross_amount
+                    FROM student_fee_assignments sfa5
+                    WHERE sfa5.tenant_id = s.tenant_id
+                      AND sfa5.branch_id = s.branch_id
+                      AND sfa5.student_id = s.id
+                      AND sfa5.academic_year_id = se.academic_year_id
+                      AND sfa5.assignment_status = 'active'
+                    ORDER BY sfa5.id DESC
+                    LIMIT 1
+                ),
+                0
+            ) AS total_fee_amount,
+            COALESCE(
+                (
                     SELECT sta.transport_required
                     FROM student_transport_assignments sta
                     WHERE sta.tenant_id = s.tenant_id
+                      AND sta.branch_id = s.branch_id
                       AND sta.student_id = s.id
                       AND sta.academic_year_id = se.academic_year_id
                       AND sta.status = 'active'
@@ -3012,6 +4831,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 SELECT sta2.route_id
                 FROM student_transport_assignments sta2
                 WHERE sta2.tenant_id = s.tenant_id
+                      AND sta2.branch_id = s.branch_id
                   AND sta2.student_id = s.id
                   AND sta2.academic_year_id = se.academic_year_id
                   AND sta2.status = 'active'
@@ -3022,6 +4842,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 SELECT sta3.stop_id
                 FROM student_transport_assignments sta3
                 WHERE sta3.tenant_id = s.tenant_id
+                      AND sta3.branch_id = s.branch_id
                   AND sta3.student_id = s.id
                   AND sta3.academic_year_id = se.academic_year_id
                   AND sta3.status = 'active'
@@ -3032,6 +4853,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 SELECT sta4.vehicle_id
                 FROM student_transport_assignments sta4
                 WHERE sta4.tenant_id = s.tenant_id
+                      AND sta4.branch_id = s.branch_id
                   AND sta4.student_id = s.id
                   AND sta4.academic_year_id = se.academic_year_id
                   AND sta4.status = 'active'
@@ -3042,6 +4864,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 SELECT sta5.route_name
                 FROM student_transport_assignments sta5
                 WHERE sta5.tenant_id = s.tenant_id
+                      AND sta5.branch_id = s.branch_id
                   AND sta5.student_id = s.id
                   AND sta5.academic_year_id = se.academic_year_id
                   AND sta5.status = 'active'
@@ -3052,6 +4875,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 SELECT sta6.boarding_stop_name
                 FROM student_transport_assignments sta6
                 WHERE sta6.tenant_id = s.tenant_id
+                      AND sta6.branch_id = s.branch_id
                   AND sta6.student_id = s.id
                   AND sta6.academic_year_id = se.academic_year_id
                   AND sta6.status = 'active'
@@ -3062,6 +4886,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 SELECT sta7.vehicle_name
                 FROM student_transport_assignments sta7
                 WHERE sta7.tenant_id = s.tenant_id
+                      AND sta7.branch_id = s.branch_id
                   AND sta7.student_id = s.id
                   AND sta7.academic_year_id = se.academic_year_id
                   AND sta7.status = 'active'
@@ -3072,6 +4897,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 SELECT sta8.driver_name
                 FROM student_transport_assignments sta8
                 WHERE sta8.tenant_id = s.tenant_id
+                      AND sta8.branch_id = s.branch_id
                   AND sta8.student_id = s.id
                   AND sta8.academic_year_id = se.academic_year_id
                   AND sta8.status = 'active'
@@ -3087,6 +4913,7 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                     )
                     FROM student_transport_assignments sta9
                     WHERE sta9.tenant_id = s.tenant_id
+                      AND sta9.branch_id = s.branch_id
                       AND sta9.student_id = s.id
                       AND sta9.academic_year_id = se.academic_year_id
                       AND sta9.status = 'active'
@@ -3096,28 +4923,19 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
                 0
             ) AS transport_fee_amount
         FROM students s
-        LEFT JOIN student_enrollments se
-          ON se.id = (
-                SELECT se2.id
-                FROM student_enrollments se2
-                WHERE se2.student_id = s.id
-                  AND se2.tenant_id = s.tenant_id
-                ORDER BY
-                    (se2.academic_year_id = :current_year_id) DESC,
-                    FIELD(se2.enrollment_status, 'active', 'promoted', 'transferred', 'completed'),
-                    se2.academic_year_id DESC,
-                    se2.id DESC
-                LIMIT 1
-          )
+        {$enrollmentJoin}
         LEFT JOIN academic_years ay
           ON ay.id = se.academic_year_id
          AND ay.tenant_id = s.tenant_id
+         AND ay.branch_id = s.branch_id
         LEFT JOIN classes c
           ON c.id = se.class_id
          AND c.tenant_id = s.tenant_id
+         AND c.branch_id = s.branch_id
         LEFT JOIN sections sec
           ON sec.id = se.section_id
          AND sec.tenant_id = s.tenant_id
+         AND sec.branch_id = s.branch_id
         LEFT JOIN student_guardians sg
           ON sg.student_id = s.id
          AND sg.guardian_id = (
@@ -3143,37 +4961,118 @@ function studentsList(PDO $pdo, array $scope, array $filters): array
     $statement->execute($params);
     $records = $statement->fetchAll(PDO::FETCH_ASSOC);
 
+    $feeBreakdownStatement = null;
+    if (studentsTableExists($pdo, 'student_fee_items')) {
+        $feeBreakdownStatement = $pdo->prepare(
+            "SELECT
+                COALESCE(SUM(CASE WHEN item_type='tuition' THEN original_amount ELSE 0 END),0) tuition_amount,
+                COALESCE(SUM(CASE WHEN item_type='admission' THEN original_amount ELSE 0 END),0) admission_amount,
+                COALESCE(SUM(CASE WHEN item_type='transport' THEN paid_amount ELSE 0 END),0) transport_paid,
+                COALESCE(SUM(CASE WHEN item_type='transport' THEN discount_amount ELSE 0 END),0) transport_discount,
+                COALESCE(SUM(CASE
+                    WHEN (item_type='previous_due' OR source_academic_year_id IS NOT NULL)
+                    THEN balance_amount ELSE 0 END),0) previous_pending,
+                COALESCE(SUM(CASE
+                    WHEN (item_type='previous_due' OR source_academic_year_id IS NOT NULL)
+                    THEN original_amount ELSE 0 END),0) previous_assigned,
+                COALESCE(SUM(CASE
+                    WHEN item_type NOT IN('tuition','admission','transport','previous_due')
+                         AND source_academic_year_id IS NULL
+                    THEN original_amount ELSE 0 END),0) other_amount,
+                COALESCE(SUM(CASE WHEN item_type<>'transport' THEN original_amount ELSE 0 END),0) nontransport_gross,
+                COALESCE(SUM(CASE WHEN item_type<>'transport' THEN balance_amount ELSE 0 END),0) nontransport_balance
+             FROM student_fee_items
+             WHERE tenant_id=:tenant_id
+               AND branch_id=:branch_id
+               AND assignment_id=:assignment_id
+               AND item_status<>'cancelled'"
+        );
+    }
+
     foreach ($records as &$record) {
         $record['status'] = studentsStatusLabel((string)$record['status']);
+        $record['fee_tuition_amount'] = 0.0;
+        $record['fee_admission_amount'] = 0.0;
+        $record['fee_other_amount'] = 0.0;
+        $record['previous_year_pending_amount'] = 0.0;
+        $record['previous_year_assigned_amount'] = 0.0;
+        $record['fee_display_total_amount'] = (float)($record['total_fee_amount'] ?? 0);
+        $record['fee_display_balance_amount'] = 0.0;
+
+        $assignmentId = (int)($record['fee_assignment_id'] ?? 0);
+        if ($feeBreakdownStatement && $assignmentId > 0) {
+            $feeBreakdownStatement->execute([
+                'tenant_id' => $scope['tenant_id'],
+                'branch_id' => $scope['branch_id'],
+                'assignment_id' => $assignmentId,
+            ]);
+            $fee = $feeBreakdownStatement->fetch(PDO::FETCH_ASSOC) ?: [];
+
+            $fixedTransport = max(0.0, round((float)($record['transport_fee_amount'] ?? 0), 2));
+            $transportPaid = max(0.0, (float)($fee['transport_paid'] ?? 0));
+            $transportDiscount = max(0.0, (float)($fee['transport_discount'] ?? 0));
+            $transportBalance = max(0.0, $fixedTransport - $transportPaid - $transportDiscount);
+
+            $record['fee_tuition_amount'] = round((float)($fee['tuition_amount'] ?? 0), 2);
+            $record['fee_admission_amount'] = round((float)($fee['admission_amount'] ?? 0), 2);
+            $record['fee_other_amount'] = round((float)($fee['other_amount'] ?? 0), 2);
+            $record['previous_year_pending_amount'] = round((float)($fee['previous_pending'] ?? 0), 2);
+            $record['previous_year_assigned_amount'] = round((float)($fee['previous_assigned'] ?? 0), 2);
+            $record['fee_display_total_amount'] = round((float)($fee['nontransport_gross'] ?? 0) + $fixedTransport, 2);
+            $record['fee_display_balance_amount'] = round((float)($fee['nontransport_balance'] ?? 0) + $transportBalance, 2);
+        }
     }
     unset($record);
 
     return $records;
 }
 
-function studentsStats(PDO $pdo, array $scope): array
+function studentsStats(PDO $pdo, array $scope, array $filters = []): array
 {
+    $academicYearId = (int)($filters['academic_year_id'] ?? 0);
+
     $where = [
-        'tenant_id = :tenant_id',
-        '(:branch_id = 0 OR branch_id = :branch_id)',
+        's.tenant_id = :tenant_id',
+        's.branch_id = :branch_id',
     ];
+    $params = [
+        'tenant_id' => $scope['tenant_id'],
+        'branch_id' => $scope['branch_id'],
+    ];
+
     if (studentsColumnExists($pdo, 'students', 'deleted_at')) {
-        $where[] = 'deleted_at IS NULL';
+        $where[] = 's.deleted_at IS NULL';
+    }
+
+    $join = '';
+    $newAdmissionExpression = 'YEAR(s.admission_date) = YEAR(CURDATE())';
+
+    if ($academicYearId > 0) {
+        $join = "
+         INNER JOIN student_enrollments se
+            ON se.student_id = s.id
+           AND se.tenant_id = s.tenant_id
+           AND se.branch_id = s.branch_id
+           AND se.academic_year_id = :stats_academic_year_id
+         LEFT JOIN academic_years ay
+            ON ay.id = se.academic_year_id
+           AND ay.tenant_id = se.tenant_id
+           AND ay.branch_id = se.branch_id";
+        $params['stats_academic_year_id'] = $academicYearId;
+        $newAdmissionExpression = "(ay.id IS NOT NULL AND s.admission_date BETWEEN ay.start_date AND ay.end_date)";
     }
 
     $statement = $pdo->prepare(
         "SELECT
-            COUNT(*) AS total,
-            SUM(status = 'active') AS active,
-            SUM(status <> 'active') AS inactive,
-            SUM(YEAR(admission_date) = YEAR(CURDATE())) AS new_admissions
-         FROM students
+            COUNT(DISTINCT s.id) AS total,
+            COUNT(DISTINCT CASE WHEN s.status='active' THEN s.id END) AS active,
+            COUNT(DISTINCT CASE WHEN s.status<>'active' THEN s.id END) AS inactive,
+            COUNT(DISTINCT CASE WHEN {$newAdmissionExpression} THEN s.id END) AS new_admissions
+         FROM students s
+         {$join}
          WHERE " . implode(' AND ', $where)
     );
-    $statement->execute([
-        'tenant_id' => $scope['tenant_id'],
-        'branch_id' => $scope['branch_id'],
-    ]);
+    $statement->execute($params);
     return $statement->fetch(PDO::FETCH_ASSOC) ?: [];
 }
 
@@ -3192,18 +5091,17 @@ function studentsGetRecord(PDO $pdo, array $scope, int $studentId): ?array
 function studentsImportHeaders(): array
 {
     return [
-        'academic_year_id','branch_id','class_id','class_name','section_id','section_name',
-        'fee_structure_id','transport_required',
-        'transport_route_id','transport_stop_id','admission_number',
-        'roll_number','student_name','date_of_birth','gender','blood_group','admission_date',
-        'status','parent_name','relationship','mobile','email','address','notes'
+        'academic_year_id','class_id','class_name','section_id','section_name',
+        'fee_structure_id','transport_required','transport_route_id','transport_stop_id',
+        'admission_number','roll_number','student_name','date_of_birth','gender',
+        'blood_group','admission_date','status','parent_name','relationship','mobile','email','address','notes'
     ];
 }
 
 function studentsTemplateRows(): array
 {
     return [[
-        '3','1','23','LKG','','A','','0','','','ADM-LKG-001','1','Sample Student',
+        '3','23','LKG','','A','','0','','','','1','Sample Student',
         '2021-05-15','Male','O+','2026-08-04','active','Sample Parent','Father',
         '9876543210','parent@example.com','Sample Address','Sample import row'
     ]];
@@ -3460,7 +5358,7 @@ function studentsReadXlsx(string $path): array
         $worksheetNames=[];
         for($index=0;$index<$zip->numFiles;$index++){$name=(string)$zip->getNameIndex($index);if(preg_match('#^xl/worksheets/[^/]+\\.xml$#i',$name))$worksheetNames[]=$name;}
         natsort($worksheetNames);
-        $required=['academic_year_id','branch_id','class_id','admission_number','student_name','date_of_birth','gender','admission_date','parent_name','mobile'];
+        $required=['academic_year_id','student_name','date_of_birth','gender','admission_date','parent_name','mobile'];
         $best=[];
         foreach($worksheetNames as $worksheetName){
             $sheetXml=$zip->getFromName($worksheetName);if($sheetXml===false)continue;
@@ -3493,167 +5391,126 @@ function studentsNormalizeImportDate(mixed $value): string
 function studentsResolveImportClassId(
     PDO $pdo,
     int $tenantId,
+    int $branchId,
     int $academicYearId,
     int $inputClassId,
     string $className
 ): int {
     $className=trim($className);
-
-    if($inputClassId>0&&studentsTableExists($pdo,'class_management_classes')){
+    if ($inputClassId>0) {
         $statement=$pdo->prepare(
-            "SELECT id,class_name
-             FROM class_management_classes
-             WHERE id=:id
-               AND tenant_id=:tenant_id
-               AND academic_year_id=:academic_year_id
-               AND status<>'archived'
-             LIMIT 1"
+            "SELECT id FROM classes
+             WHERE id=:id AND tenant_id=:tenant_id AND branch_id=:branch_id
+               AND academic_year_id=:academic_year_id LIMIT 1"
         );
         $statement->execute([
-            'id'=>$inputClassId,
-            'tenant_id'=>$tenantId,
+            'id'=>$inputClassId,'tenant_id'=>$tenantId,'branch_id'=>$branchId,
             'academic_year_id'=>$academicYearId,
-        ]);
-        $managed=$statement->fetch(PDO::FETCH_ASSOC);
-        if($managed){
-            return (int)$managed['id'];
-        }
-    }
-
-    if($inputClassId>0){
-        $statement=$pdo->prepare(
-            "SELECT id
-             FROM classes
-             WHERE id=:id
-               AND tenant_id=:tenant_id
-               AND academic_year_id=:academic_year_id
-               AND status='active'
-             LIMIT 1"
-        );
-        $statement->execute([
-            'id'=>$inputClassId,
-            'tenant_id'=>$tenantId,
-            'academic_year_id'=>$academicYearId,
-        ]);
-        if($statement->fetchColumn()){
-            return $inputClassId;
-        }
-    }
-
-    if($className!==''&&studentsTableExists($pdo,'class_management_classes')){
-        $statement=$pdo->prepare(
-            "SELECT id
-             FROM class_management_classes
-             WHERE tenant_id=:tenant_id
-               AND academic_year_id=:academic_year_id
-               AND LOWER(TRIM(class_name))=LOWER(TRIM(:class_name))
-               AND status<>'archived'
-             ORDER BY display_order,id
-             LIMIT 1"
-        );
-        $statement->execute([
-            'tenant_id'=>$tenantId,
-            'academic_year_id'=>$academicYearId,
-            'class_name'=>$className,
         ]);
         $id=(int)($statement->fetchColumn()?:0);
-        if($id>0){
-            return $id;
+        if($id>0)return $id;
+
+        if(studentsTableExists($pdo,'class_management_classes')){
+            $statement=$pdo->prepare(
+                "SELECT class_name FROM class_management_classes
+                 WHERE id=:id AND tenant_id=:tenant_id AND branch_id=:branch_id
+                   AND academic_year_id=:academic_year_id LIMIT 1"
+            );
+            $statement->execute([
+                'id'=>$inputClassId,'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+                'academic_year_id'=>$academicYearId,
+            ]);
+            $legacy=trim((string)($statement->fetchColumn()?:''));
+            if($legacy!=='')$className=$legacy;
         }
     }
-
     if($className!==''){
         $statement=$pdo->prepare(
-            "SELECT id
-             FROM classes
-             WHERE tenant_id=:tenant_id
+            "SELECT id FROM classes
+             WHERE tenant_id=:tenant_id AND branch_id=:branch_id
                AND academic_year_id=:academic_year_id
                AND LOWER(TRIM(class_name))=LOWER(TRIM(:class_name))
-               AND status='active'
-             ORDER BY display_order,id
-             LIMIT 1"
+             ORDER BY display_order,id LIMIT 1"
         );
         $statement->execute([
-            'tenant_id'=>$tenantId,
-            'academic_year_id'=>$academicYearId,
-            'class_name'=>$className,
+            'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+            'academic_year_id'=>$academicYearId,'class_name'=>$className,
         ]);
         $id=(int)($statement->fetchColumn()?:0);
-        if($id>0){
-            return $id;
-        }
+        if($id>0)return $id;
     }
-
     throw new InvalidArgumentException(
-        'Class ID '.$inputClassId.' was not found for Academic Year ID '.$academicYearId.
-        ($className!==''?' ('.$className.').':'.')
+        'Class was not found in Class Management for the current Branch and Academic Year ID '.$academicYearId.'.'
     );
 }
 
 function studentsResolveImportSectionId(
     PDO $pdo,
     int $tenantId,
+    int $branchId,
     int $academicYearId,
     int $classId,
     int $inputSectionId,
     string $sectionName
 ): int {
     if($inputSectionId>0){
-        return $inputSectionId;
-    }
-
-    $sectionName=trim($sectionName);
-    if($sectionName===''){
-        return 0;
-    }
-
-    if(studentsTableExists($pdo,'school_sections')){
         $statement=$pdo->prepare(
-            "SELECT id
-             FROM school_sections
-             WHERE tenant_id=:tenant_id
-               AND academic_year_id=:academic_year_id
-               AND section_name=:section_name
-               AND status<>'archived'
-             ORDER BY id
-             LIMIT 1"
+            "SELECT s.id FROM sections s
+             INNER JOIN classes c ON c.id=s.class_id AND c.tenant_id=s.tenant_id AND c.branch_id=s.branch_id
+             WHERE s.id=:id AND s.tenant_id=:tenant_id AND s.branch_id=:branch_id
+               AND s.class_id=:class_id AND c.academic_year_id=:academic_year_id LIMIT 1"
         );
         $statement->execute([
-            'tenant_id'=>$tenantId,
-            'academic_year_id'=>$academicYearId,
-            'section_name'=>$sectionName,
+            'id'=>$inputSectionId,'tenant_id'=>$tenantId,'branch_id'=>$branchId,
+            'class_id'=>$classId,'academic_year_id'=>$academicYearId,
         ]);
         $id=(int)($statement->fetchColumn()?:0);
-        if($id>0){
-            return $id;
-        }
+        if($id>0)return $id;
     }
-
-    /*
-     * When the Class Management record itself contains section_name, the
-     * normal save resolver will create/reuse the canonical Section A.
-     */
-    return 0;
+    $sectionName=trim($sectionName);
+    if($sectionName!==''){
+        $statement=$pdo->prepare(
+            "SELECT id FROM sections
+             WHERE tenant_id=:tenant_id AND branch_id=:branch_id AND class_id=:class_id
+               AND LOWER(TRIM(section_name))=LOWER(TRIM(:section_name))
+             ORDER BY status='active' DESC,id LIMIT 1"
+        );
+        $statement->execute([
+            'tenant_id'=>$tenantId,'branch_id'=>$branchId,'class_id'=>$classId,'section_name'=>$sectionName,
+        ]);
+        $id=(int)($statement->fetchColumn()?:0);
+        if($id>0)return $id;
+    }
+    $statement=$pdo->prepare(
+        "SELECT id FROM sections
+         WHERE tenant_id=:tenant_id AND branch_id=:branch_id AND class_id=:class_id
+         ORDER BY status='active' DESC,id LIMIT 2"
+    );
+    $statement->execute([
+        'tenant_id'=>$tenantId,'branch_id'=>$branchId,'class_id'=>$classId,
+    ]);
+    $available=array_map('intval',$statement->fetchAll(PDO::FETCH_COLUMN));
+    if(count($available)===1)return $available[0];
+    throw new InvalidArgumentException(
+        'Section was not found for the selected class in the current Branch.'
+    );
 }
 
 function studentsImportExistingStudentId(
     PDO $pdo,
     int $tenantId,
+    int $branchId,
     string $admissionNumber
 ): int {
-    $statement = $pdo->prepare(
-        "SELECT id
-         FROM students
-         WHERE tenant_id = :tenant_id
-           AND admission_no = :admission_no
+    $statement=$pdo->prepare(
+        "SELECT id FROM students
+         WHERE tenant_id=:tenant_id AND branch_id=:branch_id AND admission_no=:admission_no
          LIMIT 1"
     );
     $statement->execute([
-        'tenant_id' => $tenantId,
-        'admission_no' => $admissionNumber,
+        'tenant_id'=>$tenantId,'branch_id'=>$branchId,'admission_no'=>$admissionNumber,
     ]);
-
-    return (int)($statement->fetchColumn() ?: 0);
+    return (int)($statement->fetchColumn()?:0);
 }
 
 function studentsNormalizeImportHeader(mixed $value): string
@@ -3684,70 +5541,31 @@ function studentsNormalizeImportHeader(mixed $value): string
 
 function studentsImportFallbackValues(array $input): array
 {
-    $academicYearId = (int)($input['fallback_academic_year_id'] ?? 0);
-    $branchId = (int)($input['fallback_branch_id'] ?? 0);
-    $admissionDate = studentsNormalizeImportDate(
-        $input['fallback_admission_date'] ?? ''
-    );
-
+    $academicYearId=(int)($input['fallback_academic_year_id']??0);
+    $admissionDate=studentsNormalizeImportDate($input['fallback_admission_date']??'');
     return [
-        'academic_year_id' => $academicYearId > 0
-            ? $academicYearId
-            : '',
-        'branch_id' => $branchId > 0
-            ? $branchId
-            : '',
-        'admission_date' => trim($admissionDate),
+        'academic_year_id'=>$academicYearId>0?$academicYearId:'',
+        'admission_date'=>trim($admissionDate),
     ];
 }
 
-function studentsImportMissingColumns(
-    array $rows,
-    array $fallbackValues = []
-): array {
-    if (!$rows) {
-        return [];
-    }
-
-    $headers = array_map(
-        'studentsNormalizeImportHeader',
-        (array)($rows[0] ?? [])
-    );
-
-    $required = [
-        'academic_year_id',
-        'branch_id',
-        'admission_number',
-        'student_name',
-        'date_of_birth',
-        'gender',
-        'admission_date',
-        'parent_name',
-        'mobile',
+function studentsImportMissingColumns(array $rows,array $fallbackValues=[]): array
+{
+    if(!$rows)return [];
+    $headers=array_map('studentsNormalizeImportHeader',(array)($rows[0]??[]));
+    $required=[
+        'academic_year_id','student_name','date_of_birth','gender',
+        'admission_date','parent_name','mobile',
     ];
-
-    $missing = [];
-
-    foreach ($required as $column) {
-        if (in_array($column, $headers, true)) {
-            continue;
-        }
-
-        $fallback = $fallbackValues[$column] ?? '';
-        if ((string)$fallback !== '') {
-            continue;
-        }
-
-        $missing[] = $column;
+    $missing=[];
+    foreach($required as $column){
+        if(in_array($column,$headers,true))continue;
+        if((string)($fallbackValues[$column]??'')!=='')continue;
+        $missing[]=$column;
     }
-
-    if (
-        !in_array('class_id', $headers, true)
-        && !in_array('class_name', $headers, true)
-    ) {
-        $missing[] = 'class_id or class_name';
+    if(!in_array('class_id',$headers,true)&&!in_array('class_name',$headers,true)){
+        $missing[]='class_id or class_name';
     }
-
     return array_values(array_unique($missing));
 }
 
@@ -3799,6 +5617,9 @@ function studentsImportRows(PDO $pdo,array $scope,array $rows,string $duplicateM
         }
         $row=array_map(static fn($v)=>is_string($v)?trim($v):$v,$row);
 
+        /* Import always belongs to the logged-in active branch. */
+        $row['branch_id'] = (int)$scope['branch_id'];
+
         foreach ($fallbackValues as $fallbackColumn => $fallbackValue) {
             if (
                 !array_key_exists($fallbackColumn, $row)
@@ -3822,6 +5643,7 @@ function studentsImportRows(PDO $pdo,array $scope,array $rows,string $duplicateM
             $row['class_id']=studentsResolveImportClassId(
                 $pdo,
                 $scope['tenant_id'],
+                $scope['branch_id'],
                 $academicYearId,
                 (int)($row['class_id']??0),
                 (string)($row['class_name']??'')
@@ -3829,6 +5651,7 @@ function studentsImportRows(PDO $pdo,array $scope,array $rows,string $duplicateM
             $row['section_id']=studentsResolveImportSectionId(
                 $pdo,
                 $scope['tenant_id'],
+                $scope['branch_id'],
                 $academicYearId,
                 (int)$row['class_id'],
                 (int)($row['section_id']??0),
@@ -3840,6 +5663,7 @@ function studentsImportRows(PDO $pdo,array $scope,array $rows,string $duplicateM
                 ?studentsImportExistingStudentId(
                     $pdo,
                     $scope['tenant_id'],
+                    $scope['branch_id'],
                     $admissionNumber
                 )
                 :0;
@@ -3870,10 +5694,12 @@ function studentsImportRows(PDO $pdo,array $scope,array $rows,string $duplicateM
                 ];
             }else{
                 $created++;
+                $savedRecord=studentsGetRecord($pdo,$scope,$savedStudentId);
+                $generatedAdmissionNumber=(string)($savedRecord['admission_number']??$admissionNumber);
                 $createdRows[]=[
                     'row'=>$rowNumber,
                     'student_id'=>$savedStudentId,
-                    'admission_number'=>$admissionNumber,
+                    'admission_number'=>$generatedAdmissionNumber,
                     'student_name'=>(string)($row['student_name']??''),
                     'reason'=>'New student created.',
                 ];
@@ -3904,19 +5730,139 @@ function studentsImportRows(PDO $pdo,array $scope,array $rows,string $duplicateM
     ];
 }
 
+function studentsAdmissionNumberExists(
+    PDO $pdo,
+    int $tenantId,
+    string $admissionNumber,
+    int $excludeStudentId = 0
+): bool {
+    $admissionNumber = strtoupper(trim($admissionNumber));
+    if ($tenantId <= 0 || $admissionNumber === '') return false;
+
+    $statement = $pdo->prepare(
+        'SELECT id
+         FROM students
+         WHERE tenant_id = :tenant_id
+           AND admission_no = :admission_no
+           AND id <> :exclude_id
+         LIMIT 1'
+    );
+    $statement->execute([
+        'tenant_id' => $tenantId,
+        'admission_no' => $admissionNumber,
+        'exclude_id' => $excludeStudentId,
+    ]);
+    return (int)$statement->fetchColumn() > 0;
+}
+
+function studentsGenerateUniqueAdmissionNumber(
+    PDO $pdo,
+    int $tenantId,
+    int $excludeStudentId = 0,
+    int $maxAttempts = 250
+): string {
+    if ($tenantId <= 0) {
+        throw new InvalidArgumentException(
+            'School tenant is required for Admission Number generation.'
+        );
+    }
+
+    for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
+        $candidate = strtoupper(trim((string)school_settings_next_number(
+            $pdo,
+            $tenantId,
+            'admission'
+        )));
+
+        if ($candidate === '') continue;
+
+        if (!studentsAdmissionNumberExists(
+            $pdo,
+            $tenantId,
+            $candidate,
+            $excludeStudentId
+        )) {
+            return $candidate;
+        }
+    }
+
+    throw new RuntimeException(
+        'Unable to generate a unique Admission Number. Check the Admission Number Prefix/sequence in General Settings.'
+    );
+}
+
+function studentsPeekUniqueAdmissionNumber(PDO $pdo, int $tenantId): string
+{
+    $candidate = strtoupper(trim((string)school_settings_peek_number(
+        $pdo,
+        $tenantId,
+        'admission'
+    )));
+
+    if ($candidate !== '' && !studentsAdmissionNumberExists($pdo, $tenantId, $candidate)) {
+        return $candidate;
+    }
+
+    $settings = school_settings_get($pdo, $tenantId);
+    $prefix = strtoupper(trim((string)school_settings_prefix($settings, 'admission')));
+    if ($prefix === '') $prefix = 'ADM';
+
+    $width = 4;
+    $number = 1;
+    if ($candidate !== '' && preg_match('/^(.*?)(\\d+)$/', $candidate, $matches)) {
+        $prefix = strtoupper(trim((string)$matches[1])) ?: $prefix;
+        $width = max(1, strlen((string)$matches[2]));
+        $number = max(1, (int)$matches[2]);
+    }
+
+    for ($attempt = 0; $attempt < 500; $attempt++, $number++) {
+        $preview = $prefix . str_pad((string)$number, $width, '0', STR_PAD_LEFT);
+        if (!studentsAdmissionNumberExists($pdo, $tenantId, $preview)) {
+            return $preview;
+        }
+    }
+
+    return $candidate !== '' ? $candidate : $prefix . '0001';
+}
+
 function studentsSave(PDO $pdo, array $scope, array $input): int
 {
     $studentId = (int)($input['id'] ?? 0);
     $isNewStudent = $studentId <= 0;
     $academicYearId = (int)($input['academic_year_id'] ?? 0);
-    $branchId = (int)($input['branch_id'] ?? 0);
+    $postedBranchId = (int)($input['branch_id'] ?? 0);
+    $branchId = (int)$scope['branch_id'];
+    if ($postedBranchId > 0 && $postedBranchId !== $branchId) {
+        throw new InvalidArgumentException('Student cannot be saved to another branch. Reload the page and try again.');
+    }
     $inputClassId = (int)($input['class_id'] ?? 0);
     $inputSectionId = (int)($input['section_id'] ?? 0);
     $feeStructureId = (int)($input['fee_structure_id'] ?? 0);
     $transportRequired = (int)($input['transport_required'] ?? 0) === 1;
     $transportRouteId = (int)($input['transport_route_id'] ?? 0);
     $transportStopId = (int)($input['transport_stop_id'] ?? 0);
-    $admissionNo = trim((string)($input['admission_number'] ?? $input['admission_no'] ?? ''));
+    $admissionNo = strtoupper(trim((string)($input['admission_number'] ?? $input['admission_no'] ?? '')));
+    $admissionNumberMode = strtolower(trim((string)($input['admission_number_mode'] ?? '')));
+    $admissionNumberAuto = (int)($input['admission_number_auto'] ?? 0) === 1;
+
+    /* Auto flag is authoritative for a new student. */
+    if ($studentId <= 0 && $admissionNumberAuto) {
+        $admissionNumberMode = 'auto';
+    }
+
+    if (!in_array($admissionNumberMode, ['auto','manual'], true)) {
+        $admissionNumberMode = $studentId <= 0 ? 'auto' : 'manual';
+    }
+
+    /*
+     * Auto mode deliberately ignores the browser preview value.
+     * The real number is generated inside the save transaction so two users
+     * cannot reserve the same Admission Number.
+     */
+    if ($studentId <= 0 && $admissionNumberMode === 'auto') {
+        $admissionNo = '';
+    }
+
     $studentName = trim((string)($input['student_name'] ?? ''));
     $dateOfBirth = trim((string)($input['date_of_birth'] ?? ''));
     $gender = studentsNormalizeGender((string)($input['gender'] ?? ''));
@@ -3927,9 +5873,7 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
     $missingRequired=[];
 
     if($academicYearId<=0)$missingRequired[]='academic_year_id';
-    if($branchId<=0)$missingRequired[]='branch_id';
     if($inputClassId<=0)$missingRequired[]='class_id';
-    if($admissionNo==='')$missingRequired[]='admission_number';
     if($studentName==='')$missingRequired[]='student_name';
     if($dateOfBirth==='')$missingRequired[]='date_of_birth';
     if($gender==='')$missingRequired[]='gender';
@@ -3943,6 +5887,16 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
         );
     }
 
+    if (
+        $studentId <= 0
+        && $admissionNumberMode === 'manual'
+        && $admissionNo === ''
+    ) {
+        throw new InvalidArgumentException(
+            'Manual Admission Number is required. Enter a number or use Auto generation.'
+        );
+    }
+
     if (mb_strlen($admissionNo) > 50) {
         throw new InvalidArgumentException('Admission number cannot exceed 50 characters.');
     }
@@ -3950,32 +5904,30 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
     studentsValidateDate($dateOfBirth, 'Date of birth');
     studentsValidateDate($admissionDate, 'Admission date');
 
-    $academicYear = studentsFindAcademicYear($pdo, $scope['tenant_id'], $academicYearId);
+    $academicYear = studentsFindAcademicYear($pdo, $scope['tenant_id'], $branchId, $academicYearId);
     studentsFindBranch($pdo, $scope['tenant_id'], $branchId);
-    $class = studentsResolveClass($pdo, $scope['tenant_id'], $academicYearId, $inputClassId);
+    $class = studentsResolveClass($pdo, $scope['tenant_id'], $branchId, $academicYearId, $inputClassId);
     $section = studentsResolveSection(
         $pdo,
         $scope['tenant_id'],
+        $branchId,
         $academicYearId,
         $class,
         $inputSectionId
     );
 
-    $duplicate = $pdo->prepare(
-        'SELECT id
-         FROM students
-         WHERE tenant_id = :tenant_id
-           AND admission_no = :admission_no
-           AND id <> :id
-         LIMIT 1'
-    );
-    $duplicate->execute([
-        'tenant_id' => $scope['tenant_id'],
-        'admission_no' => $admissionNo,
-        'id' => $studentId,
-    ]);
-    if ((int)$duplicate->fetchColumn() > 0) {
-        throw new InvalidArgumentException('Admission number already exists.');
+    if (
+        $admissionNo !== ''
+        && studentsAdmissionNumberExists(
+            $pdo,
+            $scope['tenant_id'],
+            $admissionNo,
+            $studentId
+        )
+    ) {
+        throw new InvalidArgumentException(
+            'Admission number already exists. Use Auto generation or enter another manual number.'
+        );
     }
 
     [$firstName, $lastName] = studentsSplitName($studentName);
@@ -3990,8 +5942,45 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
 
     $old = $studentId > 0 ? studentsGetRecord($pdo, $scope, $studentId) : null;
 
+    if ($studentId > 0 && $admissionNo === '' && $old) {
+        $admissionNo = trim((string)($old['admission_number'] ?? $old['admission_no'] ?? ''));
+    }
+
     $pdo->beginTransaction();
     try {
+        if (
+            $studentId <= 0
+            && $admissionNumberMode === 'auto'
+        ) {
+            $admissionNo = studentsGenerateUniqueAdmissionNumber(
+                $pdo,
+                $scope['tenant_id'],
+                0
+            );
+        }
+
+        if ($admissionNo === '') {
+            throw new InvalidArgumentException('Admission number could not be generated.');
+        }
+
+        if (studentsAdmissionNumberExists(
+            $pdo,
+            $scope['tenant_id'],
+            $admissionNo,
+            $studentId
+        )) {
+            if ($studentId <= 0 && $admissionNumberMode === 'auto') {
+                $admissionNo = studentsGenerateUniqueAdmissionNumber(
+                    $pdo,
+                    $scope['tenant_id'],
+                    0
+                );
+            } else {
+                throw new InvalidArgumentException(
+                    'Admission number already exists. Use another manual number.'
+                );
+            }
+        }
         if ($studentId > 0) {
             $statement = $pdo->prepare(
                 'UPDATE students SET
@@ -4009,7 +5998,7 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
                     admission_date = :admission_date,
                     status = :status,
                     deleted_at = NULL
-                 WHERE id = :id AND tenant_id = :tenant_id'
+                 WHERE id = :id AND tenant_id = :tenant_id AND branch_id = :current_branch_id'
             );
             $statement->execute([
                 'branch_id' => $branchId,
@@ -4025,13 +6014,14 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
                 'address' => $address !== '' ? $address : null,
                 'admission_date' => $admissionDate,
                 'status' => $status,
+                'current_branch_id' => $branchId,
                 'id' => $studentId,
                 'tenant_id' => $scope['tenant_id'],
             ]);
 
             if ($statement->rowCount() === 0) {
-                $exists = $pdo->prepare('SELECT COUNT(*) FROM students WHERE id = :id AND tenant_id = :tenant_id');
-                $exists->execute(['id' => $studentId, 'tenant_id' => $scope['tenant_id']]);
+                $exists = $pdo->prepare('SELECT COUNT(*) FROM students WHERE id=:id AND tenant_id=:tenant_id AND branch_id=:branch_id');
+                $exists->execute(['id'=>$studentId,'tenant_id'=>$scope['tenant_id'],'branch_id'=>$branchId]);
                 if ((int)$exists->fetchColumn() === 0) {
                     throw new RuntimeException('Student not found.', 404);
                 }
@@ -4045,23 +6035,55 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
                     (:tenant_id, :branch_id, :admission_no, :emis_no, :first_name, :last_name, :gender,
                      :date_of_birth, :blood_group, :mobile, :email, :address, :admission_date, :status)'
             );
-            $statement->execute([
-                'tenant_id' => $scope['tenant_id'],
-                'branch_id' => $branchId,
-                'admission_no' => $admissionNo,
-                'emis_no' => $emisNo !== '' ? $emisNo : null,
-                'first_name' => $firstName,
-                'last_name' => $lastName,
-                'gender' => $gender,
-                'date_of_birth' => $dateOfBirth,
-                'blood_group' => $bloodGroup !== '' ? $bloodGroup : null,
-                'mobile' => $mobile,
-                'email' => $email !== '' ? $email : null,
-                'address' => $address !== '' ? $address : null,
-                'admission_date' => $admissionDate,
-                'status' => $status,
-            ]);
-            $studentId = (int)$pdo->lastInsertId();
+
+            $insertAttempts = $admissionNumberMode === 'auto' ? 10 : 1;
+
+            for ($insertAttempt = 0; $insertAttempt < $insertAttempts; $insertAttempt++) {
+                try {
+                    $statement->execute([
+                        'tenant_id' => $scope['tenant_id'],
+                        'branch_id' => $branchId,
+                        'admission_no' => $admissionNo,
+                        'emis_no' => $emisNo !== '' ? $emisNo : null,
+                        'first_name' => $firstName,
+                        'last_name' => $lastName,
+                        'gender' => $gender,
+                        'date_of_birth' => $dateOfBirth,
+                        'blood_group' => $bloodGroup !== '' ? $bloodGroup : null,
+                        'mobile' => $mobile,
+                        'email' => $email !== '' ? $email : null,
+                        'address' => $address !== '' ? $address : null,
+                        'admission_date' => $admissionDate,
+                        'status' => $status,
+                    ]);
+                    $studentId = (int)$pdo->lastInsertId();
+                    break;
+                } catch (PDOException $exception) {
+                    $sqlState = (string)$exception->getCode();
+                    $driverCode = (int)($exception->errorInfo[1] ?? 0);
+                    $duplicateKey = $sqlState === '23000' || $driverCode === 1062;
+
+                    if (
+                        !$duplicateKey
+                        || $admissionNumberMode !== 'auto'
+                        || $insertAttempt + 1 >= $insertAttempts
+                    ) {
+                        throw $exception;
+                    }
+
+                    $admissionNo = studentsGenerateUniqueAdmissionNumber(
+                        $pdo,
+                        $scope['tenant_id'],
+                        0
+                    );
+                }
+            }
+
+            if ($studentId <= 0) {
+                throw new RuntimeException(
+                    'Unable to save the student with a unique Admission Number.'
+                );
+            }
         }
 
         $enrollmentStatus = match ($status) {
@@ -4070,12 +6092,54 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
             default => 'active',
         };
 
+        /*
+         * Do not overwrite a promotion enrollment date with the student's
+         * original admission date. Existing promoted/current-year enrollment
+         * keeps its own enrolled_on value. If this year has no enrollment yet,
+         * start it at the later of the academic-year start or admission date.
+         */
+        $feeAssignmentDate = $admissionDate;
+        if (!$isNewStudent) {
+            $existingEnrollmentDate = $pdo->prepare(
+                "SELECT enrolled_on
+                 FROM student_enrollments
+                 WHERE tenant_id = :tenant_id
+                   AND branch_id = :branch_id
+                   AND student_id = :student_id
+                   AND academic_year_id = :academic_year_id
+                 ORDER BY id DESC
+                 LIMIT 1"
+            );
+            $existingEnrollmentDate->execute([
+                'tenant_id' => $scope['tenant_id'],
+                'branch_id' => $branchId,
+                'student_id' => $studentId,
+                'academic_year_id' => $academicYearId,
+            ]);
+            $savedEnrollmentDate = trim((string)$existingEnrollmentDate->fetchColumn());
+
+            if ($savedEnrollmentDate !== '') {
+                $feeAssignmentDate = $savedEnrollmentDate;
+            }
+
+            /*
+             * Repair an older promoted enrollment which may already have been
+             * overwritten with the student's original (previous-year)
+             * admission date.
+             */
+            $academicStart = (string)($academicYear['start_date'] ?? '');
+            if ($academicStart !== '' && $feeAssignmentDate < $academicStart) {
+                $feeAssignmentDate = $academicStart;
+            }
+        }
+
         $statement = $pdo->prepare(
             'INSERT INTO student_enrollments
-                (tenant_id, student_id, academic_year_id, class_id, section_id, roll_no, enrollment_status, enrolled_on)
+                (tenant_id, branch_id, student_id, academic_year_id, class_id, section_id, roll_no, enrollment_status, enrolled_on)
              VALUES
-                (:tenant_id, :student_id, :academic_year_id, :class_id, :section_id, :roll_no, :enrollment_status, :enrolled_on)
+                (:tenant_id, :branch_id, :student_id, :academic_year_id, :class_id, :section_id, :roll_no, :enrollment_status, :enrolled_on)
              ON DUPLICATE KEY UPDATE
+                branch_id = VALUES(branch_id),
                 class_id = VALUES(class_id),
                 section_id = VALUES(section_id),
                 roll_no = VALUES(roll_no),
@@ -4084,13 +6148,14 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
         );
         $statement->execute([
             'tenant_id' => $scope['tenant_id'],
+            'branch_id' => $branchId,
             'student_id' => $studentId,
             'academic_year_id' => $academicYearId,
             'class_id' => $class['canonical_class_id'],
             'section_id' => $section['canonical_section_id'],
             'roll_no' => $rollNo !== '' ? $rollNo : null,
             'enrollment_status' => $enrollmentStatus,
-            'enrolled_on' => $admissionDate,
+            'enrolled_on' => $feeAssignmentDate,
         ]);
 
         $assignedFeeStructureId = studentsAssignFeeStructure(
@@ -4105,7 +6170,7 @@ function studentsSave(PDO $pdo, array $scope, array $input): int
             $transportRouteId,
             $transportStopId,
             $isNewStudent,
-            $admissionDate
+            $feeAssignmentDate
         );
 
         studentsUpsertGuardian($pdo, $scope['tenant_id'], $studentId, [
@@ -4163,16 +6228,19 @@ if (!isset($pdo) || !($pdo instanceof PDO)) {
 
 try {
     $pdo->setAttribute(PDO::ATTR_EMULATE_PREPARES, true);
+    $scope = studentsScope($pdo);
     studentsRequireTables($pdo);
     studentsEnsureSupportSchema($pdo);
     studentsEnsureFeeSchema($pdo);
+    school_settings_ensure_schema($pdo);
 } catch (Throwable $exception) {
-    studentsJson(false, 'Unable to initialize Students Management: ' . $exception->getMessage(), [], 500);
-}
-
-$scope = studentsScope();
-if ($scope['tenant_id'] <= 0) {
-    studentsJson(false, 'School tenant session was not found.', [], 401);
+    $status = (int)$exception->getCode();
+    studentsJson(
+        false,
+        'Unable to initialize Students Management: ' . $exception->getMessage(),
+        [],
+        $status >= 400 && $status <= 599 ? $status : 500
+    );
 }
 
 $input = studentsInput();
@@ -4217,7 +6285,7 @@ try {
 
         studentsJson(true, 'Students loaded.', [
             'records' => studentsList($pdo, $scope, array_merge($_GET, $input)),
-            'stats' => studentsStats($pdo, $scope),
+            'stats' => studentsStats($pdo, $scope, array_merge($_GET, $input)),
         ]);
     }
 
@@ -4261,7 +6329,181 @@ try {
         exit;
     }
 
+
+    if ($action === 'parent_login_list') {
+        if (!studentsCan('view')) {
+            throw new RuntimeException(
+                'Permission denied.',
+                403
+            );
+        }
+
+        $studentScope = strtolower(trim(
+            (string)($_GET['student_scope'] ?? 'active')
+        ));
+
+        $filter = studentsParentLoginNormalizeFilters(
+            $pdo,
+            $scope,
+            [
+                'academic_year_id' => (int)($_GET['academic_year_id'] ?? 0),
+                'class_id' => (int)($_GET['class_id'] ?? 0),
+                'section_id' => (int)($_GET['section_id'] ?? 0),
+            ],
+            true
+        );
+
+        $rows = studentsParentLoginRows(
+            $pdo,
+            $scope,
+            $studentScope,
+            [],
+            $filter
+        );
+
+        $eligible = 0;
+        $existing = 0;
+        $withoutGuardian = 0;
+
+        foreach ($rows as $row) {
+            if ((bool)$row['has_parent_login']) {
+                $existing++;
+            } elseif (!(int)($row['guardian_id'] ?? 0)) {
+                $withoutGuardian++;
+            } else {
+                $eligible++;
+            }
+        }
+
+        studentsJson(
+            true,
+            'Parent Login student list loaded.',
+            [
+                'rows' => $rows,
+                'summary' => [
+                    'total_students' => count($rows),
+                    'eligible' => $eligible,
+                    'existing' => $existing,
+                    'without_guardian' => $withoutGuardian,
+                ],
+                'filters' => $filter,
+                'csrf_token' => function_exists('csrfToken')
+                    ? csrfToken()
+                    : '',
+            ]
+        );
+    }
+
+
+    if ($action === 'parent_login_student_credentials') {
+        if (!studentsCan('view')) {
+            throw new RuntimeException(
+                'Permission denied.',
+                403
+            );
+        }
+
+        $studentId = (int)($_GET['student_id'] ?? 0);
+
+        $details = studentsParentLoginCredentialDetails(
+            $pdo,
+            $scope,
+            $studentId
+        );
+
+        studentsJson(
+            true,
+            $details['message'],
+            [
+                'credential' => $details,
+                'csrf_token' => function_exists('csrfToken')
+                    ? csrfToken()
+                    : '',
+            ]
+        );
+    }
+
+
     studentsCsrf($input);
+
+
+    if ($action === 'parent_login_reset_password') {
+        if (
+            !studentsCan('edit')
+            && !studentsCan('add')
+            && !studentsCan('create')
+        ) {
+            throw new RuntimeException(
+                'Permission denied.',
+                403
+            );
+        }
+
+        $studentId = (int)($input['student_id'] ?? 0);
+
+        $details = studentsResetParentLoginPassword(
+            $pdo,
+            $scope,
+            $studentId
+        );
+
+        studentsJson(
+            true,
+            $details['message'],
+            [
+                'credential' => $details,
+                'csrf_token' => function_exists('csrfToken')
+                    ? csrfToken()
+                    : '',
+            ]
+        );
+    }
+
+
+    if ($action === 'parent_login_create_selected') {
+        if (
+            !studentsCan('add')
+            && !studentsCan('create')
+        ) {
+            throw new RuntimeException(
+                'Permission denied.',
+                403
+            );
+        }
+
+        $studentIds = is_array(
+            $input['student_ids'] ?? null
+        )
+            ? $input['student_ids']
+            : [];
+
+        $result = studentsGenerateParentLoginsSelected(
+            $pdo,
+            $scope,
+            $studentIds,
+            [
+                'academic_year_id' => (int)($input['academic_year_id'] ?? 0),
+                'class_id' => (int)($input['class_id'] ?? 0),
+                'section_id' => (int)($input['section_id'] ?? 0),
+            ]
+        );
+
+        studentsJson(
+            true,
+            $result['created']
+                . ' Parent Login'
+                . ($result['created'] === 1 ? '' : 's')
+                . ' generated successfully.',
+            array_merge(
+                $result,
+                [
+                    'csrf_token' => function_exists('csrfToken')
+                        ? csrfToken()
+                        : '',
+                ]
+            )
+        );
+    }
 
     if ($action === 'save') {
         $studentId = (int)($input['id'] ?? 0);
@@ -4271,10 +6513,87 @@ try {
         }
 
         $savedId = studentsSave($pdo, $scope, $input);
+
+        $parentLoginCredential = null;
+        $parentLoginWarning = '';
+        $parentLoginRequired = $studentId === 0
+            && in_array(
+                strtolower(trim((string)(
+                    $input['parent_login_required'] ?? 'no'
+                ))),
+                ['yes', '1', 'true'],
+                true
+            );
+
+        if ($parentLoginRequired) {
+            try {
+                $parentLoginResult =
+                    studentsGenerateParentLoginForStudent(
+                        $pdo,
+                        $scope,
+                        $savedId
+                    );
+
+                if (
+                    ($parentLoginResult['status'] ?? '') === 'created'
+                ) {
+                    $parentLoginCredential =
+                        $parentLoginResult['credential'];
+                } else {
+                    $parentLoginWarning =
+                        (string)(
+                            $parentLoginResult['message']
+                            ?? 'Parent Login was not generated.'
+                        );
+                }
+            } catch (Throwable $parentLoginException) {
+                /*
+                 * The student is already safely saved at this point.
+                 * Do not undo Student Admission because credential generation
+                 * failed. Return a clear warning so the admin can generate it
+                 * later from Generate Parent Login.
+                 */
+                $parentLoginWarning =
+                    $parentLoginException->getMessage();
+
+                error_log(
+                    'Auto Parent Login generation failed for student '
+                    . $savedId
+                    . ': '
+                    . $parentLoginException->getMessage()
+                );
+            }
+        }
+
+        $message = $studentId > 0
+            ? 'Student updated successfully.'
+            : 'Student created successfully.';
+
+        if ($parentLoginCredential) {
+            $message =
+                'Student created and Parent Login generated successfully.';
+        } elseif ($parentLoginRequired && $parentLoginWarning !== '') {
+            $message .=
+                ' Parent Login could not be generated automatically: '
+                . $parentLoginWarning;
+        }
+
         studentsJson(
             true,
-            $studentId > 0 ? 'Student updated successfully.' : 'Student created successfully.',
-            ['id' => $savedId]
+            $message,
+            [
+                'id' => $savedId,
+                'admission_number' => (string)(studentsGetRecord($pdo, $scope, $savedId)['admission_number'] ?? ''),
+                'admission_number_mode' => strtolower((string)($input['admission_number_mode'] ?? 'auto')),
+                'admission_number_prefix' => school_settings_prefix(
+                    school_settings_get($pdo, $scope['tenant_id']),
+                    'admission'
+                ),
+                'next_admission_number' => studentsPeekUniqueAdmissionNumber($pdo, $scope['tenant_id']),
+                'parent_login_required' => $parentLoginRequired,
+                'parent_login_credential' => $parentLoginCredential,
+                'parent_login_warning' => $parentLoginWarning,
+            ]
         );
     }
 
@@ -4299,27 +6618,31 @@ try {
                 $statement = $pdo->prepare(
                     "UPDATE students
                      SET status = 'inactive', deleted_at = CURRENT_TIMESTAMP
-                     WHERE id = :id AND tenant_id = :tenant_id"
+                     WHERE id = :id AND tenant_id = :tenant_id AND branch_id = :branch_id"
                 );
             } else {
                 $statement = $pdo->prepare(
                     "UPDATE students
                      SET status = 'inactive'
-                     WHERE id = :id AND tenant_id = :tenant_id"
+                     WHERE id = :id AND tenant_id = :tenant_id AND branch_id = :branch_id"
                 );
             }
             $statement->execute([
                 'id' => $studentId,
                 'tenant_id' => $scope['tenant_id'],
+                'branch_id' => $scope['branch_id'],
             ]);
 
             $pdo->prepare(
                 "UPDATE student_enrollments
                  SET enrollment_status = 'completed'
-                 WHERE student_id = :student_id AND tenant_id = :tenant_id"
+                 WHERE student_id = :student_id
+                   AND tenant_id = :tenant_id
+                   AND branch_id = :branch_id"
             )->execute([
                 'student_id' => $studentId,
                 'tenant_id' => $scope['tenant_id'],
+                'branch_id' => $scope['branch_id'],
             ]);
 
             studentsLog($pdo, $scope, 'delete', $studentId, 'Student archived.', $old, null);
@@ -4369,7 +6692,6 @@ try {
                     'missing_columns' => $missingColumns,
                     'supported_fallback_columns' => [
                         'academic_year_id',
-                        'branch_id',
                         'admission_date',
                     ],
                     'csrf_token' => function_exists('csrfToken')
@@ -4443,6 +6765,7 @@ try {
 
             try {
                 $row['id'] = 0;
+                $row['branch_id'] = $scope['branch_id'];
                 studentsSave($pdo, $scope, $row);
                 $created++;
             } catch (Throwable $exception) {

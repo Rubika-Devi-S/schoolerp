@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-14-remove-role-copy-export-v7 */
+
 $projectRoot = dirname(__DIR__);
 
 require_once $projectRoot . '/includes/bootstrap.php';
@@ -49,10 +51,20 @@ require $projectRoot . '/includes/layout-start.php';
 <style>
 .rbac-page{display:grid;gap:16px}
 .rbac-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
-.rbac-kpi{padding:16px}
-.rbac-kpi small,.rbac-kpi strong{display:block}
-.rbac-kpi small{color:var(--text-muted,#64748b);font-size:9px;font-weight:750}
-.rbac-kpi strong{margin-top:5px;font-size:22px;font-weight:850}
+.rbac-kpi{min-height:122px;padding:18px 20px;display:flex;align-items:center;gap:14px;position:relative;overflow:hidden;border:0;border-radius:15px;color:#fff;box-shadow:0 12px 28px rgba(15,23,42,.08)}
+.rbac-kpi::after{content:"";position:absolute;width:118px;height:118px;border-radius:50%;right:-38px;top:-42px;background:rgba(255,255,255,.08)}
+.rbac-kpi::before{content:"";position:absolute;width:62px;height:62px;border-radius:50%;right:14px;bottom:-34px;background:rgba(255,255,255,.05)}
+.rbac-kpi.purple{background:linear-gradient(135deg,#7448e8,#4b36cf)}
+.rbac-kpi.green{background:linear-gradient(135deg,#45c783,#1ea568)}
+.rbac-kpi.pink{background:linear-gradient(135deg,#ff4f7b,#f52f62)}
+.rbac-kpi.orange{background:linear-gradient(135deg,#ffb327,#ff8a17)}
+.rbac-kpi-icon{width:52px;height:52px;flex:0 0 52px;display:grid;place-items:center;border-radius:50%;background:rgba(255,255,255,.16);position:relative;z-index:1}
+.rbac-kpi-icon svg{width:23px;height:23px;stroke-width:2}
+.rbac-kpi-copy{position:relative;z-index:1;min-width:0}
+.rbac-kpi small,.rbac-kpi strong{display:block;color:#fff}
+.rbac-kpi small{font-size:11px;font-weight:750;opacity:.98;margin-bottom:6px}
+.rbac-kpi strong{font-size:27px;line-height:1;font-weight:850;margin:0}
+.rbac-kpi .trend{margin-top:9px;font-size:9px;line-height:1.25;font-weight:700;color:#fff;opacity:.94}
 .rbac-toolbar{display:grid;grid-template-columns:minmax(210px,1.15fr) minmax(190px,1fr) minmax(190px,1fr) minmax(150px,.7fr) auto;gap:12px;align-items:end;padding:16px}
 .rbac-field label{display:block;margin-bottom:6px;font-size:10px;font-weight:750}
 .rbac-table{min-width:1260px}
@@ -112,6 +124,9 @@ require $projectRoot . '/includes/layout-start.php';
 .rbac-role-checkboxes{display:flex;flex-wrap:wrap;gap:8px}
 .rbac-role-option{display:inline-flex;align-items:center;gap:6px;padding:7px 9px;border:1px solid var(--border-soft,#e7ebf3);border-radius:999px;background:var(--body-bg,#f6f8fc);font-size:9px;font-weight:700}
 .rbac-message{display:none;margin:0}
+.rbac-page .page-heading{align-items:flex-start}
+.rbac-page .page-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:nowrap;white-space:nowrap;flex:0 0 auto}
+.rbac-page .page-actions .btn-ui{flex:0 0 auto}
 .rbac-message.show{display:block}
 .rbac-audit-table{min-width:1050px}
 .rbac-tab-content{padding-top:14px}
@@ -129,8 +144,7 @@ require $projectRoot . '/includes/layout-start.php';
         <div>
             <h1 class="page-title">Roles & Permissions</h1>
             <p class="page-subtitle">
-                Manage school-wise and branch-wise roles, permissions,
-                sidebar visibility and inheritance.
+                Manage school-wise and branch-wise custom-role permissions. School Administrator permissions remain controlled from School Sidebar Permissions.
             </p>
         </div>
 
@@ -138,12 +152,6 @@ require $projectRoot . '/includes/layout-start.php';
             <?php if ($canAudit): ?>
                 <button id="auditButton" class="btn-ui" type="button">
                     <i data-lucide="history"></i>Audit Log
-                </button>
-            <?php endif; ?>
-
-            <?php if ($canImport): ?>
-                <button id="importButton" class="btn-ui" type="button">
-                    <i data-lucide="file-up"></i>Import
                 </button>
             <?php endif; ?>
 
@@ -168,21 +176,37 @@ require $projectRoot . '/includes/layout-start.php';
     <div id="rbacMessage" class="alert rbac-message"></div>
 
     <div class="rbac-kpis">
-        <article class="ui-card rbac-kpi">
-            <small>Total Schools</small>
-            <strong id="schoolCount">0</strong>
+        <article class="rbac-kpi purple">
+            <span class="rbac-kpi-icon"><i data-lucide="school"></i></span>
+            <div class="rbac-kpi-copy">
+                <small>Total Schools</small>
+                <strong id="schoolCount">0</strong>
+                <div class="trend">Schools available for role control</div>
+            </div>
         </article>
-        <article class="ui-card rbac-kpi">
-            <small>Total Branches</small>
-            <strong id="branchCount">0</strong>
+        <article class="rbac-kpi green">
+            <span class="rbac-kpi-icon"><i data-lucide="git-branch"></i></span>
+            <div class="rbac-kpi-copy">
+                <small>Total Branches</small>
+                <strong id="branchCount">0</strong>
+                <div class="trend">Branches available under schools</div>
+            </div>
         </article>
-        <article class="ui-card rbac-kpi">
-            <small>School Roles</small>
-            <strong id="roleCount">0</strong>
+        <article class="rbac-kpi pink">
+            <span class="rbac-kpi-icon"><i data-lucide="shield-check"></i></span>
+            <div class="rbac-kpi-copy">
+                <small>School Roles</small>
+                <strong id="roleCount">0</strong>
+                <div class="trend">School-wise login roles</div>
+            </div>
         </article>
-        <article class="ui-card rbac-kpi">
-            <small>Permission Definitions</small>
-            <strong id="permissionCount">0</strong>
+        <article class="rbac-kpi orange">
+            <span class="rbac-kpi-icon"><i data-lucide="key-round"></i></span>
+            <div class="rbac-kpi-copy">
+                <small>Permission Definitions</small>
+                <strong id="permissionCount">0</strong>
+                <div class="trend">Available permission actions</div>
+            </div>
         </article>
     </div>
 
@@ -500,7 +524,7 @@ require $projectRoot . '/includes/layout-start.php';
                             School & Branch Permissions
                         </h5>
                         <small id="permissionRoleText" class="text-muted">
-                            Configure role access.
+                            Grant only permissions allowed to this school/branch by Super Admin School Sidebar Permission.
                         </small>
                     </div>
                     <button
@@ -1117,6 +1141,21 @@ require $projectRoot . '/includes/layout-start.php';
             ?.school_name || '-';
     }
 
+    function isSchoolAdminRole(role) {
+        const key = String(role?.role_key || '')
+            .toLowerCase()
+            .trim()
+            .replaceAll('-', '_');
+
+        return [
+            'school_admin',
+            'school_administrator',
+            'schooladmin',
+            'administrator',
+            'admin'
+        ].includes(key);
+    }
+
     function fillSchoolSelect(select, includeAll = false) {
         const current = select.value;
 
@@ -1274,13 +1313,14 @@ require $projectRoot . '/includes/layout-start.php';
             const roleId = Number(role.id);
             const platform = role.role_scope === 'platform';
             const system = Number(role.is_system) === 1;
+            const schoolAdminRole = isSchoolAdminRole(role);
             const active = role.status === 'active';
             const checked = selectedRoleIds.has(roleId);
 
             return `
                 <tr>
                     <td>
-                        ${platform ? '' : `
+                        ${platform || schoolAdminRole ? '' : `
                             <input
                                 class="form-check-input rbac-role-select"
                                 type="checkbox"
@@ -1306,7 +1346,12 @@ require $projectRoot . '/includes/layout-start.php';
 
                     <td><code>${escapeHtml(role.role_key)}</code></td>
                     <td>${Number(role.user_count || 0)}</td>
-                    <td>${Number(role.permission_count || 0)}</td>
+                    <td>
+                        ${schoolAdminRole
+                            ? '<span class="rbac-mode">School Sidebar Permission</span>'
+                            : Number(role.permission_count || 0)
+                        }
+                    </td>
 
                     <td>
                         ${platform
@@ -1330,7 +1375,7 @@ require $projectRoot . '/includes/layout-start.php';
 
                     <td>
                         <div class="rbac-actions">
-                            ${!platform && capabilities.manage ? `
+                            ${!platform && !schoolAdminRole && capabilities.manage ? `
                                 <button
                                     class="rbac-action-btn role-permission"
                                     type="button"
@@ -1338,29 +1383,6 @@ require $projectRoot . '/includes/layout-start.php';
                                     data-role-id="${roleId}"
                                 >
                                     <i data-lucide="key-round"></i>
-                                </button>
-                            ` : ''}
-
-                            ${!platform && capabilities.export ? `
-                                <button
-                                    class="rbac-action-btn role-export"
-                                    type="button"
-                                    title="Export Role"
-                                    data-role-id="${roleId}"
-                                    data-school-id="${Number(role.tenant_id)}"
-                                >
-                                    <i data-lucide="download"></i>
-                                </button>
-                            ` : ''}
-
-                            ${!platform && capabilities.create ? `
-                                <button
-                                    class="rbac-action-btn role-copy"
-                                    type="button"
-                                    title="Copy Role"
-                                    data-role="${escapeHtml(JSON.stringify(role))}"
-                                >
-                                    <i data-lucide="copy"></i>
                                 </button>
                             ` : ''}
 
@@ -1629,17 +1651,27 @@ require $projectRoot . '/includes/layout-start.php';
                                     page.permissions?.[action.action_key]
                                     || {};
 
+                                const capAllowed =
+                                    Number(permission.cap_allowed ?? 1) === 1;
+
                                 return `
                                     <td class="text-center">
-                                        <input
-                                            class="form-check-input rbac-permission-check"
-                                            type="checkbox"
-                                            data-permission-id="${Number(permission.permission_id || 0)}"
-                                            data-action="${escapeHtml(action.action_key)}"
-                                            data-page-id="${Number(page.id)}"
-                                            data-module-id="${moduleId}"
-                                            ${permissionChecked(permission) ? 'checked' : ''}
-                                        >
+                                        ${capAllowed ? `
+                                            <input
+                                                class="form-check-input rbac-permission-check"
+                                                type="checkbox"
+                                                data-permission-id="${Number(permission.permission_id || 0)}"
+                                                data-action="${escapeHtml(action.action_key)}"
+                                                data-page-id="${Number(page.id)}"
+                                                data-module-id="${moduleId}"
+                                                ${permissionChecked(permission) ? 'checked' : ''}
+                                            >
+                                        ` : `
+                                            <span
+                                                class="rbac-mode"
+                                                title="Not granted to this school/branch by Super Admin"
+                                            >Locked</span>
+                                        `}
                                     </td>
                                 `;
                             }).join('')}
@@ -1673,6 +1705,7 @@ require $projectRoot . '/includes/layout-start.php';
                             data-parent-id="${Number(item.parent_id || 0)}"
                             data-is-parent="${isParent ? '1' : '0'}"
                             ${Number(item.effective_show || 0) === 1 ? 'checked' : ''}
+                            ${Number(item.cap_show ?? 1) === 1 ? '' : 'disabled'}
                         >
                         <span class="rbac-sidebar-icon">
                             <i data-lucide="${escapeHtml(item.icon || 'circle')}"></i>
@@ -2324,12 +2357,14 @@ require $projectRoot . '/includes/layout-start.php';
 
         const invalid = selected.some(id => {
             const role = roles.find(item => Number(item.id) === id);
-            return !role || Number(role.tenant_id) !== schoolId;
+            return !role
+                || Number(role.tenant_id) !== schoolId
+                || isSchoolAdminRole(role);
         });
 
         if (invalid) {
             message(
-                'Bulk roles must belong to the selected school.',
+                'Bulk roles must belong to the selected school. School Administrator is controlled from School Sidebar Permissions.',
                 false
             );
             return;
@@ -2367,7 +2402,9 @@ require $projectRoot . '/includes/layout-start.php';
         event => {
             document.querySelectorAll('.rbac-permission-check')
                 .forEach(check => {
-                    check.checked = event.target.checked;
+                    if (!check.disabled) {
+                        check.checked = event.target.checked;
+                    }
                 });
             refreshPermissionAggregates();
         }
@@ -2378,7 +2415,9 @@ require $projectRoot . '/includes/layout-start.php';
         event => {
             document.querySelectorAll('.rbac-sidebar-check')
                 .forEach(check => {
-                    check.checked = event.target.checked;
+                    if (!check.disabled) {
+                        check.checked = event.target.checked;
+                    }
                 });
             refreshSidebarAggregate();
         }

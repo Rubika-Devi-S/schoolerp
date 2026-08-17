@@ -7,6 +7,13 @@ $sidebarFile = __DIR__ . '/sidebar.php';
 
 require dirname(__DIR__) . '/includes/layout-start.php';
 
+/* Use the existing common toast system. */
+$commonToastFile = dirname(__DIR__) . '/includes/common-toast.php';
+if (is_file($commonToastFile)) {
+    require_once $commonToastFile;
+}
+
+
 $csrfToken = function_exists('csrfToken') ? csrfToken() : '';
 ?>
 
@@ -308,6 +315,7 @@ $csrfToken = function_exists('csrfToken') ? csrfToken() : '';
 }
 </style>
 
+<!-- Build: 2026-08-10-student-admission-auto-number-duplicate-fixed-v5 -->
 <div class="admission-page">
     <header class="admission-heading">
         <div>
@@ -692,18 +700,43 @@ const esc = value => String(value ?? '')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
 
-function showMessage(text, success = false) {
+function showMessage(text, success = false, title = '') {
+    const message = String(text || '').trim();
+    if (!message) return;
+
+    const type = success ? 'success' : 'error';
+
+    if (typeof window.schoolToast === 'function') {
+        window.schoolToast(
+            type,
+            message,
+            title || (success ? 'Success' : 'Action failed')
+        );
+        return;
+    }
+
+    if (typeof window.showToast === 'function') {
+        window.showToast(
+            type,
+            message,
+            title || (success ? 'Success' : 'Action failed')
+        );
+        return;
+    }
+
     const box = $('admissionAlert');
-    box.className =
-        'alert admission-alert show ' +
+    if (!box) return;
+    box.className = 'alert admission-alert show ' +
         (success ? 'alert-success' : 'alert-danger');
-    box.textContent = text;
+    box.textContent = message;
     box.scrollIntoView({behavior: 'smooth', block: 'center'});
 }
 
 function clearMessage() {
-    $('admissionAlert').className = 'alert admission-alert';
-    $('admissionAlert').textContent = '';
+    const box = $('admissionAlert');
+    if (!box) return;
+    box.className = 'alert admission-alert';
+    box.textContent = '';
 }
 
 async function request(action, data = {}, method = 'GET') {
@@ -1178,6 +1211,10 @@ async function loadMeta() {
     permissions = result.data.permissions || {};
     csrfToken = result.data.csrf_token || csrfToken;
 
+    if (!meta.next_admission_number) {
+        meta.next_admission_number = `${admissionPrefix()}0001`;
+    }
+
     if (!permissions.add && !permissions.create) {
         throw new Error(
             'You do not have permission to add students.'
@@ -1232,7 +1269,9 @@ function buildPayload() {
         transport_stop_id:
             Number($('transportStopId').value || 0),
         admission_number_mode:
-            $('admissionNumberMode').value,
+            $('admissionNumberMode').value === 'manual'
+                ? 'manual'
+                : 'auto',
         /*
          * Always send the visible Admission Number.
          *
@@ -1296,7 +1335,7 @@ async function saveStudent(event) {
              * Rebuild the preview once if metadata was refreshed or the input
              * was unexpectedly cleared before submission.
              */
-            applyAdmissionNumberMode();
+            refreshAdmissionNumberMode(false);
             data.admission_number = $('admissionNumber').value.trim();
         }
 

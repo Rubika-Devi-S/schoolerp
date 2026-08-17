@@ -72,7 +72,7 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
 </section>
 
 <section class="fee-grid">
-<section class="ui-card fee-card"><div class="fee-card-head"><strong>Recent Fee Collections</strong><a class="btn-ui" href="fee-transactions.php">View All</a></div><div class="fee-table-wrap"><table class="data-table fee-table"><thead><tr><th>Receipt</th><th>Student</th><th>Date</th><th>Amount</th><th>Status</th></tr></thead><tbody id="recentBody"><tr><td colspan="5" class="fee-empty">Loading...</td></tr></tbody></table></div></section>
+<section class="ui-card fee-card"><div class="fee-card-head"><strong>Recent Fee Collections</strong><a class="btn-ui" href="school-transactions.php">View All</a></div><div class="fee-table-wrap"><table class="data-table fee-table"><thead><tr><th>Receipt</th><th>Student</th><th>Date</th><th>Amount</th><th>Status</th></tr></thead><tbody id="recentBody"><tr><td colspan="5" class="fee-empty">Loading...</td></tr></tbody></table></div></section>
 </section>
 <script>
 document.addEventListener('DOMContentLoaded',async()=>{

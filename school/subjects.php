@@ -9,9 +9,51 @@ require dirname(__DIR__) . '/includes/layout-start.php';
 
 $csrfToken = function_exists('csrfToken') ? csrfToken() : '';
 
-$capabilities = function_exists('school_current_page_capabilities')
-    ? school_current_page_capabilities($pageKey)
-    : [
+$subjectCurrentUser = function_exists('current_user')
+    ? current_user()
+    : [];
+
+$subjectCurrentUser = is_array($subjectCurrentUser)
+    ? $subjectCurrentUser
+    : [];
+
+$subjectRoleText = strtolower(trim((string)(
+    $subjectCurrentUser['role_key']
+    ?? $subjectCurrentUser['role_name']
+    ?? $subjectCurrentUser['role']
+    ?? $subjectCurrentUser['user_type']
+    ?? $_SESSION['role_key']
+    ?? $_SESSION['role_name']
+    ?? $_SESSION['role']
+    ?? ''
+)));
+
+$subjectRoleKey = preg_replace('/[^a-z0-9]+/', '_', $subjectRoleText) ?? '';
+
+$subjectPlatformFullAccess = in_array(
+    trim($subjectRoleKey, '_'),
+    [
+        'platform_owner',
+        'platformowner',
+        'platform_admin',
+        'platformadministrator',
+        'super_admin',
+        'superadministrator',
+    ],
+    true
+);
+
+if (function_exists('is_super_admin')) {
+    try {
+        $subjectPlatformFullAccess =
+            $subjectPlatformFullAccess
+            || (bool)is_super_admin();
+    } catch (Throwable) {
+    }
+}
+
+$capabilities = $subjectPlatformFullAccess
+    ? [
         'view' => true,
         'add' => true,
         'create' => true,
@@ -20,14 +62,22 @@ $capabilities = function_exists('school_current_page_capabilities')
         'print' => true,
         'pdf' => true,
         'export' => true,
-    ];
+        'import' => true,
+    ]
+    : (
+        function_exists('school_current_page_capabilities')
+            ? school_current_page_capabilities($pageKey)
+            : []
+    );
 
+$canView = !empty($capabilities['view']);
 $canAdd = !empty($capabilities['add'] ?? $capabilities['create'] ?? false);
 $canEdit = !empty($capabilities['edit']);
 $canDelete = !empty($capabilities['delete']);
 $canPrint = !empty($capabilities['print']);
 $canPdf = !empty($capabilities['pdf']);
 $canExport = !empty($capabilities['export']);
+$canImport = !empty($capabilities['import']);
 ?>
 <style>
 .subject-page{display:grid;gap:16px}
@@ -234,6 +284,12 @@ $canExport = !empty($capabilities['export']);
                 </a>
             <?php endif; ?>
 
+            <?php if ($canImport): ?>
+                <button id="importSubjects" class="btn-ui" type="button" data-permission-action="import">
+                    <i data-lucide="upload"></i> Import Subjects
+                </button>
+            <?php endif; ?>
+
             <?php if ($canAdd): ?>
                 <button id="addSubject" class="btn-ui btn-primary-ui" type="button" data-permission-action="create">
                     <i data-lucide="plus"></i> Add Subject
@@ -347,6 +403,63 @@ $canExport = !empty($capabilities['export']);
         <div id="allClassView" class="subject-all-groups" style="display:none"></div>
     </section>
 </div>
+
+
+<?php if ($canImport): ?>
+<div class="modal fade" id="subjectImportModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+            <form id="subjectImportForm" enctype="multipart/form-data">
+                <div class="modal-header">
+                    <div>
+                        <h5 class="modal-title">Import Subjects</h5>
+                        <small class="text-muted">Bulk import class-wise subjects using CSV or XLSX.</small>
+                    </div>
+                    <button class="btn-close" type="button" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="subject-modal-note">
+                        <strong>Required:</strong> Academic Year, Class, Subject Name, Subject Code.<br>
+                        <strong>Optional:</strong> Book Name, Status, Subject Type, Department,
+                        Subject Group, Maximum Marks, Pass Marks, Subject Teacher, Description.<br>
+                        Academic Year and Class must match existing records for this school.
+                    </div>
+
+                    <div class="d-flex gap-2 flex-wrap mb-3">
+                        <a id="downloadSubjectCsvTemplate" class="btn-ui" href="#" target="_blank">
+                            <i data-lucide="file-down"></i> Download CSV Template
+                        </a>
+                        <a id="downloadSubjectXlsxTemplate" class="btn-ui" href="#" target="_blank">
+                            <i data-lucide="file-spreadsheet"></i> Download XLSX Template
+                        </a>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">CSV / XLSX File *</label>
+                        <input
+                            id="subjectImportFile"
+                            name="import_file"
+                            class="form-control"
+                            type="file"
+                            accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            required
+                        >
+                        <small class="text-muted">Maximum 2,000 rows and 10 MB.</small>
+                    </div>
+
+                    <div id="subjectImportResult" class="alert alert-light border" style="display:none"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn-ui" type="button" data-bs-dismiss="modal">Cancel</button>
+                    <button id="startSubjectImport" class="btn-ui btn-primary-ui" type="submit">
+                        <i data-lucide="upload"></i> Import Subjects
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
 
 <div class="modal fade" id="subjectModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-xl modal-dialog-centered">
@@ -481,6 +594,8 @@ let permissions=<?= json_encode([
     'print'=>$canPrint,
     'pdf'=>$canPdf,
     'export'=>$canExport,
+    'import'=>$canImport,
+    'platform_full_access'=>$subjectPlatformFullAccess,
 ],JSON_UNESCAPED_SLASHES) ?>;
 
 const $=id=>document.getElementById(id);
@@ -564,6 +679,60 @@ async function request(action,data={},method='GET'){
     }
 
     return result;
+}
+
+
+async function requestUpload(action,formData){
+    formData.set('action',action);
+    formData.set('csrf_token',csrfToken);
+
+    const response=await fetch(apiUrl,{
+        method:'POST',
+        credentials:'same-origin',
+        headers:{Accept:'application/json'},
+        body:formData
+    });
+
+    const text=await response.text();
+    let result;
+
+    try{
+        result=JSON.parse(text);
+    }catch{
+        const preview=String(text||'')
+            .replace(/<[^>]*>/g,' ')
+            .replace(/\s+/g,' ')
+            .trim()
+            .slice(0,300);
+        throw new Error(`Subjects Import API returned HTTP ${response.status}. ${preview||'Invalid server response.'}`);
+    }
+
+    if(!response.ok||!result.success){
+        throw new Error(result.message||'Subject import failed.');
+    }
+
+    return result;
+}
+
+function applyActionPermissions(){
+    const actionMap={
+        print:'printSubjects',
+        pdf:'exportSubjectsPdf',
+        export:'exportSubjectsExcel',
+        import:'importSubjects',
+        create:'addSubject'
+    };
+
+    Object.entries(actionMap).forEach(([action,id])=>{
+        const element=$(id);
+        if(!element)return;
+
+        const allowed=action==='create'
+            ?Boolean(permissions.create||permissions.add)
+            :Boolean(permissions[action]);
+
+        element.style.display=allowed?'':'none';
+    });
 }
 
 function selectedYearId(){
@@ -1014,6 +1183,7 @@ async function initialize(preserveYear=false){
         csrfToken=result.data.csrf_token||csrfToken;
         meta=result.data.meta||{};
         permissions={...permissions,...(result.data.permissions||{})};
+        applyActionPermissions();
 
         fillAcademicYears();
         fillTeachers();
@@ -1109,6 +1279,109 @@ $('subjectForm').addEventListener('submit',async event=>{
         showMessage(error.message,false);
     }
 });
+
+
+const importButton=$('importSubjects');
+if(importButton){
+    importButton.addEventListener('click',()=>{
+        if(!permissions.import){
+            showMessage('You do not have permission to import subjects.',false);
+            return;
+        }
+
+        const resultBox=$('subjectImportResult');
+        if(resultBox){
+            resultBox.style.display='none';
+            resultBox.textContent='';
+        }
+
+        const fileInput=$('subjectImportFile');
+        if(fileInput)fileInput.value='';
+
+        bootstrap.Modal.getOrCreateInstance($('subjectImportModal')).show();
+        window.lucide?.createIcons();
+    });
+}
+
+const csvTemplate=$('downloadSubjectCsvTemplate');
+const xlsxTemplate=$('downloadSubjectXlsxTemplate');
+
+if(csvTemplate)csvTemplate.href=`${apiUrl}?action=template&format=csv`;
+if(xlsxTemplate)xlsxTemplate.href=`${apiUrl}?action=template&format=xlsx`;
+
+const importForm=$('subjectImportForm');
+if(importForm){
+    importForm.addEventListener('submit',async event=>{
+        event.preventDefault();
+
+        if(!permissions.import){
+            showMessage('You do not have permission to import subjects.',false);
+            return;
+        }
+
+        const file=$('subjectImportFile')?.files?.[0];
+        if(!file){
+            showMessage('Choose a CSV or XLSX file to import.',false);
+            return;
+        }
+
+        const extension=String(file.name.split('.').pop()||'').toLowerCase();
+        if(!['csv','xlsx'].includes(extension)){
+            showMessage('Only CSV and XLSX files are supported.',false);
+            return;
+        }
+
+        const submitButton=$('startSubjectImport');
+        const resultBox=$('subjectImportResult');
+
+        submitButton.disabled=true;
+        submitButton.innerHTML='<span class="spinner-border spinner-border-sm me-2"></span>Importing...';
+
+        try{
+            const formData=new FormData();
+            formData.append('import_file',file);
+
+            const result=await requestUpload('import',formData);
+            const summary=result.data||{};
+            const imported=Number(summary.imported||0);
+            const skipped=Number(summary.skipped||0);
+            const failed=Number(summary.failed||0);
+            const errors=Array.isArray(summary.errors)?summary.errors:[];
+
+            if(resultBox){
+                resultBox.style.display='block';
+                resultBox.className='alert '+(failed>0?'alert-warning':'alert-success');
+                resultBox.innerHTML=
+                    `<strong>${esc(result.message)}</strong>`
+                    +`<div class="mt-2">Imported: <strong>${imported}</strong> · Skipped: <strong>${skipped}</strong> · Failed: <strong>${failed}</strong></div>`
+                    +(errors.length
+                        ?`<div class="mt-2 small">${errors.slice(0,10).map(item=>esc(item)).join('<br>')}</div>`
+                        :'');
+            }
+
+            showMessage(
+                `${imported} subject${imported===1?'':'s'} imported.`
+                +(skipped?` ${skipped} skipped.`:'')
+                +(failed?` ${failed} failed.`:''),
+                failed===0,
+                failed===0?'Import Completed':'Import Completed With Warnings'
+            );
+
+            await initialize(true);
+        }catch(error){
+            if(resultBox){
+                resultBox.style.display='block';
+                resultBox.className='alert alert-danger';
+                resultBox.textContent=error.message;
+            }
+            showMessage(error.message,false,'Import Failed');
+        }finally{
+            submitButton.disabled=false;
+            submitButton.innerHTML='<i data-lucide="upload"></i> Import Subjects';
+            window.lucide?.createIcons();
+        }
+    });
+}
 
 initialize();
 })();

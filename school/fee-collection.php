@@ -3,6 +3,11 @@ declare(strict_types=1);
 $pageTitle='Fee Collection';
 $pageKey='fee_management';
 require dirname(__DIR__).'/includes/layout-start.php';
+
+// Explicit compatibility include requested for the common School ERP toaster.
+$commonToastFile=dirname(__DIR__).'/includes/common-toast.php';
+if(is_file($commonToastFile)){require_once $commonToastFile;}
+
 if(session_status()!==PHP_SESSION_ACTIVE){session_start();}
 if(empty($_SESSION['fee_csrf_token'])||!is_string($_SESSION['fee_csrf_token'])){$_SESSION['fee_csrf_token']=bin2hex(random_bytes(32));}
 $feeCsrf=$_SESSION['fee_csrf_token'];
@@ -325,7 +330,8 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
 .fc-badge.active{color:#16834f;background:#e8f8ef}
 
 .fc-badge.partial,
-.fc-badge.pending{color:#9a6700;background:#fff7d6}
+.fc-badge.pending,
+.fc-badge.carried_forward{color:#9a6700;background:#fff7d6}
 
 .fc-badge.unpaid,
 .fc-badge.overdue,
@@ -468,13 +474,57 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
 
 .fc-charge-row{
     display:grid;
-    grid-template-columns:1fr 1.15fr .65fr auto;
+    grid-template-columns:minmax(220px,1fr) minmax(240px,1.15fr) minmax(150px,.65fr);
     gap:8px;
     align-items:end;
     margin-bottom:8px;
 }
+.fc-charge-help{font-size:10px;color:var(--text-muted,#64748b);margin-top:5px;display:block}
+.fc-charge-row input[list]{background-color:var(--card-bg,#fff)}
 
 .fc-charge-row>div{min-width:0}
+
+ .fc-fee-history-summary{
+    display:grid;
+    grid-template-columns:repeat(5,minmax(0,1fr));
+    gap:9px;
+    padding:12px;
+    border:1px solid var(--border-soft,#e7ebf3);
+    border-radius:12px;
+    background:rgba(99,102,241,.035);
+}
+.fc-fee-history-summary>div{
+    min-width:0;
+    padding:10px;
+    border-radius:10px;
+    background:var(--card-bg,#fff);
+}
+.fc-fee-history-summary small{
+    display:block;
+    color:var(--text-muted,#64748b);
+    font-size:9px;
+    font-weight:800;
+}
+.fc-fee-history-summary strong{
+    display:block;
+    margin-top:4px;
+    font-size:13px;
+    overflow-wrap:anywhere;
+}
+.fc-fee-history-summary .previous strong{color:#c2410c}
+.fc-fee-history-summary .balance strong{color:#dc2626}
+.fc-fee-history-summary .paid strong{color:#16834f}
+.fc-year-scope{
+    display:inline-flex;
+    align-items:center;
+    padding:4px 7px;
+    border-radius:999px;
+    font-size:8px;
+    font-weight:800;
+    white-space:nowrap
+}
+.fc-year-scope.previous{background:#fff7ed;color:#c2410c}
+.fc-year-scope.current{background:#eef2ff;color:#4338ca}
 
 .fc-calculation{
     display:grid;
@@ -772,6 +822,8 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
         justify-content:center;
     }
 }
+@media(max-width:900px){.fc-fee-history-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:575px){.fc-fee-history-summary{grid-template-columns:1fr}}
 </style>
 <div class="fc-page" data-page="collection">
 <div class="page-heading">
@@ -802,7 +854,7 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
  </section>
 </section>
 <section class="fc-panel" data-panel="summary">
- <section class="ui-card fc-card"><div class="fc-card-head"><strong>Assigned Fee Schedule</strong><small id="breakdownHint" class="text-muted">Open a student to view the schedule.</small></div><div class="fc-table-wrap"><table class="data-table fc-table"><thead><tr><th>Fee Type</th><th>Fee Component</th><th>Period</th><th>Due Date</th><th>Amount</th><th>Discount</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead><tbody id="breakdownBody"><tr><td colspan="9" class="fc-empty">Select a student.</td></tr></tbody></table></div></section>
+ <section class="ui-card fc-card"><div class="fc-card-head"><strong>Assigned Fee Schedule</strong><small id="breakdownHint" class="text-muted">Open a student to view the schedule.</small></div><div class="fc-table-wrap"><table class="data-table fc-table"><thead><tr><th>Academic Year</th><th>Fee Type</th><th>Fee Component</th><th>Period</th><th>Due Date</th><th>Amount</th><th>Discount</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead><tbody id="breakdownBody"><tr><td colspan="10" class="fc-empty">Select a student.</td></tr></tbody></table></div></section>
 </section>
 <section class="fc-panel" data-panel="receipts">
  <section class="ui-card fc-card">
@@ -819,10 +871,40 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
  <div class="modal-header"><div><h5 class="modal-title">Collect Fee</h5><small class="text-muted">Scheduled fees and additional charges.</small></div><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
  <div class="modal-body">
   <input id="modalStudentId" type="hidden"><div id="studentDetails" class="fc-student-card mb-3"></div>
-  <div class="fc-section-title"><strong>Due Fee Components</strong><small class="text-muted">Previous due and current period fees load automatically.</small></div>
-  <div class="fc-table-wrap"><table class="data-table fc-due-table"><thead><tr><th>Fee Type</th><th>Component</th><th>Period</th><th>Due Date</th><th>Balance</th></tr></thead><tbody id="dueItemBody"><tr><td colspan="5" class="fc-empty">Loading...</td></tr></tbody></table></div>
-  <div class="fc-section-title"><strong>Additional Charges</strong><button id="addChargeBtn" class="btn-ui btn-sm" type="button"><i data-lucide="plus"></i> Add Charge</button></div>
-  <div id="chargeRows"></div>
+  <div id="feeHistorySummary" class="fc-fee-history-summary mb-3">
+   <div class="previous"><small>Previous Year Pending</small><strong id="summaryPreviousDue">₹0</strong></div>
+   <div><small>Current Year Fees</small><strong id="summaryCurrentFees">₹0</strong></div>
+   <div><small>Tuition Fee</small><strong id="summaryTuition">₹0</strong></div>
+   <div><small>Admission Fee</small><strong id="summaryAdmission">₹0</strong></div>
+   <div><small>Transport Fee</small><strong id="summaryTransport">₹0</strong></div>
+   <div><small>Extra Fees</small><strong id="summaryExtra">₹0</strong></div>
+   <div><small>Other Fees</small><strong id="summaryOther">₹0</strong></div>
+   <div><small>Total Fees</small><strong id="summaryTotalFees">₹0</strong></div>
+   <div class="paid"><small>Amount Already Paid</small><strong id="summaryPaid">₹0</strong></div>
+   <div class="balance"><small>Remaining Balance</small><strong id="summaryBalance">₹0</strong></div>
+  </div>
+  <div class="fc-section-title"><strong>Due Fee Components</strong><small class="text-muted">Previous Academic Year pending fees and current-year fees are shown separately.</small></div>
+  <div class="fc-table-wrap"><table class="data-table fc-due-table"><thead><tr><th>Academic Year</th><th>Fee Type</th><th>Component</th><th>Period</th><th>Due Date</th><th>Balance</th></tr></thead><tbody id="dueItemBody"><tr><td colspan="6" class="fc-empty">Loading...</td></tr></tbody></table></div>
+  <div class="fc-section-title">
+   <strong>Additional Charge</strong>
+   <small class="text-muted">Choose a Fee Settings option or type a new charge name directly.</small>
+  </div>
+  <div class="fc-charge-row" id="singleChargeRow">
+   <div>
+    <label class="form-label" for="chargeTypeName">Charge Type</label>
+    <input id="chargeTypeName" class="form-control" list="chargeTypeOptions" maxlength="120" autocomplete="off" placeholder="Select or type charge type">
+    <datalist id="chargeTypeOptions"></datalist>
+    <small class="fc-charge-help">Fee Settings options are suggested. A new name can also be typed and collected directly.</small>
+   </div>
+   <div>
+    <label class="form-label" for="chargeDescription">Description</label>
+    <input id="chargeDescription" class="form-control" maxlength="120" placeholder="Optional description">
+   </div>
+   <div>
+    <label class="form-label" for="chargeAmount">Amount</label>
+    <input id="chargeAmount" class="form-control" type="number" min="0" step="0.01" value="0">
+   </div>
+  </div>
   <div class="fee-form-grid mt-3">
    <div><label class="form-label">Discount</label><input id="discount" class="form-control" type="number" min="0" step="0.01" value="0"></div>
    <div><label class="form-label">Paid Amount *</label><input id="amount" class="form-control" type="number" min="0.01" step="0.01" required></div>
@@ -864,6 +946,7 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
     <table class="data-table fc-table">
      <thead>
       <tr>
+       <th>Academic Year</th>
        <th>Fee Type</th>
        <th>Component</th>
        <th>Period</th>
@@ -876,7 +959,7 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
       </tr>
      </thead>
      <tbody id="historyScheduleBody">
-      <tr><td colspan="9" class="fc-empty">Loading fee schedule...</td></tr>
+      <tr><td colspan="10" class="fc-empty">Loading fee schedule...</td></tr>
      </tbody>
     </table>
    </div>
@@ -922,11 +1005,17 @@ $feeCsrf=$_SESSION['fee_csrf_token'];
 (function(){
 'use strict';
 const apiUrl=new URL('../api/fee-collection.php',window.location.href).href;
-let csrfToken=<?=json_encode($feeCsrf)?>,meta={years:[],classes:[],sections:[],methods:[],charge_types:[]},studentRows=[],selectedStudent=null,detail=null,receiptPage=1,searchTimer=null,receiptTimer=null,chargeCounter=0,historyStudent=null,paidAmountManual=false;
+const receiptPrintUrl=new URL('fee-receipt-print.php',window.location.href).href;
+let csrfToken=<?=json_encode($feeCsrf)?>,meta={years:[],classes:[],sections:[],methods:[],charge_types:[]},studentRows=[],selectedStudent=null,detail=null,receiptPage=1,searchTimer=null,receiptTimer=null,historyStudent=null;
 const $=id=>document.getElementById(id);const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));const money=value=>new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:2}).format(Number(value||0));const badge=value=>`<span class="fc-badge ${esc(String(value||'').toLowerCase())}">${esc(value||'-')}</span>`;
 function localToday(){const now=new Date();return new Date(now.getTime()-now.getTimezoneOffset()*60000).toISOString().slice(0,10)}
 async function request(action,data={},method='GET'){let response;if(method==='GET'){const url=new URL(apiUrl);url.searchParams.set('action',action);Object.entries(data).forEach(([k,v])=>{if(v!==''&&v!==null&&v!==undefined)url.searchParams.set(k,String(v))});response=await fetch(url,{headers:{Accept:'application/json'},credentials:'same-origin'});}else response=await fetch(apiUrl,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json'},credentials:'same-origin',body:JSON.stringify({action,csrf_token:csrfToken,...data})});const text=await response.text();let result;try{result=JSON.parse(text)}catch{throw new Error(`Fee Collection API returned HTTP ${response.status}. ${text.replace(/\s+/g,' ').trim().slice(0,220)||'Invalid server response.'}`)}if(!response.ok||!result.success)throw new Error(result.message||'Request failed.');if(result.data?.csrf_token)csrfToken=result.data.csrf_token;return result;}
-function message(text,success=false){const box=$('feeMessage');box.className='alert fc-message show '+(success?'alert-success':'alert-danger');box.textContent=text;clearTimeout(box._timer);box._timer=setTimeout(()=>box.className='alert fc-message',7000)}
+function message(text,success=false,type=''){
+ const toastType=type||((success)?'success':'error');
+ if(typeof window.showToast==='function'){window.showToast(toastType,String(text||''));return}
+ if(window.SchoolToast&&typeof window.SchoolToast.show==='function'){window.SchoolToast.show(toastType,String(text||''));return}
+ const box=$('feeMessage');if(!box)return;box.className='alert fc-message show '+(success?'alert-success':'alert-danger');box.textContent=text;clearTimeout(box._timer);box._timer=setTimeout(()=>box.className='alert fc-message',7000)
+}
 function fill(id,rows,key,label,first='',firstValue=''){const el=$(id);el.innerHTML=(first?`<option value="${esc(firstValue)}">${esc(first)}</option>`:'')+rows.map(row=>`<option value="${esc(row[key])}">${esc(typeof label==='function'?label(row):row[label])}</option>`).join('')}
 function n(id){const el=$(id);if(!el)return 0;const v=Number(el.value||0);return Number.isFinite(v)&&v>=0?v:0}
 function refreshClasses(){const year=Number($('yearId').value||0),old=$('classId').value;const rows=(meta.classes||[]).filter(row=>!year||Number(row.academic_year_id)===year);fill('classId',rows,'id','class_name','All Classes','');if(old&&[...$('classId').options].some(o=>o.value===old))$('classId').value=old;refreshSections()}
@@ -999,16 +1088,24 @@ function renderHistoryStudent(student={}){
 function renderHistorySummary(data={}){
  const summary=data.summary||{};
  $('historySummary').innerHTML=`
+  <div><small>Previous / Old Balance</small><strong>${money(summary.previous_year_pending||0)}</strong></div>
+  <div><small>Current Year Fees</small><strong>${money(summary.current_year_total||0)}</strong></div>
+  <div><small>Tuition Fee</small><strong>${money(summary.current_year_tuition||0)}</strong></div>
+  <div><small>Admission Fee</small><strong>${money(summary.current_year_admission||0)}</strong></div>
+  <div><small>Transport Fee</small><strong>${money(summary.current_year_transport||0)}</strong></div>
+  <div><small>Extra Fees</small><strong>${money(summary.current_year_extra||0)}</strong></div>
+  <div><small>Other Fees</small><strong>${money(summary.current_year_other||0)}</strong></div>
   <div><small>Total Assigned</small><strong>${money(summary.total_assigned||0)}</strong></div>
   <div><small>Total Discount</small><strong>${money(summary.total_discount||0)}</strong></div>
-  <div><small>Total Paid</small><strong>${money(summary.total_paid||0)}</strong></div>
-  <div><small>Outstanding Balance</small><strong>${money(summary.balance_amount||0)}</strong></div>
+  <div><small>Amount Paid</small><strong>${money(summary.total_paid||0)}</strong></div>
+  <div><small>Remaining Balance</small><strong>${money(summary.balance_amount||0)}</strong></div>
   <div><small>Total Receipts</small><strong>${Number(summary.receipt_count||0).toLocaleString('en-IN')}</strong></div>
  `;
 }
 function renderHistorySchedule(rows=[]){
  $('historyScheduleCount').textContent=`${rows.length} fee item${rows.length===1?'':'s'}`;
  $('historyScheduleBody').innerHTML=rows.map(row=>`<tr>
+  <td>${feeYearCell(row)}</td>
   <td><span class="fc-type">${esc(row.item_type||'-')}</span></td>
   <td>${esc(row.item_name||'-')}</td>
   <td>${esc(row.period_label||'-')}</td>
@@ -1018,7 +1115,7 @@ function renderHistorySchedule(rows=[]){
   <td>${money(row.paid_amount)}</td>
   <td><strong>${money(row.balance_amount)}</strong></td>
   <td>${badge(row.item_status||'-')}</td>
- </tr>`).join('')||'<tr><td colspan="9" class="fc-empty">No fee schedule found.</td></tr>';
+ </tr>`).join('')||'<tr><td colspan="10" class="fc-empty">No fee schedule found.</td></tr>';
 }
 function renderHistoryReceipts(rows=[]){
  $('historyReceiptCount').textContent=`${rows.length} receipt${rows.length===1?'':'s'}`;
@@ -1032,7 +1129,7 @@ function renderHistoryReceipts(rows=[]){
   <td>${esc(row.payment_methods||'-')}</td>
   <td>${badge(row.payment_status||'-')}</td>
   <td>
-   <a class="fc-action" target="_blank" href="${apiUrl}?action=print_receipt&id=${Number(row.id)}" title="Print Receipt">
+   <a class="fc-action" target="_blank" href="${receiptPrintUrl}?id=${Number(row.id)}" title="Print Receipt">
     <i data-lucide="printer"></i>
    </a>
   </td>
@@ -1043,7 +1140,7 @@ async function openStudentHistory(id){
  if(!historyStudent)return;
 
  $('historySubtitle').textContent=`${historyStudent.student_name} · Complete fee history`;
- $('historyScheduleBody').innerHTML='<tr><td colspan="9" class="fc-empty">Loading fee schedule...</td></tr>';
+ $('historyScheduleBody').innerHTML='<tr><td colspan="10" class="fc-empty">Loading fee schedule...</td></tr>';
  $('historyReceiptBody').innerHTML='<tr><td colspan="9" class="fc-empty">Loading payment history...</td></tr>';
 
  try{
@@ -1065,11 +1162,63 @@ async function openStudentHistory(id){
 
 async function loadStudents(){if(Number($('yearId').value||0)<=0){studentRows=[];renderStats({});renderStudents();return}try{const result=await request('students',filters());studentRows=result.data.records||[];renderStats(result.data.stats||{});renderStudents()}catch(error){message(error.message)}}
 function renderStudentDetails(){const route=detail?.student?.transport_route_name||'Not Required';$('studentDetails').innerHTML=`<div><small>Student</small><strong>${esc(selectedStudent?.student_name||'-')}</strong></div><div><small>Admission No.</small><strong>${esc(selectedStudent?.admission_no||'-')}</strong></div><div><small>Class / Section</small><strong>${esc(selectedStudent?.class_name||'-')}${selectedStudent?.section_name?' / '+esc(selectedStudent.section_name):''}</strong></div><div><small>Transport Route</small><strong>${esc(route)}${Number(detail?.student?.route_bus_fee||0)>0?' · '+money(detail.student.route_bus_fee):''}</strong></div>`}
-function renderDueItems(){const rows=detail?.items||[];$('dueItemBody').innerHTML=rows.map(row=>`<tr><td><span class="fc-type">${esc(row.item_type)}</span></td><td>${esc(row.item_name)}</td><td>${esc(row.period_label)}</td><td>${esc(row.due_date_display||row.due_date)}</td><td><strong>${money(row.balance_amount)}</strong></td></tr>`).join('')||'<tr><td colspan="5" class="fc-empty">No outstanding fee components are available.</td></tr>';$('breakdownHint').textContent=selectedStudent?`${selectedStudent.student_name} · Complete assigned schedule`:'Select a student.';$('breakdownBody').innerHTML=(detail?.schedule||[]).map(row=>`<tr><td>${esc(row.item_type)}</td><td>${esc(row.item_name)}</td><td>${esc(row.period_label)}</td><td>${esc(row.due_date_display||row.due_date)}</td><td>${money(row.original_amount)}</td><td>${money(row.discount_amount)}</td><td>${money(row.paid_amount)}</td><td>${money(row.balance_amount)}</td><td>${badge(row.item_status)}</td></tr>`).join('')||'<tr><td colspan="9" class="fc-empty">No schedule found.</td></tr>'}
-function chargeRow(data={}){chargeCounter++;const id=chargeCounter;const options=(meta.charge_types||[]).map(row=>`<option value="${Number(row.id)}" data-code="${esc(row.charge_code)}">${esc(row.charge_name)}</option>`).join('');return `<div class="fc-charge-row" data-charge-row="${id}"><div><label class="form-label">Charge Type</label><select class="form-select js-charge-type">${options}</select></div><div><label class="form-label">Description</label><input class="form-control js-charge-description" maxlength="120" value="${esc(data.description||'')}"></div><div><label class="form-label">Amount</label><input class="form-control js-charge-amount" type="number" min="0" step="0.01" value="${Number(data.amount||0)}"></div><button class="btn-ui js-remove-charge" type="button"><i data-lucide="trash-2"></i></button></div>`}
-function bindCharges(){document.querySelectorAll('.js-charge-amount').forEach(el=>el.oninput=()=>calculate(true));document.querySelectorAll('.js-remove-charge').forEach(el=>el.onclick=()=>{el.closest('[data-charge-row]')?.remove();calculate(true)});window.lucide?.createIcons()}
-function addCharge(){if(!(meta.charge_types||[]).length){message('No active Additional Charge types are configured.');return}$('chargeRows').insertAdjacentHTML('beforeend',chargeRow());bindCharges();calculate(true)}
-function additionalCharges(){return [...document.querySelectorAll('[data-charge-row]')].map(row=>({charge_type_id:Number(row.querySelector('.js-charge-type').value||0),description:row.querySelector('.js-charge-description').value.trim(),amount:Number(row.querySelector('.js-charge-amount').value||0)})).filter(row=>row.charge_type_id>0&&row.amount>0)}
+function renderFeeHistorySummary(){
+ const s=detail?.fee_breakdown_summary||{};
+ $('summaryPreviousDue').textContent=money(s.previous_year_pending||0);
+ $('summaryCurrentFees').textContent=money(s.current_year_total||0);
+ $('summaryTuition').textContent=money(s.current_year_tuition||0);
+ $('summaryAdmission').textContent=money(s.current_year_admission||0);
+ $('summaryTransport').textContent=money(s.current_year_transport||0);
+ $('summaryExtra').textContent=money(s.current_year_extra||0);
+ $('summaryOther').textContent=money(s.current_year_other||0);
+ $('summaryTotalFees').textContent=money(s.total_fees||0);
+ $('summaryPaid').textContent=money(s.amount_paid||0);
+ $('summaryBalance').textContent=money(s.remaining_balance||0);
+}
+function feeYearCell(row){
+ const previous=String(row.fee_year_scope||'current')==='previous'||String(row.item_type||'')==='previous_due';
+ const year=String(row.fee_academic_year_name||row.source_academic_year_name||row.current_academic_year_name||'-');
+ return `<span class="fc-year-scope ${previous?'previous':'current'}">${previous?'Previous':'Current'} · ${esc(year)}</span>`;
+}
+function renderDueItems(){
+ const rows=detail?.items||[];
+ $('dueItemBody').innerHTML=rows.map(row=>`<tr><td>${feeYearCell(row)}</td><td><span class="fc-type">${esc(row.item_type)}</span></td><td>${esc(row.item_name)}</td><td>${esc(row.period_label)}</td><td>${esc(row.due_date_display||row.due_date)}</td><td><strong>${money(row.balance_amount)}</strong></td></tr>`).join('')||'<tr><td colspan="6" class="fc-empty">No outstanding fee components are available.</td></tr>';
+ $('breakdownHint').textContent=selectedStudent?`${selectedStudent.student_name} · Complete fee history by Academic Year`:'Select a student.';
+ $('breakdownBody').innerHTML=(detail?.schedule||[]).map(row=>`<tr><td>${feeYearCell(row)}</td><td>${esc(row.item_type)}</td><td>${esc(row.item_name)}</td><td>${esc(row.period_label)}</td><td>${esc(row.due_date_display||row.due_date)}</td><td>${money(row.original_amount)}</td><td>${money(row.discount_amount)}</td><td>${money(row.paid_amount)}</td><td>${money(row.balance_amount)}</td><td>${badge(row.item_status)}</td></tr>`).join('')||'<tr><td colspan="10" class="fc-empty">No schedule found.</td></tr>';
+ renderFeeHistorySummary();
+}
+function normalizeChargeName(value){return String(value||'').trim().replace(/\s+/g,' ').toLowerCase()}
+function renderChargeTypeOptions(){
+ const list=$('chargeTypeOptions');if(!list)return;
+ list.innerHTML=(meta.charge_types||[]).map(row=>`<option value="${esc(row.charge_name||'')}" label="${esc(row.source_label||row.charge_code||'Fee Settings')}"></option>`).join('');
+}
+function selectedChargeOption(){
+ const name=normalizeChargeName($('chargeTypeName')?.value||'');
+ if(!name)return null;
+ return (meta.charge_types||[]).find(row=>normalizeChargeName(row.charge_name)===name)||null;
+}
+function clearSingleCharge(){
+ if($('chargeTypeName'))$('chargeTypeName').value='';
+ if($('chargeDescription'))$('chargeDescription').value='';
+ if($('chargeAmount'))$('chargeAmount').value='0';
+ calculate();
+}
+function additionalCharges(){
+ const chargeName=String($('chargeTypeName')?.value||'').trim().replace(/\s+/g,' ');
+ const amount=Math.max(0,Number($('chargeAmount')?.value||0));
+ const description=String($('chargeDescription')?.value||'').trim();
+ if(amount<=0&&chargeName==='')return [];
+ if(amount<=0)return [];
+ const option=selectedChargeOption();
+ return [{
+  charge_key:option?.charge_key||'',
+  charge_type_id:Number(option?.id||0),
+  charge_type_name:chargeName,
+  charge_source:option?.source||'custom',
+  description,
+  amount
+ }];
+}
 function calculation(){
  const total=Number(
   detail?.assigned_total
@@ -1096,21 +1245,8 @@ function calculation(){
  const balance=Math.max(0,grand-paid);
  return{total,previous,outstanding,additional,discount,grand,paid,balance};
 }
-function calculate(syncAutoPaid=false){
- let c=calculation();
-
- /*
-  * Default behaviour is "Pay Full Current Balance".
-  * Once the user types a Paid Amount manually, preserve that partial amount.
-  * Before manual editing, Discount / Additional Charge changes keep the
-  * Paid Amount synchronized with the current Total Payable.
-  */
- if(syncAutoPaid&&!paidAmountManual){
-  $('amount').value=c.grand>0?c.grand.toFixed(2):'';
-  c=calculation();
- }
-
- $('amount').max=c.grand>0?c.grand.toFixed(2):'0';
+function calculate(){
+ const c=calculation();
  $('calcTotalFee').textContent=money(c.total);
  $('calcPrevious').textContent=money(c.previous);
  $('calcOutstanding').textContent=money(c.outstanding);
@@ -1119,77 +1255,53 @@ function calculate(syncAutoPaid=false){
  $('calcGrand').textContent=money(c.grand);
  $('calcPaid').textContent=money(c.paid);
  $('calcBalance').textContent=money(c.balance);
-
  return c;
 }
-async function loadDetail(resetPaid=true){
+async function loadDetail(){
  if(!selectedStudent)return;
-
- const existingPaid=String($('amount').value||'');
-
  const result=await request('detail',{
   student_id:selectedStudent.id,
   academic_year_id:selectedStudent.academic_year_id,
   payment_date:$('paymentDate').value
  });
-
  detail=result.data;
  renderStudentDetails();
  renderDueItems();
-
- if(resetPaid){
-  paidAmountManual=false;
- }
-
- if(!resetPaid&&paidAmountManual&&existingPaid!==''){
-  $('amount').value=existingPaid;
-  const current=calculation();
-
-  if(current.paid>current.grand){
-   $('amount').value=current.grand>0?current.grand.toFixed(2):'';
-   paidAmountManual=false;
-  }
- }
-
- calculate(true);
+ const c=calculate();
+ $('amount').value=c.grand>0?c.grand.toFixed(2):'';
+ calculate();
 }
 async function openCollect(id){
- selectedStudent=studentRows.find(row=>Number(row.id)===id)||null;
- if(!selectedStudent)return;
-
- $('modalStudentId').value=String(id);
- $('paymentDate').value=localToday();
- $('discount').value='0';
- $('amount').value='';
- $('reference').value='';
- $('notes').value='';
- $('chargeRows').innerHTML='';
- paidAmountManual=false;
-
- try{
-  await loadDetail(true);
-  bootstrap.Modal.getOrCreateInstance($('collectFeeModal')).show();
-  window.lucide?.createIcons();
- }catch(error){
-  message(error.message);
- }
+ selectedStudent=studentRows.find(row=>Number(row.id)===id)||null;if(!selectedStudent)return;
+ $('modalStudentId').value=String(id);$('paymentDate').value=localToday();$('discount').value='0';$('amount').value='';$('reference').value='';$('notes').value='';
+ clearSingleCharge();renderChargeTypeOptions();
+ const modal=bootstrap.Modal.getOrCreateInstance($('collectFeeModal'));modal.show();window.lucide?.createIcons();
+ try{await loadDetail()}catch(error){message(error.message,false,'error')}
 }
 function setButtons(value){$('saveFeeBtn').disabled=value;$('savePrintFeeBtn').disabled=value}
 async function save(printReceipt){
- const c=calculate(false);
- const grand=Math.round(c.grand*100)/100;
- const paid=Math.round(c.paid*100)/100;
- const discount=Math.round(c.discount*100)/100;
+ const c=calculate();
+ if(!selectedStudent){message('Select a student.',false,'warning');return}
+ if(c.grand<=0){message('There is no payable amount.',false,'warning');return}
+ if(c.paid<=0){message('Enter a valid Paid Amount.',false,'warning');return}
+ if(c.paid>c.grand+0.01){message('Paid Amount cannot exceed Grand Total.',false,'warning');return}
+ if(Number($('methodId').value||0)<=0){message('Select a Payment Mode.',false,'warning');return}
+ const chargeName=String($('chargeTypeName')?.value||'').trim();
+ const chargeAmount=Math.max(0,Number($('chargeAmount')?.value||0));
+ if(chargeAmount>0&&chargeName===''){message('Enter or select a Charge Type for the additional amount.',false,'warning');$('chargeTypeName')?.focus();return}
 
- if(!selectedStudent){message('Select a student.');return}
- if(grand<=0){message('There is no payable amount.');return}
- if(paid<=0){message('Enter a valid Paid Amount.');$('amount').focus();return}
- if(paid>grand+0.009){message('Paid Amount cannot exceed Total Payable Now.');$('amount').focus();return}
- if(Number($('methodId').value||0)<=0){message('Select a Payment Mode.');return}
+ let printWindow=null;
+ if(printReceipt){
+  printWindow=window.open('about:blank','feeReceiptPrintWindow','width=980,height=760,scrollbars=yes,resizable=yes');
+  if(!printWindow){message('Receipt print window was blocked. Allow pop-ups for this site and try again.',false,'warning');return}
+  try{
+   printWindow.document.open();
+   printWindow.document.write('<!doctype html><html><head><title>Preparing Receipt...</title></head><body style="font-family:Arial;padding:30px">Preparing receipt for printing...</body></html>');
+   printWindow.document.close();
+  }catch(e){}
+ }
 
- let printWindow=printReceipt?window.open('about:blank','_blank'):null;
  setButtons(true);
-
  try{
   const result=await request('collect',{
    student_id:selectedStudent.id,
@@ -1198,39 +1310,40 @@ async function save(printReceipt){
    payment_method_id:Number($('methodId').value),
    reference_no:$('reference').value.trim(),
    remarks:$('notes').value.trim(),
-   discount_amount:discount,
-   paid_amount:paid,
+   discount_amount:c.discount,
+   paid_amount:c.paid,
    additional_charges:additionalCharges()
   },'POST');
 
   bootstrap.Modal.getInstance($('collectFeeModal'))?.hide();
-  message(result.message,true);
+  message(result.message,true,'success');
   await loadStudents();
   await loadReceipts();
 
-  if(printReceipt&&result.data?.receipt_id){
-   const url=`${apiUrl}?action=print_receipt&id=${encodeURIComponent(result.data.receipt_id)}`;
-   if(printWindow)printWindow.location.href=url;
-   else window.open(url,'_blank');
+  if(printReceipt&&result.data?.receipt_id&&printWindow){
+   const returnUrl=new URL('fee-collection.php',window.location.href).href;
+   const url=`${receiptPrintUrl}?id=${encodeURIComponent(result.data.receipt_id)}&autoprint=1&return=${encodeURIComponent(returnUrl)}`;
+   printWindow.location.replace(url);
+   printWindow.focus();
   }else if(printWindow){
    printWindow.close();
   }
  }catch(error){
-  if(printWindow)printWindow.close();
-  message(error.message);
+  if(printWindow&&!printWindow.closed)printWindow.close();
+  message(error.message,false,'error');
  }finally{
   setButtons(false);
  }
 }
 function renderReceiptPagination(p={}){const total=Number(p.total||0),page=Number(p.page||1),per=Number(p.per_page||10),last=Math.max(1,Number(p.last_page||1)),start=total?((page-1)*per)+1:0,end=Math.min(page*per,total);$('receiptCount').textContent=`${total} receipt${total===1?'':'s'}`;$('receiptPageInfo').textContent=`Showing ${start}-${end} of ${total}`;let html=`<button class="fc-page-button" data-page="${page-1}" ${page<=1?'disabled':''}>‹</button>`;for(let i=Math.max(1,page-2);i<=Math.min(last,page+2);i++)html+=`<button class="fc-page-button ${i===page?'active':''}" data-page="${i}">${i}</button>`;html+=`<button class="fc-page-button" data-page="${page+1}" ${page>=last?'disabled':''}>›</button>`;$('receiptPagination').innerHTML=html;document.querySelectorAll('.fc-page-button').forEach(b=>b.onclick=()=>{if(!b.disabled){receiptPage=Number(b.dataset.page);loadReceipts()}})}
-async function loadReceipts(){try{const result=await request('receipts',{academic_year_id:$('yearId').value,search:$('receiptSearch').value.trim(),from_date:$('fromDate').value,to_date:$('toDate').value,status:$('receiptStatus').value,payment_method_id:$('receiptMethod').value,page:receiptPage,per_page:10});const rows=result.data.records||[];$('statReceipts').textContent=Number(result.data.pagination?.total||0).toLocaleString('en-IN');renderReceiptPagination(result.data.pagination||{});$('receiptBody').innerHTML=rows.map(row=>`<tr><td><strong>${esc(row.receipt_no)}</strong></td><td>${esc(row.receipt_date_display||row.receipt_date)}</td><td>${esc(row.student_name)}</td><td>${money(row.gross_amount)}</td><td>${money(row.discount_amount)}</td><td>${money(row.paid_amount)}</td><td>${money(row.due_amount)}</td><td>${esc(row.payment_methods||'-')}</td><td>${badge(row.payment_status)}</td><td><div class="fc-receipt-actions"><a class="fc-action" target="_blank" href="${apiUrl}?action=print_receipt&id=${Number(row.id)}" title="Reprint"><i data-lucide="printer"></i></a><button class="fc-action js-manage" data-id="${Number(row.id)}" type="button" title="Manage"><i data-lucide="pencil"></i></button>${row.payment_status!=='reversed'?`<button class="fc-action js-reverse" data-id="${Number(row.id)}" type="button" title="Reverse"><i data-lucide="rotate-ccw"></i></button>`:''}${row.payment_status==='reversed'?`<button class="fc-action danger js-delete" data-id="${Number(row.id)}" type="button" title="Delete"><i data-lucide="trash-2"></i></button>`:''}</div></td></tr>`).join('')||'<tr><td colspan="10" class="fc-empty">No payment history found.</td></tr>';document.querySelectorAll('.js-manage').forEach(b=>b.onclick=()=>openReceipt(Number(b.dataset.id)));document.querySelectorAll('.js-reverse').forEach(b=>b.onclick=()=>receiptAction('reverse',Number(b.dataset.id)));document.querySelectorAll('.js-delete').forEach(b=>b.onclick=()=>receiptAction('delete',Number(b.dataset.id)));updateExport();window.lucide?.createIcons()}catch(error){message(error.message)}}
+async function loadReceipts(){try{const result=await request('receipts',{academic_year_id:$('yearId').value,search:$('receiptSearch').value.trim(),from_date:$('fromDate').value,to_date:$('toDate').value,status:$('receiptStatus').value,payment_method_id:$('receiptMethod').value,page:receiptPage,per_page:10});const rows=result.data.records||[];$('statReceipts').textContent=Number(result.data.pagination?.total||0).toLocaleString('en-IN');renderReceiptPagination(result.data.pagination||{});$('receiptBody').innerHTML=rows.map(row=>`<tr><td><strong>${esc(row.receipt_no)}</strong></td><td>${esc(row.receipt_date_display||row.receipt_date)}</td><td>${esc(row.student_name)}</td><td>${money(row.gross_amount)}</td><td>${money(row.discount_amount)}</td><td>${money(row.paid_amount)}</td><td>${money(row.due_amount)}</td><td>${esc(row.payment_methods||'-')}</td><td>${badge(row.payment_status)}</td><td><div class="fc-receipt-actions"><a class="fc-action" target="_blank" href="${receiptPrintUrl}?id=${Number(row.id)}" title="Reprint"><i data-lucide="printer"></i></a><button class="fc-action js-manage" data-id="${Number(row.id)}" type="button" title="Manage"><i data-lucide="pencil"></i></button>${row.payment_status!=='reversed'?`<button class="fc-action js-reverse" data-id="${Number(row.id)}" type="button" title="Reverse"><i data-lucide="rotate-ccw"></i></button>`:''}${row.payment_status==='reversed'?`<button class="fc-action danger js-delete" data-id="${Number(row.id)}" type="button" title="Delete"><i data-lucide="trash-2"></i></button>`:''}</div></td></tr>`).join('')||'<tr><td colspan="10" class="fc-empty">No payment history found.</td></tr>';document.querySelectorAll('.js-manage').forEach(b=>b.onclick=()=>openReceipt(Number(b.dataset.id)));document.querySelectorAll('.js-reverse').forEach(b=>b.onclick=()=>receiptAction('reverse',Number(b.dataset.id)));document.querySelectorAll('.js-delete').forEach(b=>b.onclick=()=>receiptAction('delete',Number(b.dataset.id)));updateExport();window.lucide?.createIcons()}catch(error){message(error.message)}}
 function updateExport(){const q=new URLSearchParams({action:'export_receipts',academic_year_id:$('yearId').value||'',search:$('receiptSearch').value.trim(),from_date:$('fromDate').value,to_date:$('toDate').value,status:$('receiptStatus').value,payment_method_id:$('receiptMethod').value});$('exportReceipts').href=apiUrl+'?'+q}
 async function openReceipt(id){try{const result=await request('receipt_detail',{id});const receipt=result.data.receipt,payment=result.data.payments?.[0];$('manageReceiptId').value=String(id);$('manageReceiptNo').value=receipt.receipt_no;fill('manageMethodId',meta.methods||[],'id','method_name');$('manageMethodId').value=String(payment?.payment_method_id||'');$('manageReference').value=payment?.reference_no||'';$('manageNotes').value=receipt.clean_notes||'';bootstrap.Modal.getOrCreateInstance($('receiptManageModal')).show()}catch(error){message(error.message)}}
 async function receiptAction(action,id){const text=action==='reverse'?'Reverse this receipt and restore all allocated balances?':'Delete this reversed receipt?';if(!confirm(text))return;try{const result=await request(action,{id},'POST');message(result.message,true);await loadStudents();await loadReceipts()}catch(error){message(error.message)}}
-async function init(){try{const result=await request('meta');meta=result.data;fill('yearId',meta.years||[],'id','year_name','Select Academic Year','');const current=(meta.years||[]).find(row=>Number(row.is_current)===1)||(meta.years||[])[0];if(current)$('yearId').value=String(current.id);fill('methodId',meta.methods||[],'id','method_name');fill('manageMethodId',meta.methods||[],'id','method_name');fill('receiptMethod',meta.methods||[],'id','method_name','All Payment Modes','all');const cash=(meta.methods||[]).find(row=>row.method_key==='cash');if(cash)$('methodId').value=String(cash.id);refreshClasses();$('paymentDate').value=localToday();await loadStudents();await loadReceipts()}catch(error){message(error.message)}}
+async function init(){try{const result=await request('meta');meta=result.data;fill('yearId',meta.years||[],'id','year_name','Select Academic Year','');const current=(meta.years||[]).find(row=>Number(row.is_current)===1)||(meta.years||[])[0];if(current)$('yearId').value=String(current.id);fill('methodId',meta.methods||[],'id','method_name');fill('manageMethodId',meta.methods||[],'id','method_name');fill('receiptMethod',meta.methods||[],'id','method_name','All Payment Modes','all');renderChargeTypeOptions();const cash=(meta.methods||[]).find(row=>row.method_key==='cash');if(cash)$('methodId').value=String(cash.id);refreshClasses();$('paymentDate').value=localToday();await loadStudents();await loadReceipts()}catch(error){message(error.message,false,'error')}}
 $('receiptManageForm').onsubmit=async e=>{e.preventDefault();try{const result=await request('update_receipt',{id:Number($('manageReceiptId').value),payment_method_id:Number($('manageMethodId').value),reference_no:$('manageReference').value.trim(),remarks:$('manageNotes').value.trim()},'POST');bootstrap.Modal.getInstance($('receiptManageModal'))?.hide();message(result.message,true);await loadReceipts()}catch(error){message(error.message)}};
 document.querySelectorAll('.fc-tab').forEach(button=>button.onclick=()=>{document.querySelectorAll('.fc-tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.fc-panel').forEach(x=>x.classList.remove('active'));button.classList.add('active');document.querySelector(`[data-panel="${button.dataset.tab}"]`)?.classList.add('active')});
-$('yearId').onchange=async()=>{refreshClasses();receiptPage=1;await loadStudents();await loadReceipts()};$('classId').onchange=async()=>{refreshSections();await loadStudents()};$('sectionId').onchange=loadStudents;$('feeStatusFilter').onchange=loadStudents;$('studentSearch').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(loadStudents,250)};$('studentFilterReset').onclick=async()=>{$('studentSearch').value='';$('classId').value='';refreshSections();$('feeStatusFilter').value='all';const current=(meta.years||[]).find(row=>Number(row.is_current)===1)||(meta.years||[])[0];$('yearId').value=current?String(current.id):'';refreshClasses();await loadStudents()};$('addChargeBtn').onclick=addCharge;$('discount').oninput=()=>calculate(true);$('amount').oninput=()=>{paidAmountManual=true;calculate(false)};$('paymentDate').onchange=()=>loadDetail(true);$('saveFeeBtn').onclick=()=>save(false);$('savePrintFeeBtn').onclick=()=>save(true);$('topCollectBtn').onclick=()=>{$('studentFeeCard').scrollIntoView({behavior:'smooth',block:'start'});setTimeout(()=>$('studentSearch').focus(),300)};$('refreshBtn').onclick=async()=>{await loadStudents();await loadReceipts();message('Fee Collection refreshed.',true)};$('receiptSearch').oninput=()=>{clearTimeout(receiptTimer);receiptTimer=setTimeout(()=>{receiptPage=1;loadReceipts()},300)};['fromDate','toDate','receiptStatus','receiptMethod'].forEach(id=>$(id).onchange=()=>{receiptPage=1;loadReceipts()});$('receiptReset').onclick=()=>{$('receiptSearch').value='';$('fromDate').value='';$('toDate').value='';$('receiptStatus').value='all';$('receiptMethod').value='all';receiptPage=1;loadReceipts()};
+$('yearId').onchange=async()=>{refreshClasses();receiptPage=1;await loadStudents();await loadReceipts()};$('classId').onchange=async()=>{refreshSections();await loadStudents()};$('sectionId').onchange=loadStudents;$('feeStatusFilter').onchange=loadStudents;$('studentSearch').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(loadStudents,250)};$('studentFilterReset').onclick=async()=>{$('studentSearch').value='';$('classId').value='';refreshSections();$('feeStatusFilter').value='all';const current=(meta.years||[]).find(row=>Number(row.is_current)===1)||(meta.years||[])[0];$('yearId').value=current?String(current.id):'';refreshClasses();await loadStudents()};$('chargeTypeName').oninput=calculate;$('chargeDescription').oninput=calculate;$('chargeAmount').oninput=calculate;$('discount').oninput=calculate;$('amount').oninput=calculate;$('paymentDate').onchange=loadDetail;$('saveFeeBtn').onclick=()=>save(false);$('savePrintFeeBtn').onclick=()=>save(true);$('topCollectBtn').onclick=()=>{$('studentFeeCard').scrollIntoView({behavior:'smooth',block:'start'});setTimeout(()=>$('studentSearch').focus(),300)};$('refreshBtn').onclick=async()=>{await loadStudents();await loadReceipts();message('Fee Collection refreshed.',true)};$('receiptSearch').oninput=()=>{clearTimeout(receiptTimer);receiptTimer=setTimeout(()=>{receiptPage=1;loadReceipts()},300)};['fromDate','toDate','receiptStatus','receiptMethod'].forEach(id=>$(id).onchange=()=>{receiptPage=1;loadReceipts()});$('receiptReset').onclick=()=>{$('receiptSearch').value='';$('fromDate').value='';$('toDate').value='';$('receiptStatus').value='all';$('receiptMethod').value='all';receiptPage=1;loadReceipts()};
 init();window.lucide?.createIcons();
 })();
 </script>

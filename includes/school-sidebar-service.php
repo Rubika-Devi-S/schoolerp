@@ -2,15 +2,20 @@
 declare(strict_types=1);
 
 /**
- * School ERP - Strict School Sidebar Service
- * Build: 2026-08-07-strict-school-sidebar-v17
+ * School ERP - Default Inheritance Sidebar Service
+ * Build: 2026-08-14-branch-permission-inheritance-v26
  *
  * Data model:
  *   sidebar_items              = shared/default master structure
- *   sidebar_default_settings   = default catalogue enable/order
- *   tenant_sidebar_items       = explicit school assignment/override
+ *   sidebar_default_settings   = global default enable/order
+ *   tenant_sidebar_items       = explicit per-school override/customization
  *
- * Missing tenant_sidebar_items row means NOT assigned to that school.
+ * Effective rule:
+ *   - no tenant_sidebar_items row => inherit Default Sidebar state
+ *   - explicit tenant row         => school-specific enable/disable/customization
+ *
+ * Therefore a new enabled Default Sidebar item is automatically available to
+ * every school, while each school can independently override that item.
  */
 
 if (!function_exists('school_sidebar_service_table')) {
@@ -71,6 +76,245 @@ if (!function_exists('school_sidebar_service_marks')) {
     }
 }
 
+
+if (!function_exists('school_sidebar_service_role_key')) {
+    function school_sidebar_service_role_key(string $roleKey): string
+    {
+        $key = strtolower(trim($roleKey));
+        $key = str_replace('-', '_', $key);
+
+        return match ($key) {
+            'school_administrator', 'schooladmin', 'school_admin_user',
+            'branch_administrator', 'branch_admin', 'administrator', 'admin'
+                => 'school_admin',
+            'super_administrator' => 'super_admin',
+            default => $key,
+        };
+    }
+}
+
+if (!function_exists('school_sidebar_service_role_master_upsert')) {
+    function school_sidebar_service_role_master_upsert(
+        PDO $pdo,
+        string $roleKey,
+        int $itemId,
+        bool $enabled = true,
+        ?int $displayOrder = null,
+        ?int $userId = null
+    ): void {
+        $roleKey = school_sidebar_service_role_key($roleKey);
+        if ($roleKey === '' || $itemId <= 0) {
+            return;
+        }
+
+        $stmt = $pdo->prepare(
+            "INSERT INTO sidebar_role_master_items
+                (role_key,sidebar_item_id,is_enabled,display_order,created_by,updated_by)
+             VALUES
+                (:role_key,:item_id,:enabled,:display_order,:created_by,:updated_by)
+             ON DUPLICATE KEY UPDATE
+                is_enabled=VALUES(is_enabled),
+                display_order=VALUES(display_order),
+                updated_by=VALUES(updated_by),
+                updated_at=CURRENT_TIMESTAMP"
+        );
+        $stmt->execute([
+            'role_key' => $roleKey,
+            'item_id' => $itemId,
+            'enabled' => $enabled ? 1 : 0,
+            'display_order' => $displayOrder,
+            'created_by' => $userId,
+            'updated_by' => $userId,
+        ]);
+    }
+}
+
+if (!function_exists('school_sidebar_service_role_master_remove')) {
+    function school_sidebar_service_role_master_remove(
+        PDO $pdo,
+        string $roleKey,
+        int $itemId
+    ): void {
+        $roleKey = school_sidebar_service_role_key($roleKey);
+        if ($roleKey === '' || $itemId <= 0) {
+            return;
+        }
+
+        $stmt = $pdo->prepare(
+            "DELETE FROM sidebar_role_master_items
+             WHERE role_key=:role_key
+               AND sidebar_item_id=:item_id"
+        );
+        $stmt->execute([
+            'role_key' => $roleKey,
+            'item_id' => $itemId,
+        ]);
+    }
+}
+
+if (!function_exists('school_sidebar_service_role_master_count')) {
+    function school_sidebar_service_role_master_count(
+        PDO $pdo,
+        string $roleKey
+    ): int {
+        $roleKey = school_sidebar_service_role_key($roleKey);
+        if ($roleKey === ''
+            || !school_sidebar_service_table($pdo, 'sidebar_role_master_items')) {
+            return 0;
+        }
+
+        $stmt = $pdo->prepare(
+            "SELECT COUNT(*)
+             FROM sidebar_role_master_items
+             WHERE role_key=:role_key"
+        );
+        $stmt->execute(['role_key' => $roleKey]);
+        return (int)$stmt->fetchColumn();
+    }
+}
+
+if (!function_exists('school_sidebar_service_seed_parent_items')) {
+    function school_sidebar_service_seed_parent_items(
+        PDO $pdo,
+        ?int $userId = null
+    ): void {
+        if (!school_sidebar_service_table($pdo, 'sidebar_items')) {
+            return;
+        }
+
+        $items = [
+            ['parent_dashboard', 'Dashboard', 'parent/s_dashboard.php', 'layout-dashboard', 1],
+            ['parent_my_children', 'My Children', 'parent/s_dashboard.php#profile', 'users-round', 2],
+            ['parent_attendance', 'Attendance', 'parent/s_dashboard.php#attendance', 'calendar-check', 3],
+            ['parent_fees', 'Fees', 'parent/s_dashboard.php#fees', 'wallet-cards', 4],
+            ['parent_fee_payment', 'Fee Payment', 'parent/s_dashboard.php#fees', 'credit-card', 5],
+            ['parent_results', 'Exams / Results', 'parent/s_dashboard.php#results', 'notebook-tabs', 6],
+            ['parent_homework', 'Homework', 'parent/s_dashboard.php#homework', 'notebook-pen', 7],
+            ['parent_notices', 'Notices', 'parent/s_dashboard.php#announcements', 'megaphone', 8],
+            ['parent_transport', 'Transport', 'parent/s_dashboard.php#transport', 'bus-front', 9],
+            ['parent_profile', 'Profile', 'parent/s_dashboard.php#profile', 'user-round', 10],
+        ];
+
+        $select = $pdo->prepare(
+            "SELECT id FROM sidebar_items
+             WHERE menu_key=:menu_key
+             LIMIT 1"
+        );
+        $insert = $pdo->prepare(
+            "INSERT INTO sidebar_items
+                (parent_id,module_id,menu_key,menu_title,route,icon,
+                 portal_scope,owner_tenant_id,display_order,show_in_sidebar,is_active)
+             VALUES
+                (NULL,NULL,:menu_key,:menu_title,:route,:icon,
+                 'school',NULL,:display_order,1,1)"
+        );
+        foreach ($items as [$key, $title, $route, $icon, $order]) {
+            $select->execute(['menu_key' => $key]);
+            $itemId = (int)($select->fetchColumn() ?: 0);
+
+            if ($itemId <= 0) {
+                $insert->execute([
+                    'menu_key' => $key,
+                    'menu_title' => $title,
+                    'route' => $route,
+                    'icon' => $icon,
+                    'display_order' => $order,
+                ]);
+                $itemId = (int)$pdo->lastInsertId();
+            }
+
+            school_sidebar_service_role_master_upsert(
+                $pdo,
+                'parent',
+                $itemId,
+                true,
+                $order,
+                $userId
+            );
+
+            /*
+             * Keep the shared definition enabled. Role-master membership is the
+             * role boundary, so these rows do not leak into School Admin.
+             */
+            if (school_sidebar_service_table($pdo, 'sidebar_default_settings')) {
+                school_sidebar_service_default_upsert(
+                    $pdo,
+                    $itemId,
+                    1,
+                    $order,
+                    $userId
+                );
+            }
+        }
+    }
+}
+
+if (!function_exists('school_sidebar_service_ensure_role_master')) {
+    function school_sidebar_service_ensure_role_master(
+        PDO $pdo,
+        string $roleKey,
+        ?int $userId = null
+    ): void {
+        $roleKey = school_sidebar_service_role_key($roleKey);
+        if ($roleKey === '' || $roleKey === 'super_admin') {
+            return;
+        }
+
+        if ($roleKey === 'parent') {
+            if (school_sidebar_service_role_master_count(
+                $pdo,
+                $roleKey
+            ) === 0) {
+                school_sidebar_service_seed_parent_items(
+                    $pdo,
+                    $userId
+                );
+            }
+            return;
+        }
+
+        if (school_sidebar_service_role_master_count($pdo, $roleKey) > 0) {
+            return;
+        }
+
+        /*
+         * One-time compatibility snapshot for existing school roles. It copies
+         * the current School master catalogue, excluding Parent-only items.
+         * After this snapshot every role has an independent master list.
+         */
+        $owner = school_sidebar_service_column(
+            $pdo,
+            'sidebar_items',
+            'owner_tenant_id'
+        ) ? 'AND si.owner_tenant_id IS NULL' : '';
+
+        $stmt = $pdo->prepare(
+            "INSERT IGNORE INTO sidebar_role_master_items
+                (role_key,sidebar_item_id,is_enabled,display_order,created_by,updated_by)
+             SELECT
+                :role_key,
+                si.id,
+                COALESCE(sds.is_enabled,1),
+                COALESCE(sds.display_order,si.display_order),
+                :created_by,
+                :updated_by
+             FROM sidebar_items si
+             LEFT JOIN sidebar_default_settings sds
+               ON sds.sidebar_item_id=si.id
+             WHERE si.is_active=1
+               AND si.show_in_sidebar=1
+               AND si.portal_scope IN ('school','all')
+               AND si.menu_key NOT LIKE 'parent\\_%'
+               {$owner}"
+        );
+        $stmt->execute([
+            'role_key' => $roleKey,
+            'created_by' => $userId,
+            'updated_by' => $userId,
+        ]);
+    }
+}
+
 if (!function_exists('school_sidebar_service_ensure')) {
     function school_sidebar_service_ensure(PDO $pdo): void
     {
@@ -85,39 +329,99 @@ if (!function_exists('school_sidebar_service_ensure')) {
               COLLATE=utf8mb4_unicode_ci"
         );
 
+        /*
+         * Optional branch-level permission layer.
+         *
+         * No branch rows means "inherit the school-level permission".
+         * A saved branch row can only restrict an action already allowed by the
+         * school level; it never changes another branch or the school master.
+         */
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS branch_sidebar_permission_grants (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                tenant_id BIGINT UNSIGNED NOT NULL,
+                branch_id BIGINT UNSIGNED NOT NULL,
+                role_id BIGINT UNSIGNED NOT NULL,
+                sidebar_item_id BIGINT UNSIGNED NOT NULL,
+                action_key VARCHAR(50) NOT NULL,
+                is_allowed TINYINT(1) NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_branch_sidebar_grant
+                    (tenant_id,branch_id,role_id,sidebar_item_id,action_key),
+                KEY idx_branch_sidebar_grant_scope
+                    (tenant_id,branch_id,role_id),
+                KEY idx_branch_sidebar_grant_item (sidebar_item_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+              COLLATE=utf8mb4_unicode_ci"
+        );
+
         if (!school_sidebar_service_table($pdo, 'sidebar_items')) {
             return;
         }
 
-        /*
-         * Legacy builds stored a custom menu in sidebar_items with a school
-         * owner. The strict V17 model uses ONE shared master definition and a
-         * tenant_sidebar_items row for the school assignment. Promoting the
-         * master does not expose it to other schools because runtime access is
-         * assignment-only.
-         */
-        if (
-            school_sidebar_service_column($pdo, 'sidebar_items', 'owner_tenant_id')
-            && school_sidebar_service_table($pdo, 'sidebar_default_settings')
-        ) {
-            $pdo->exec(
-                "INSERT IGNORE INTO sidebar_default_settings
-                    (sidebar_item_id,is_enabled,display_order,updated_by)
-                 SELECT id,1,display_order,NULL
-                 FROM sidebar_items
-                 WHERE owner_tenant_id IS NOT NULL
-                   AND is_active=1
-                   AND show_in_sidebar=1
-                   AND portal_scope IN ('school','all')"
-            );
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS sidebar_role_master_items (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                role_key VARCHAR(80) NOT NULL,
+                sidebar_item_id BIGINT UNSIGNED NOT NULL,
+                is_enabled TINYINT(1) NOT NULL DEFAULT 1,
+                display_order INT DEFAULT NULL,
+                created_by BIGINT UNSIGNED DEFAULT NULL,
+                updated_by BIGINT UNSIGNED DEFAULT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_sidebar_role_master (role_key,sidebar_item_id),
+                KEY idx_sidebar_role_master_enabled (role_key,is_enabled,display_order),
+                KEY idx_sidebar_role_master_item (sidebar_item_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+              COLLATE=utf8mb4_unicode_ci"
+        );
 
+        /*
+         * Every active school receives its own tenant-scoped Parent role.
+         * Existing Parent roles are preserved; disabled roles are reactivated.
+         */
+        if (school_sidebar_service_table($pdo, 'roles')
+            && school_sidebar_service_table($pdo, 'tenants')) {
             $pdo->exec(
-                "UPDATE sidebar_items
-                 SET owner_tenant_id=NULL
-                 WHERE owner_tenant_id IS NOT NULL
-                   AND portal_scope IN ('school','all')"
+                "INSERT INTO roles
+                    (tenant_id,role_key,role_name,description,role_scope,is_system,status,created_by)
+                 SELECT
+                    t.id,'parent','Parent','Parent Portal Login','school',0,'active',NULL
+                 FROM tenants t
+                 WHERE t.status IN ('active','trial')
+                   AND NOT EXISTS (
+                        SELECT 1
+                        FROM roles r
+                        WHERE r.tenant_id=t.id
+                          AND r.role_key='parent'
+                   )"
+            );
+            $pdo->exec(
+                "UPDATE roles r
+                 INNER JOIN tenants t ON t.id=r.tenant_id
+                 SET r.role_name='Parent',
+                     r.description='Parent Portal Login',
+                     r.role_scope='school',
+                     r.status='active',
+                     r.deleted_at=NULL
+                 WHERE r.role_key='parent'
+                   AND t.status IN ('active','trial')"
             );
         }
+
+        /*
+         * V21 IMPORTANT:
+         * Keep owner_tenant_id intact. A school-owned custom menu must remain
+         * private to that school and must never be promoted into the global
+         * Default Sidebar catalogue. Shared/default items use owner_tenant_id
+         * NULL; school-specific items keep their tenant id.
+         */
 
         /* Old inherited placeholder rows are not explicit assignments. */
         if (
@@ -157,6 +461,29 @@ if (!function_exists('school_sidebar_service_ensure')) {
                    AND portal_scope IN ('school','all')
                    {$owner}"
             );
+        }
+
+        /*
+         * Build independent master catalogues for every existing school role.
+         * Parent is deliberately seeded from its own curated list only.
+         */
+        if (school_sidebar_service_table($pdo, 'roles')) {
+            $roleKeys = $pdo->query(
+                "SELECT DISTINCT role_key
+                 FROM roles
+                 WHERE role_scope='school'
+                   AND status='active'
+                   AND deleted_at IS NULL
+                 ORDER BY role_key"
+            )->fetchAll(PDO::FETCH_COLUMN);
+
+            foreach ($roleKeys as $roleKey) {
+                school_sidebar_service_ensure_role_master(
+                    $pdo,
+                    (string)$roleKey,
+                    null
+                );
+            }
         }
     }
 }
@@ -348,6 +675,85 @@ if (!function_exists('school_sidebar_service_assign_item')) {
 
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
+    }
+}
+
+
+if (!function_exists('school_sidebar_service_set_school_visibility')) {
+    /**
+     * Create/update an explicit school visibility override.
+     *
+     * Missing tenant row means "inherit Default Sidebar".  This helper is used
+     * only when the school intentionally chooses Enabled/Disabled or when a
+     * school-owned custom menu must remain explicitly assigned.
+     */
+    function school_sidebar_service_set_school_visibility(
+        PDO $pdo,
+        int $tenantId,
+        int $itemId,
+        bool $visible
+    ): void {
+        if ($tenantId <= 0 || $itemId <= 0) {
+            return;
+        }
+
+        school_sidebar_service_assign_item($pdo, $tenantId, $itemId);
+
+        $sets = ['is_visible=:is_visible'];
+        if (school_sidebar_service_column(
+            $pdo,
+            'tenant_sidebar_items',
+            'inherit_default'
+        )) {
+            $sets[] = 'inherit_default=0';
+        }
+        if (school_sidebar_service_column(
+            $pdo,
+            'tenant_sidebar_items',
+            'updated_at'
+        )) {
+            $sets[] = 'updated_at=CURRENT_TIMESTAMP';
+        }
+
+        $stmt = $pdo->prepare(
+            "UPDATE tenant_sidebar_items
+             SET " . implode(',', $sets) . "
+             WHERE tenant_id=:tenant_id
+               AND sidebar_item_id=:sidebar_item_id"
+        );
+        $stmt->execute([
+            'is_visible' => $visible ? 1 : 0,
+            'tenant_id' => $tenantId,
+            'sidebar_item_id' => $itemId,
+        ]);
+    }
+}
+
+if (!function_exists('school_sidebar_service_remove_school_override')) {
+    /**
+     * Remove only the school's override so the item immediately falls back to
+     * the Default Sidebar state. Role/action permission rows are intentionally
+     * preserved; they become effective again if the menu is visible.
+     */
+    function school_sidebar_service_remove_school_override(
+        PDO $pdo,
+        int $tenantId,
+        int $itemId
+    ): void {
+        if ($tenantId <= 0 || $itemId <= 0
+            || !school_sidebar_service_table($pdo, 'tenant_sidebar_items')) {
+            return;
+        }
+
+        $stmt = $pdo->prepare(
+            "DELETE FROM tenant_sidebar_items
+             WHERE tenant_id=:tenant_id
+               AND sidebar_item_id=:sidebar_item_id"
+        );
+        $stmt->execute([
+            'tenant_id' => $tenantId,
+            'sidebar_item_id' => $itemId,
+        ]);
     }
 }
 
@@ -719,18 +1125,37 @@ if (!function_exists('school_sidebar_service_create_menu')) {
             }
         }
 
-        $find = $pdo->prepare(
-            "SELECT id,owner_tenant_id
-             FROM sidebar_items
-             WHERE LOWER(menu_key)=LOWER(:menu_key)
-             ORDER BY id LIMIT 1"
+        $hasOwner = school_sidebar_service_column(
+            $pdo,
+            'sidebar_items',
+            'owner_tenant_id'
         );
+
+        $findSql = "SELECT id"
+            . ($hasOwner ? ",owner_tenant_id" : ",NULL AS owner_tenant_id")
+            . " FROM sidebar_items
+                WHERE LOWER(menu_key)=LOWER(:menu_key)
+                ORDER BY id LIMIT 1";
+        $find = $pdo->prepare($findSql);
         $find->execute(['menu_key'=>$key]);
         $existing = $find->fetch(PDO::FETCH_ASSOC);
         $reused = is_array($existing);
 
         if ($reused) {
             $itemId = (int)$existing['id'];
+            $existingOwner = (int)($existing['owner_tenant_id'] ?? 0);
+
+            if ($tenantId <= 0 && $existingOwner > 0) {
+                throw new InvalidArgumentException(
+                    'This Menu Key is already used by a school-specific sidebar item.'
+                );
+            }
+            if ($tenantId > 0 && $existingOwner > 0 && $existingOwner !== $tenantId) {
+                throw new InvalidArgumentException(
+                    'This Menu Key is already used by another school.'
+                );
+            }
+
             if ($parentId === $itemId
                 || in_array(
                     $parentId,
@@ -739,31 +1164,35 @@ if (!function_exists('school_sidebar_service_create_menu')) {
                 )) {
                 throw new InvalidArgumentException('Invalid parent hierarchy.');
             }
-            $ownerSet = school_sidebar_service_column(
-                $pdo,'sidebar_items','owner_tenant_id'
-            ) ? ',owner_tenant_id=NULL' : '';
-            $stmt = $pdo->prepare(
-                "UPDATE sidebar_items
-                 SET menu_title=:title,route=:route,icon=:icon,
-                     parent_id=:parent_id,display_order=:display_order,
-                     portal_scope='school',show_in_sidebar=1,is_active=1
-                     {$ownerSet}
-                 WHERE id=:id"
-            );
-            $stmt->execute([
-                'title'=>substr($title,0,120),
-                'route'=>substr($route,0,255),
-                'icon'=>substr($icon,0,4096),
-                'parent_id'=>$parentId>0?$parentId:null,
-                'display_order'=>$order,
-                'id'=>$itemId,
-            ]);
+
+            /*
+             * Never rewrite a shared Default master when assigning it to one
+             * school. Per-school title/route/icon are stored as tenant overrides.
+             */
+            if ($tenantId <= 0 || $existingOwner === $tenantId) {
+                $ownerSet = ($hasOwner && $tenantId <= 0)
+                    ? ',owner_tenant_id=NULL'
+                    : '';
+                $stmt = $pdo->prepare(
+                    "UPDATE sidebar_items
+                     SET menu_title=:title,route=:route,icon=:icon,
+                         parent_id=:parent_id,display_order=:display_order,
+                         portal_scope='school',show_in_sidebar=1,is_active=1
+                         {$ownerSet}
+                     WHERE id=:id"
+                );
+                $stmt->execute([
+                    'title'=>substr($title,0,120),
+                    'route'=>substr($route,0,255),
+                    'icon'=>substr($icon,0,4096),
+                    'parent_id'=>$parentId>0?$parentId:null,
+                    'display_order'=>$order,
+                    'id'=>$itemId,
+                ]);
+            }
         } else {
-            $hasOwner = school_sidebar_service_column(
-                $pdo,'sidebar_items','owner_tenant_id'
-            );
             $ownerColumn = $hasOwner ? ',owner_tenant_id' : '';
-            $ownerValue = $hasOwner ? ',NULL' : '';
+            $ownerValue = $hasOwner ? ',:owner_tenant_id' : '';
             $stmt = $pdo->prepare(
                 "INSERT INTO sidebar_items(
                     parent_id,module_id,menu_key,menu_title,route,icon,
@@ -774,24 +1203,52 @@ if (!function_exists('school_sidebar_service_create_menu')) {
                     NULL,NULL,'school'{$ownerValue},:display_order,1,1
                  )"
             );
-            $stmt->execute([
+            $params = [
                 'parent_id'=>$parentId>0?$parentId:null,
                 'menu_key'=>$key,
                 'menu_title'=>substr($title,0,120),
                 'route'=>substr($route,0,255),
                 'icon'=>substr($icon,0,4096),
                 'display_order'=>$order,
-            ]);
+            ];
+            if ($hasOwner) {
+                $params['owner_tenant_id'] = $tenantId > 0 ? $tenantId : null;
+            }
+            $stmt->execute($params);
             $itemId=(int)$pdo->lastInsertId();
         }
 
-        /* Always create/update the same structure in Default Sidebar. */
-        school_sidebar_service_default_upsert(
-            $pdo,$itemId,$visible,$order,$userId
-        );
+        if ($tenantId <= 0) {
+            /*
+             * A menu added to Default Sidebar becomes part of the inherited
+             * catalogue. Runtime inheritance makes it available to every school
+             * automatically; no tenant rows are copied/created.
+             */
+            school_sidebar_service_default_upsert(
+                $pdo,$itemId,$visible,$order,$userId
+            );
+        } else {
+            /*
+             * A menu added while a school is selected is school-specific. Do not
+             * add/enable it in the global Default Sidebar.
+             *
+             * Very old schemas without owner_tenant_id cannot mark ownership,
+             * so keep the shared default OFF and rely on this school's explicit
+             * enabled override.
+             */
+            if (!$hasOwner && !$reused) {
+                school_sidebar_service_default_upsert(
+                    $pdo,
+                    $itemId,
+                    0,
+                    $order,
+                    $userId
+                );
+            }
 
-        if ($tenantId > 0) {
-            school_sidebar_service_assign_parent_chain($pdo,$tenantId,$itemId);
+            if ($parentId > 0) {
+                school_sidebar_service_assign_parent_chain($pdo,$tenantId,$parentId);
+            }
             school_sidebar_service_assign_item(
                 $pdo,
                 $tenantId,
@@ -803,6 +1260,12 @@ if (!function_exists('school_sidebar_service_create_menu')) {
                     'custom_parent_id'=>$parentId>0?$parentId:null,
                     'display_order'=>$order,
                 ]
+            );
+            school_sidebar_service_set_school_visibility(
+                $pdo,
+                $tenantId,
+                $itemId,
+                $visible === 1
             );
         }
 
@@ -867,12 +1330,11 @@ if (!function_exists('school_sidebar_service_edit_menu')) {
             return;
         }
 
-        if (!$visible) {
-            $ids=school_sidebar_service_school_descendants($pdo,$tenantId,$itemId);
-            school_sidebar_service_remove_school_items($pdo,$tenantId,$ids);
-            return;
-        }
-
+        /*
+         * School edits are explicit tenant overrides. Disabling a shared
+         * default item must create is_visible=0 instead of deleting the tenant
+         * row, otherwise the item would immediately inherit Default=Enabled.
+         */
         if ($parentId>0) {
             school_sidebar_service_assign_parent_chain($pdo,$tenantId,$parentId);
         }
@@ -887,6 +1349,12 @@ if (!function_exists('school_sidebar_service_edit_menu')) {
                 'custom_parent_id'=>$parentId>0?$parentId:null,
                 'display_order'=>$order,
             ]
+        );
+        school_sidebar_service_set_school_visibility(
+            $pdo,
+            $tenantId,
+            $itemId,
+            $visible === 1
         );
     }
 }
@@ -903,10 +1371,41 @@ if (!function_exists('school_sidebar_service_delete_menu')) {
         }
 
         if ($tenantId>0) {
-            $ids=school_sidebar_service_school_descendants($pdo,$tenantId,$itemId);
-            if ($ids===[]) $ids=[$itemId];
-            school_sidebar_service_remove_school_items($pdo,$tenantId,$ids);
-            return $ids;
+            $master=school_sidebar_service_master_item($pdo,$itemId);
+            $ownerId=(int)($master['owner_tenant_id']??0);
+
+            if ($ownerId===$tenantId && $ownerId>0) {
+                /*
+                 * A genuinely school-owned custom menu can be removed from that
+                 * school. It is not part of the global Default catalogue.
+                 */
+                $ids=school_sidebar_service_master_descendants($pdo,$itemId);
+                school_sidebar_service_cleanup_global_dependencies($pdo,$ids);
+                foreach (array_reverse($ids) as $id) {
+                    $stmt=$pdo->prepare(
+                        'DELETE FROM sidebar_items
+                         WHERE id=:id AND owner_tenant_id=:tenant_id'
+                    );
+                    $stmt->execute([
+                        'id'=>$id,
+                        'tenant_id'=>$tenantId,
+                    ]);
+                }
+                return $ids;
+            }
+
+            /*
+             * Shared Default item: "Delete" in school context means Disabled
+             * for this school only. The Default master and every other school
+             * remain untouched.
+             */
+            school_sidebar_service_set_school_visibility(
+                $pdo,
+                $tenantId,
+                $itemId,
+                false
+            );
+            return [$itemId];
         }
 
         $ids=school_sidebar_service_master_descendants($pdo,$itemId);

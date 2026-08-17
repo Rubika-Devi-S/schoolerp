@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+/* Build: 2026-08-17-super-admin-theme-runtime-fix-v9 */
+
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
 require_once dirname(__DIR__) . '/includes/theme-config.php';
 
@@ -71,13 +73,149 @@ $baseUrl = defined('BASE_URL')
     ? rtrim((string)BASE_URL, '/') . '/'
     : '../';
 
-$tenantId = max(
-    1,
-    (int)(
-        $currentUser['tenant_id']
-        ?? $_SESSION['tenant_id']
-        ?? 1
-    )
+
+if (!function_exists('platform_theme_storage_tenant_id')) {
+    function platform_theme_storage_tenant_id(
+        ?PDO $pdo,
+        array $user = []
+    ): int {
+        if ($pdo instanceof PDO
+            && function_exists('school_table_exists')
+            && school_table_exists($pdo, 'tenants')) {
+            try {
+                $statement = $pdo->query(
+                    "SELECT id
+                     FROM tenants
+                     WHERE status = 'active'
+                     ORDER BY id ASC
+                     LIMIT 1"
+                );
+
+                $tenantId = (int)$statement->fetchColumn();
+
+                if ($tenantId > 0) {
+                    return $tenantId;
+                }
+            } catch (Throwable $exception) {
+                error_log(
+                    'platform_theme_storage_tenant_id: '
+                    . $exception->getMessage()
+                );
+            }
+        }
+
+        $fallback = (int)(
+            $user['tenant_id']
+            ?? $user['school_id']
+            ?? $_SESSION['tenant_id']
+            ?? $_SESSION['school_id']
+            ?? 0
+        );
+
+        return max(0, $fallback);
+    }
+}
+
+if (!function_exists('platform_theme_load_settings')) {
+    /** @return array<string,string> */
+    function platform_theme_load_settings(
+        ?PDO $pdo,
+        int $storageTenantId
+    ): array {
+        $settings = school_theme_default_settings();
+
+        if ($storageTenantId <= 0
+            || !($pdo instanceof PDO)
+            || !function_exists('school_table_exists')
+            || !school_table_exists($pdo, 'website_color_settings')) {
+            return $settings;
+        }
+
+        try {
+            $statement = $pdo->prepare(
+                "SELECT setting_key, setting_value
+                 FROM website_color_settings
+                 WHERE tenant_id = :tenant_id
+                   AND setting_key LIKE 'platform\\_%' ESCAPE '\\\\'
+                   AND is_active = 1"
+            );
+
+            $statement->execute([
+                'tenant_id' => $storageTenantId,
+            ]);
+
+            $fontOptions = school_theme_font_options();
+            $presets = school_theme_presets();
+
+            foreach ($statement->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $storedKey = trim((string)($row['setting_key'] ?? ''));
+
+                if (!str_starts_with($storedKey, 'platform_')) {
+                    continue;
+                }
+
+                $key = substr($storedKey, 9);
+                $value = trim((string)($row['setting_value'] ?? ''));
+
+                if (!array_key_exists($key, $settings)) {
+                    continue;
+                }
+
+                if ($key === 'layout_density') {
+                    if (in_array(
+                        $value,
+                        ['compact', 'comfortable', 'spacious'],
+                        true
+                    )) {
+                        $settings[$key] = $value;
+                    }
+                    continue;
+                }
+
+                if ($key === 'theme_preset') {
+                    $normalizedPreset = school_theme_normalize_preset($value);
+
+                    if (array_key_exists($normalizedPreset, $presets)
+                        || $normalizedPreset === 'custom') {
+                        $settings[$key] = $normalizedPreset;
+                    }
+                    continue;
+                }
+
+                if ($key === 'app_font_style') {
+                    if (array_key_exists($value, $fontOptions)) {
+                        $settings[$key] = $value;
+                    }
+                    continue;
+                }
+
+                if ($key === 'app_font_size') {
+                    $fontSize = (int)$value;
+
+                    if ($fontSize >= 14 && $fontSize <= 20) {
+                        $settings[$key] = (string)$fontSize;
+                    }
+                    continue;
+                }
+
+                if (preg_match('/^#[0-9a-fA-F]{6}$/', $value) === 1) {
+                    $settings[$key] = strtolower($value);
+                }
+            }
+        } catch (Throwable $exception) {
+            error_log(
+                'platform_theme_load_settings: '
+                . $exception->getMessage()
+            );
+        }
+
+        return $settings;
+    }
+}
+
+$platformThemeStorageTenantId = platform_theme_storage_tenant_id(
+    isset($pdo) && $pdo instanceof PDO ? $pdo : null,
+    is_array($currentUser) ? $currentUser : []
 );
 
 if (function_exists('csrfToken')) {
@@ -96,9 +234,9 @@ $defaults = school_theme_default_settings();
 $presets = school_theme_presets();
 $fontOptions = school_theme_font_options();
 
-$theme = school_theme_load_settings(
+$theme = platform_theme_load_settings(
     isset($pdo) && $pdo instanceof PDO ? $pdo : null,
-    $tenantId
+    $platformThemeStorageTenantId
 );
 
 $fields = [
@@ -365,7 +503,7 @@ require dirname(__DIR__) . '/includes/layout-start.php';
     <div>
         <h1 class="page-title">Super Admin Theme Settings</h1>
         <p class="page-subtitle">
-            Manage themes and typography without changing the current template.
+            Manage the Super Admin panel theme and typography without changing the current template.
         </p>
     </div>
 
@@ -676,6 +814,91 @@ require dirname(__DIR__) . '/includes/layout-start.php';
     const clampFontSize = value =>
         Math.max(14, Math.min(20, Number.parseInt(value, 10) || 16));
 
+    /*
+     * Compatibility with older Super Admin theme CSS.
+     *
+     * Older versions stored CSS variables directly on body:has(...).
+     * A variable defined on BODY overrides the value inherited from :root.
+     * Therefore live preview must write the active values to BOTH html and body.
+     */
+    const themeCssVariableMap = {
+        sidebar_bg: '--sidebar-bg',
+        sidebar_text: '--sidebar-text',
+        sidebar_active_bg_1: '--sidebar-active-bg-1',
+        sidebar_active_bg_2: '--sidebar-active-bg-2',
+        sidebar_active_text: '--sidebar-active-text',
+        sidebar_hover_bg: '--sidebar-hover-bg',
+        sidebar_hover_text: '--sidebar-hover-text',
+        topbar_bg_1: '--topbar-bg-1',
+        topbar_bg_2: '--topbar-bg-2',
+        topbar_text: '--topbar-text',
+        body_bg: '--body-bg',
+        card_bg: '--card-bg',
+        text_main: '--text-main',
+        text_muted: '--text-muted',
+        border_soft: '--border-soft',
+        brand_1: '--brand-1',
+        brand_2: '--brand-2',
+        header_gradient_start: '--header-gradient-start',
+        header_gradient_end: '--header-gradient-end',
+        header_text: '--header-text'
+    };
+
+    function applyRuntimeVariables(settings) {
+        const root = document.documentElement;
+        const body = document.body;
+
+        Object.entries(themeCssVariableMap).forEach(([key, variable]) => {
+            const value = String(settings[key] || '');
+
+            if (!validHex(value)) {
+                return;
+            }
+
+            root.style.setProperty(variable, value, 'important');
+
+            if (body) {
+                body.style.setProperty(variable, value, 'important');
+            }
+        });
+
+        /*
+         * Some existing School ERP CSS versions use --topbar-bg instead of
+         * --topbar-bg-1. Keep that alias synchronized with the selected theme.
+         */
+        const topbarFallback = String(settings.topbar_bg_1 || '');
+
+        if (validHex(topbarFallback)) {
+            root.style.setProperty(
+                '--topbar-bg',
+                topbarFallback,
+                'important'
+            );
+
+            if (body) {
+                body.style.setProperty(
+                    '--topbar-bg',
+                    topbarFallback,
+                    'important'
+                );
+            }
+        }
+
+        root.style.setProperty(
+            '--app-font-size',
+            clampFontSize(settings.app_font_size) + 'px',
+            'important'
+        );
+
+        if (body) {
+            body.style.setProperty(
+                '--app-font-size',
+                clampFontSize(settings.app_font_size) + 'px',
+                'important'
+            );
+        }
+    }
+
     function updatePresetSelection(presetKey) {
         document
             .querySelectorAll('.theme-preset')
@@ -717,22 +940,18 @@ require dirname(__DIR__) . '/includes/layout-start.php';
         };
 
         if (window.SchoolTheme) {
-            window.SchoolTheme.apply(currentSettings, broadcast === true);
-        } else {
-            Object.entries(currentSettings).forEach(([key, value]) => {
-                if (validHex(String(value))) {
-                    document.documentElement.style.setProperty(
-                        '--' + key.replaceAll('_', '-'),
-                        value
-                    );
-                }
-            });
-
-            document.documentElement.style.setProperty(
-                '--app-font-size',
-                clampFontSize(currentSettings.app_font_size) + 'px'
+            window.SchoolTheme.apply(
+                currentSettings,
+                broadcast === true
             );
         }
+
+        /*
+         * Always run the compatibility layer as well. This makes the selected
+         * preset visible immediately even when a legacy BODY-scoped theme block
+         * still exists in the main stylesheet.
+         */
+        applyRuntimeVariables(currentSettings);
 
         updateVisibleFields(currentSettings);
         updatePresetSelection(
@@ -902,7 +1121,13 @@ require dirname(__DIR__) . '/includes/layout-start.php';
     document
         .getElementById('resetTheme')
         .addEventListener('click', () => {
-            applySettings(defaults, false);
+            applySettings(
+                {
+                    ...defaults,
+                    theme_preset: 'light'
+                },
+                false
+            );
 
             showMessage(
                 'Default Light theme and typography applied to preview. '
@@ -925,6 +1150,7 @@ require dirname(__DIR__) . '/includes/layout-start.php';
                 },
                 body: JSON.stringify({
                     csrf_token: csrfToken,
+                    theme_scope: 'platform',
                     settings: currentSettings
                 })
             });

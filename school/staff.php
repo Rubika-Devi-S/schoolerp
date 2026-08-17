@@ -3,7 +3,12 @@ declare(strict_types=1);
 
 $pageTitle = 'Staff Management';
 $pageKey = 'teachers';
+
 require dirname(__DIR__) . '/includes/layout-start.php';
+$staffCommonFile = dirname(__DIR__) . '/includes/common-toast.php';
+if (is_file($staffCommonFile)) {
+    require_once $staffCommonFile;
+}
 
 $staffPermissions = function_exists('school_current_page_capabilities')
     ? school_current_page_capabilities($pageKey)
